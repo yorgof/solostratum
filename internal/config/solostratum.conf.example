@@ -1,0 +1,46 @@
+# solostratum settings
+#
+# Keep this file next to the solostratum program. Lines starting with # are
+# comments. Only the first two sections must be filled in.
+
+# ---- Your Bitcoin node (required) -------------------------------------------
+
+# Address of your Bitcoin Core node's RPC port. The usual ports are 8332
+# (mainnet), 48332 (testnet4) and 18443 (regtest).
+node_url = http://127.0.0.1:8332
+
+# Login for the node: the rpcuser/rpcpassword (or rpcauth) you configured in
+# bitcoin.conf.
+node_user =
+node_password =
+
+# Alternative for a node on this computer: leave node_user and node_password
+# empty and point this at the node's ".cookie" file instead.
+# node_cookie_file = /home/me/.bitcoin/.cookie
+
+# ---- Where block rewards go (required) --------------------------------------
+
+# Your Bitcoin address. A miner can override it by using a Bitcoin address as
+# its Stratum username ("address" or "address.workername").
+payout_address =
+
+# ---- Optional ---------------------------------------------------------------
+
+# Where miners connect: stratum+tcp://<this computer's IP>:3333
+# stratum_listen = 0.0.0.0:3333
+
+# Status web page: http://<this computer's IP>:3334
+# Use 127.0.0.1:3334 to make it reachable from this computer only, or leave
+# the value empty to turn the page off.
+# status_listen = 0.0.0.0:3334
+
+# Short text written into blocks you find (at most 32 characters).
+# coinbase_tag = /solostratum/
+
+# Share difficulty for a newly connected miner. It adjusts automatically
+# afterwards and never drops below min_difficulty.
+# start_difficulty = 1024
+# min_difficulty = 0.001
+
+# Folder where every block you find is saved before it is sent to the node.
+# blocks_dir = blocks

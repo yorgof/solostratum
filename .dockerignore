@@ -1,0 +1,5 @@
+.git
+e2e
+dist
+*.conf
+blocks

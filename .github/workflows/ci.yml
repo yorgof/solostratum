@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Vet and test
+        run: make test
+      - name: Build for every release platform
+        run: make release VERSION=ci
+
+  e2e:
+    name: End-to-end (Bitcoin Core in Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Mine blocks against real Bitcoin Core nodes
+        run: make e2e

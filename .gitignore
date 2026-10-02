@@ -1,0 +1,12 @@
+# Built program and release archives
+/solostratum
+/solostratum.exe
+/axesim
+/dist/
+
+# Your own settings and found blocks never belong in the repository
+*.conf
+!*.conf.example
+/blocks/
+/data/
+.cookie
