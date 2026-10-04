@@ -514,7 +514,9 @@ function drawHistory() {
     if (tx > left + 26 && tx < left + pw - 26) svg("text", { x: tx, y: H - 6, "text-anchor": "middle" }).textContent = p.tick(d);
   }
 
-  for (const b of bands) {
+  // From the top band down: where a band is too thin to see, the line of the
+  // band below it is the one that shows.
+  for (const b of bands.slice().reverse()) {
     // A band is drawn only where its worker delivered something, so a worker
     // that is away does not paint over the one below it.
     const v = b.s.hashrate, alone = [];
@@ -549,7 +551,7 @@ function drawHistory() {
   // every band and one box that lists them all.
   const cross = svg("g", { visibility: "hidden" });
   const hair = svg("line", { y1: top, y2: top + ph, style: "stroke:var(--dim)" }, cross);
-  for (const b of bands) b.dot = svg("circle", { r: 4, style: "fill:" + b.s.color + ";stroke:var(--panel);stroke-width:2" }, cross);
+  for (const b of bands.slice().reverse()) b.dot = svg("circle", { r: 4, style: "fill:" + b.s.color + ";stroke:var(--panel);stroke-width:2" }, cross);
   const say = (value, name, color) => {
     const row = document.createElement("div"), strong = document.createElement("b");
     strong.textContent = fmtHash(value);
