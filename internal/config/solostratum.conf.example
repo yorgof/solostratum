@@ -44,3 +44,8 @@ payout_address =
 
 # Folder where every block you find is saved before it is sent to the node.
 # blocks_dir = blocks
+
+# Folder for the permanent mining history: each worker's lifetime totals,
+# and its shares for every five minutes. The offline list and the charts on
+# the status page are made from it. Leave the value empty to keep no history.
+# stats_dir = stats

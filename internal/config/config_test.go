@@ -39,6 +39,9 @@ func TestLoadMinimal(t *testing.T) {
 	if want := filepath.Join(filepath.Dir(path), "blocks"); cfg.BlocksDir != want {
 		t.Errorf("blocks dir %q, want %q (next to the settings file)", cfg.BlocksDir, want)
 	}
+	if want := filepath.Join(filepath.Dir(path), "stats"); cfg.StatsDir != want {
+		t.Errorf("stats dir %q, want %q (next to the settings file)", cfg.StatsDir, want)
+	}
 }
 
 func TestLoadAllSettings(t *testing.T) {
@@ -52,7 +55,8 @@ func TestLoadAllSettings(t *testing.T) {
 		"coinbase_tag = /my rig/\r\n"+
 		"start_difficulty = 512\r\n"+
 		"min_difficulty = 0.5\r\n"+
-		"blocks_dir = /srv/found\r\n"))
+		"blocks_dir = /srv/found\r\n"+
+		"stats_dir =\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +65,7 @@ func TestLoadAllSettings(t *testing.T) {
 	}
 	if cfg.PayoutAddress != "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" || cfg.StratumListen != "127.0.0.1:4000" ||
 		cfg.StatusListen != "" || cfg.CoinbaseTag != "/my rig/" || cfg.StartDifficulty != 512 ||
-		cfg.MinDifficulty != 0.5 || cfg.BlocksDir != "/srv/found" {
+		cfg.MinDifficulty != 0.5 || cfg.BlocksDir != "/srv/found" || cfg.StatsDir != "" {
 		t.Errorf("settings: %+v", cfg)
 	}
 }
@@ -112,7 +116,7 @@ func TestExampleFile(t *testing.T) {
 	// Every commented-out example value must equal the built-in default,
 	// so the file documents the real behaviour.
 	uncommented := filled
-	for _, key := range []string{"stratum_listen", "status_listen", "coinbase_tag", "start_difficulty", "min_difficulty", "blocks_dir"} {
+	for _, key := range []string{"stratum_listen", "status_listen", "coinbase_tag", "start_difficulty", "min_difficulty", "blocks_dir", "stats_dir"} {
 		if !strings.Contains(uncommented, "# "+key+" =") {
 			t.Fatalf("example file does not document %s", key)
 		}
@@ -124,6 +128,7 @@ func TestExampleFile(t *testing.T) {
 	}
 	explicit.Dir, cfg.Dir = "", ""
 	explicit.BlocksDir, cfg.BlocksDir = filepath.Base(explicit.BlocksDir), filepath.Base(cfg.BlocksDir)
+	explicit.StatsDir, cfg.StatsDir = filepath.Base(explicit.StatsDir), filepath.Base(cfg.StatsDir)
 	if explicit != cfg {
 		t.Errorf("documented defaults differ from real defaults:\n documented %+v\n real       %+v", explicit, cfg)
 	}

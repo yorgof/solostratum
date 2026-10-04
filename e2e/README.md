@@ -39,9 +39,9 @@ Each scenario runs once per Bitcoin Core version.
 | Scenario | What it proves |
 |----------|----------------|
 | `PayoutAddressTypes` | Blocks are accepted and pay the right amount to legacy, P2SH-segwit, bech32 and taproot addresses, with empty and small blocks. |
-| `UsernameOverride` | A miner's username can redirect its reward; invalid, mistyped or wrong-network addresses fall back to the default. |
+| `UsernameOverride` | A miner's username can redirect its reward; invalid, mistyped or wrong-network addresses fall back to the default. A miner that leaves is listed as offline. |
 | `ManyTransactions` | A block with 300 transactions (deep merkle tree, multi-byte transaction count) is accepted. |
-| `ConsecutiveBlocksAndFiles` | Several blocks in a row are accepted, each saved to its own file whose content is byte-for-byte the block Core stored. |
+| `ConsecutiveBlocksAndFiles` | Several blocks in a row are accepted, each saved to its own file whose content is byte-for-byte the block Core stored. The mining history feeds the charts and is on disk after shutdown. |
 | `NewBlockFromNetwork` | When someone else finds a block, miners get new work within seconds and work on the old tip is refused. |
 | `FirmwareCode` | A header assembled by the Bitaxe firmware's own C code yields an accepted block. |
 | `Cpuminer` | An unrelated, long-established Stratum miner produces accepted blocks. |

@@ -8,9 +8,13 @@
 <link rel="icon" href="data:,">
 <style>
   :root {
-    --bg: #0d1014; --panel: #151a21; --line: #252c36; --text: #e4e8ee;
+    --bg: #0d1014; --panel: #151a21; --line: #252c36; --axis: #36404d; --text: #e4e8ee;
     --dim: #8b96a5; --accent: #f7931a; --ok: #3fb96b; --bad: #e5534b;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    /* Chart colours, one per worker in a fixed order. They were checked as a
+       set against --panel for colour-blind readers: do not change one alone. */
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767; --other: #898781;
   }
   * { box-sizing: border-box; }
   html { background: var(--bg); }
@@ -22,7 +26,7 @@
   header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
   h1 { font-size: 20px; margin: 0; letter-spacing: .2px; }
   h1 span { color: var(--accent); }
-  #version { color: var(--dim); font-size: 13px; }
+  #version, #uptime { color: var(--dim); font-size: 13px; }
   #health { margin-left: auto; font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); }
   #health.ok { color: var(--ok); border-color: #24553a; }
   #health.bad { color: var(--bad); border-color: #6b2b28; }
@@ -36,7 +40,9 @@
   .card .note { color: var(--dim); font-size: 12px; }
   .scroll { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
   table { border-collapse: collapse; width: 100%; font-size: 14px; }
-  th, td { text-align: left; padding: 9px 14px; white-space: nowrap; }
+  th, td { text-align: left; padding: 9px 8px; white-space: nowrap; }
+  th:first-child, td:first-child { padding-left: 14px; }
+  th:last-child, td:last-child { padding-right: 14px; }
   th { color: var(--dim); font-weight: 500; font-size: 12px; border-bottom: 1px solid var(--line); }
   tr + tr td { border-top: 1px solid var(--line); }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -44,14 +50,55 @@
   .dim { color: var(--dim); }
   .ok { color: var(--ok); } .bad { color: var(--bad); } .accent { color: var(--accent); }
   .empty { padding: 18px 14px; color: var(--dim); }
+  /* Text of unknown length is cut off with "…"; hovering shows all of it. */
+  .clip { display: inline-block; max-width: 18ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+  .clip.mono { max-width: 15ch; } /* room for any IPv4 address */
+  .full { display: none; }
+  /* Too narrow for a wide table: each row becomes a block of labelled values. */
+  @media (max-width: 1020px) {
+    .stack, .stack tbody { display: block; }
+    .stack thead { display: none; }
+    .stack tr { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px 14px; padding: 12px 14px; }
+    .stack tr + tr { border-top: 1px solid var(--line); }
+    .stack td { padding: 0; border: 0; text-align: left; min-width: 0; }
+    .stack td::before { content: attr(data-label); display: block; color: var(--dim); font-size: 12px; }
+    .stack td:first-child, #miners td:last-child { grid-column: 1 / -1; }
+    .stack td:first-child { font-size: 15px; font-weight: 600; }
+    .stack td:first-child::before { content: none; }
+    .stack .clip { max-width: 100%; }
+    .stack .short { display: none; }
+    .stack .full { display: inline; white-space: normal; overflow-wrap: anywhere; }
+  }
   #error { display: none; margin-bottom: 16px; padding: 10px 14px; border: 1px solid #6b2b28; border-radius: 8px; color: var(--bad); background: #1d1414; }
   footer { margin-top: 32px; color: var(--dim); font-size: 12px; }
+
+  .heading { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 28px 0 10px; }
+  .heading h2 { margin: 0; }
+  .ranges { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .ranges button { background: none; border: 0; color: var(--dim); font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer; }
+  .ranges button + button { border-left: 1px solid var(--line); }
+  .ranges button:hover { color: var(--text); }
+  .ranges button[aria-pressed="true"] { background: var(--panel); color: var(--text); }
+  .ranges button:focus-visible, #chart svg:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  #chart { position: relative; margin-top: 8px; }
+  #chart.stale svg { opacity: .5; }
+  #chart svg { display: block; width: 100%; touch-action: pan-y; }
+  #chart text { fill: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+  #chart text.name { fill: var(--text); font-size: 12px; }
+  #tip { position: absolute; top: 0; pointer-events: none; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 12px; white-space: nowrap; }
+  #tip .when { display: block; color: var(--dim); margin-bottom: 4px; }
+  #tip b { display: inline-block; min-width: 72px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  /* A short stroke in a worker's chart colour, next to its name. */
+  .key { display: inline-block; width: 12px; height: 3px; border-radius: 2px; margin-right: 8px; vertical-align: middle; }
+  #summary-box { margin-top: 10px; }
+  #summary tr.total td { color: var(--dim); }
 </style>
 </head>
 <body>
 <header>
   <h1>solo<span>stratum</span></h1>
   <span id="version"></span>
+  <span id="uptime"></span>
   <span id="health">connecting…</span>
 </header>
 <div id="error"></div>
@@ -74,7 +121,7 @@
 
 <h2>Miners</h2>
 <div class="scroll">
-  <table id="miners">
+  <table id="miners" class="stack">
     <thead><tr>
       <th>Worker</th><th class="num">Hashrate</th><th class="num">Difficulty</th><th class="num">Accepted</th>
       <th class="num">Rejected</th><th class="num">Best share</th><th>Last share</th><th>Connected</th><th>From</th><th>Pays to</th>
@@ -82,6 +129,44 @@
     <tbody></tbody>
   </table>
   <div class="empty" id="no-miners">No miners connected. Point a miner at <span class="mono">stratum+tcp://&lt;this computer&gt;:<span id="port">3333</span></span>.</div>
+</div>
+
+<div id="offline-section" hidden>
+  <h2>Offline miners</h2>
+  <div class="scroll">
+    <table id="offline" class="stack">
+      <thead><tr>
+        <th>Worker</th><th>Last seen</th><th class="num">Accepted</th><th class="num">Rejected</th>
+        <th class="num">Best share</th><th class="num">Connections</th><th class="num">Online</th><th>First seen</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="history-section" hidden>
+  <div class="heading">
+    <h2>History</h2>
+    <div class="ranges" id="ranges" role="group" aria-label="Period">
+      <button type="button" data-range="24h" aria-pressed="true">24 hours</button>
+      <button type="button" data-range="7d" aria-pressed="false">7 days</button>
+      <button type="button" data-range="30d" aria-pressed="false">30 days</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="label">Hashrate<span id="chart-step"></span></div>
+    <div id="chart"><svg id="plot" role="img" tabindex="0"></svg><div id="tip" hidden></div></div>
+    <div class="empty" id="no-history" hidden>No shares in this period yet.</div>
+  </div>
+  <div class="scroll" id="summary-box">
+    <table id="summary" class="stack">
+      <thead><tr>
+        <th>Worker</th><th class="num">Average</th><th class="num">Accepted</th><th class="num">Rejected</th>
+        <th class="num">Best share</th><th class="num">Connections</th><th class="num">Online</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
 </div>
 
 <h2>Blocks found</h2>
@@ -93,7 +178,7 @@
   <div class="empty" id="no-blocks">None yet.</div>
 </div>
 
-<footer>Updates every 5 seconds. This page is read-only. Hover over a rejected count to see the reasons.</footer>
+<footer>Updates every 5 seconds. This page is read-only. Hover over a worker to see its full name, or over a rejected count to see the reasons.</footer>
 
 <script>
 "use strict";
@@ -105,18 +190,25 @@ function unit(value, units, base) {
   const digits = value >= 100 || i === 0 && Number.isInteger(value) ? 0 : value >= 10 ? 1 : 2;
   return value.toFixed(digits) + units[i];
 }
-const fmtHash = h => h > 0 ? unit(h, [" H/s", " kH/s", " MH/s", " GH/s", " TH/s", " PH/s", " EH/s"], 1000) : "–";
+const hashUnits = [" H/s", " kH/s", " MH/s", " GH/s", " TH/s", " PH/s", " EH/s"];
+const fmtHash = h => h > 0 ? unit(h, hashUnits, 1000) : "–";
 const fmtDiff = d => !(d > 0) ? "–" : d < 1 ? d.toPrecision(3) : unit(d, ["", "k", "M", "G", "T", "P", "E"], 1000);
 const fmtInt = n => Number(n).toLocaleString("en-US");
+
+// dur writes a length of time in its two largest units: "3d 4h", "5h 12m", "40s".
+function dur(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor(s % 3600 / 60) + "m";
+  return Math.floor(s / 86400) + "d " + Math.floor(s % 86400 / 3600) + "h";
+}
 
 function ago(iso, now) {
   const t = Date.parse(iso);
   if (!(t > 0)) return "–";
   const s = Math.max(0, Math.round((now - t) / 1000));
-  if (s < 60) return s + "s ago";
-  if (s < 3600) return Math.floor(s / 60) + "m ago";
-  if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor(s % 3600 / 60) + "m ago";
-  return Math.floor(s / 86400) + "d ago";
+  return s < 86400 ? dur(s) + " ago" : Math.floor(s / 86400) + "d ago";
 }
 
 function span(seconds) {
@@ -138,6 +230,47 @@ function cell(row, text, cls) {
   return td;
 }
 
+function tag(cls, text) {
+  const s = document.createElement("span");
+  s.className = cls;
+  s.textContent = text;
+  return s;
+}
+
+// A short stroke in a chart colour.
+function key(color) {
+  const k = tag("key", "");
+  k.style.background = color;
+  return k;
+}
+
+const shortAddress = a => a.length > 12 ? a.slice(0, 6) + "…" + a.slice(-4) : a;
+
+// A worker called "address.name" is listed as "name". Whatever looks like a
+// Bitcoin address before the first dot is left out; hovering shows it all.
+function workerName(worker) {
+  const dot = worker.indexOf(".");
+  const head = dot < 0 ? worker : worker.slice(0, dot);
+  if (!/^[a-zA-Z0-9]{26,90}$/.test(head)) return worker;
+  return worker.slice(head.length + 1) || shortAddress(head);
+}
+
+// workerCell starts a row with the worker's name, after a stroke in its
+// chart colour if it has one.
+function workerCell(row, worker, title, color) {
+  const td = cell(row, "");
+  if (color) td.append(key(color));
+  td.append(tag("clip", workerName(worker)));
+  td.title = title;
+  return td;
+}
+
+// In the narrow layout every value carries the name of its column.
+function label(table, row) {
+  const heads = table.tHead.rows[0].cells;
+  Array.from(row.cells).forEach((td, i) => td.dataset.label = heads[i].textContent);
+}
+
 function render(r) {
   const now = Date.parse(r.now);
   $("version").textContent = r.version;
@@ -148,7 +281,9 @@ function render(r) {
   err.style.display = r.node.error ? "block" : "none";
   err.textContent = r.node.error ? "Node problem: " + r.node.error : "";
 
-  const pool = r.pool, miners = pool.miners || [], blocks = r.blocks || [];
+  const pool = r.pool, miners = pool.miners || [], blocks = r.blocks || [], offline = r.offline || [];
+  $("uptime").textContent = "up " + dur((now - Date.parse(pool.started)) / 1000);
+  $("uptime").title = "Running since " + new Date(pool.started).toLocaleString();
   $("hashrate").textContent = fmtHash(pool.hashrate);
   $("miners-count").textContent = miners.length + (miners.length === 1 ? " miner" : " miners");
   $("best").textContent = fmtDiff(pool.bestShare);
@@ -171,7 +306,7 @@ function render(r) {
   mb.replaceChildren();
   for (const m of miners) {
     const row = mb.insertRow();
-    cell(row, m.worker).title = m.client || "";
+    workerCell(row, m.worker, m.worker + (m.client ? "\n" + m.client : ""));
     cell(row, fmtHash(m.hashrate), "num");
     cell(row, fmtDiff(m.difficulty), "num");
     cell(row, fmtInt(m.accepted), "num");
@@ -180,11 +315,36 @@ function render(r) {
     cell(row, fmtDiff(m.bestShare), "num");
     cell(row, ago(m.lastShare, now));
     cell(row, ago(m.connected, now));
-    cell(row, m.address, "mono dim");
-    cell(row, m.ownPayout ? m.payout : "default", m.ownPayout ? "mono accent" : "dim");
+    const from = cell(row, "", "dim");
+    from.append(tag("clip mono", m.address));
+    from.title = m.address;
+    const pays = cell(row, m.ownPayout ? "" : "default", m.ownPayout ? "accent" : "dim");
+    if (m.ownPayout) {
+      pays.append(tag("short mono", shortAddress(m.payout)), tag("full mono", m.payout));
+      pays.title = m.payout;
+    }
+    label($("miners"), row);
   }
   $("miners").style.display = miners.length ? "" : "none";
   $("no-miners").style.display = miners.length ? "none" : "";
+
+  // Workers that have mined here before and are not connected now, with
+  // their numbers since they were first seen.
+  const ob = $("offline").tBodies[0];
+  ob.replaceChildren();
+  for (const w of offline) {
+    const row = ob.insertRow();
+    workerCell(row, w.worker, w.worker);
+    cell(row, ago(w.lastSeen, now)).title = new Date(w.lastSeen).toLocaleString();
+    cell(row, fmtInt(w.accepted), "num");
+    cell(row, fmtInt(w.rejected), "num" + (w.rejected ? "" : " dim"));
+    cell(row, fmtDiff(w.bestShare), "num");
+    cell(row, fmtInt(w.connections), "num");
+    cell(row, dur(w.online), "num");
+    cell(row, new Date(w.firstSeen).toLocaleDateString());
+    label($("offline"), row);
+  }
+  $("offline-section").hidden = !offline.length;
 
   const bb = $("blocks").tBodies[0];
   bb.replaceChildren();
@@ -198,6 +358,12 @@ function render(r) {
   }
   $("blocks").style.display = blocks.length ? "" : "none";
   $("no-blocks").style.display = blocks.length ? "none" : "";
+
+  if (r.history && $("history-section").hidden) {
+    $("history-section").hidden = false;
+    loadHistory();
+    setInterval(loadHistory, 60000);
+  }
 }
 
 async function refresh() {
@@ -211,6 +377,238 @@ async function refresh() {
     health.textContent = "solostratum not reachable";
   }
 }
+
+// ---- History: hashrate over time, one band per worker, stacked to the total ----
+
+const clock = d => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+// every: the gaps between time labels to choose from, in hours.
+const periods = {
+  "24h": { name: "24 hours", every: [2, 3, 4, 6, 12], tick: clock },
+  "7d": { name: "7 days", every: [24, 48, 96], tick: d => d.toLocaleDateString([], { weekday: "short", day: "numeric" }) },
+  "30d": { name: "30 days", every: [48, 120, 240, 360], tick: d => d.toLocaleDateString([], { month: "short", day: "numeric" }) },
+};
+let period = "24h", loaded = null, loadedText = "", drawn = null;
+
+// svg adds a shape to the chart, or to a group inside it.
+const plot = $("plot");
+function svg(name, attrs, parent) {
+  const e = document.createElementNS(plot.namespaceURI, name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  (parent || plot).append(e);
+  return e;
+}
+
+async function loadHistory() {
+  const wanted = period;
+  try {
+    const res = await fetch("api/history?range=" + wanted, { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const text = await res.text();
+    if (wanted !== period) return;   // another period was chosen meanwhile
+    if (text !== loadedText) {
+      loadedText = text;
+      loaded = JSON.parse(text);
+      drawHistory();
+    }
+  } catch (e) {
+    // The page header already says so when the server cannot be reached.
+  }
+  if (wanted === period) $("chart").classList.remove("stale");
+}
+
+// A step that puts about `count` round-numbered lines between zero and max.
+function niceStep(max, count) {
+  const raw = max / count, power = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / power;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * power;
+}
+
+// Local clock times `hours` apart, counted back from the newest one before end.
+function clockTicks(start, end, hours) {
+  const out = [], d = new Date(end);
+  d.setMinutes(0, 0, 0);
+  d.setHours(hours >= 24 ? 0 : d.getHours() - d.getHours() % hours);
+  while (d.getTime() > start) {
+    out.push(new Date(d));
+    if (hours >= 24) d.setDate(d.getDate() - hours / 24); else d.setHours(d.getHours() - hours);
+  }
+  return out;
+}
+
+function drawHistory() {
+  const h = loaded, p = periods[period], box = $("chart"), tip = $("tip");
+  const stepMs = h.step * 1000, start = Date.parse(h.start), end = start + h.steps * stepMs;
+  $("chart-step").textContent = ", " + (h.step >= 3600 ? h.step / 3600 + "-hour" : h.step / 60 + "-minute") + " averages";
+
+  // A worker's colour follows its place in the list, which is the same for every period.
+  const all = h.workers.map((w, i) => ({ ...w, count: 1, color: "var(--s" + (i + 1) + ")" }));
+  if (h.other) all.push({ ...h.other, count: Math.max(h.others, 1), color: "var(--other)", worker: h.others === 1 ? "1 other worker" : "Other workers" });
+  const active = all.filter(s => s.accepted || s.rejected || s.connections || s.online);
+  const lines = active.filter(s => s.work > 0);
+  let first = 0;
+  while (first < h.steps && !lines.some(s => s.hashrate[first] > 0)) first++;
+
+  // The numbers below the chart. They also say which colour is which worker.
+  // Averages are taken over the part of the period that was recorded.
+  const covered = (end - Date.parse(h.since)) / 1000, sb = $("summary").tBodies[0];
+  sb.replaceChildren();
+  const summarise = (s, cls) => {
+    const row = sb.insertRow();
+    if (cls) row.className = cls;
+    workerCell(row, s.worker, s.worker, s.color);
+    cell(row, covered > 0 ? fmtHash(s.work * 4294967296 / Math.max(covered, 60)) : "–", "num");
+    cell(row, fmtInt(s.accepted), "num");
+    cell(row, fmtInt(s.rejected), "num" + (s.rejected ? "" : " dim"));
+    cell(row, fmtDiff(s.bestShare), "num");
+    cell(row, fmtInt(s.connections), "num");
+    cell(row, covered > 0 && s.count ? Math.min(100, s.online / (covered * s.count) * 100).toFixed(1) + "%" : "–", "num");
+    label($("summary"), row);
+  };
+  active.forEach(s => summarise(s));
+  if (active.length > 1) {
+    const sum = name => active.reduce((n, s) => n + s[name], 0);
+    summarise({ worker: "All workers", work: sum("work"), accepted: sum("accepted"), rejected: sum("rejected"),
+      bestShare: Math.max(...active.map(s => s.bestShare)), connections: sum("connections") }, "total");
+  }
+  $("summary-box").hidden = !active.length;
+
+  plot.replaceChildren();
+  tip.hidden = true;
+  drawn = null;
+  $("no-history").hidden = first < h.steps;
+  box.hidden = first >= h.steps;
+  if (first >= h.steps) return;
+
+  // Stack the workers with the first one on top, so the bands read from top
+  // to bottom in the order of the list below the chart.
+  let total = new Array(h.steps).fill(0);
+  const bands = lines.slice().reverse().map(s => {
+    const band = { s, low: total, high: s.hashrate.map((v, i) => total[i] + v) };
+    total = band.high;
+    return band;
+  });
+  const peak = Math.max(...total), yStep = niceStep(peak, 4), yMax = Math.ceil(peak / yStep) * yStep;
+
+  const W = box.clientWidth, H = 240, top = 8, bottom = 24, left = 62;
+  // With two to four workers and room to spare, each band is named at its right end.
+  const named = lines.length >= 2 && lines.length <= 4 && W >= 640;
+  const nameOf = s => { const n = workerName(s.worker); return n.length > 14 ? n.slice(0, 13) + "…" : n; };
+  const right = named ? 14 + 7 * Math.max(...lines.map(s => nameOf(s).length)) : 12;
+  const pw = W - left - right, ph = H - top - bottom;
+  const x = i => left + (i + 0.5) / h.steps * pw, y = v => top + ph - v / yMax * ph;
+
+  plot.setAttribute("width", W);
+  plot.setAttribute("height", H);
+  plot.setAttribute("viewBox", "0 0 " + W + " " + H);
+  plot.setAttribute("aria-label", "Hashrate over the last " + p.name + ". The left and right arrow keys read out the values.");
+  let scale = 1, u = 0;
+  while (yMax / scale >= 1000 && u < hashUnits.length - 1) { scale *= 1000; u++; }
+  for (let v = 0; v <= yMax * 1.0001; v += yStep) {
+    svg("line", { x1: left, x2: left + pw, y1: y(v), y2: y(v), style: "stroke:var(" + (v ? "--line" : "--axis") + ")" });
+    svg("text", { x: left - 8, y: y(v), "text-anchor": "end", "dominant-baseline": "middle" })
+      .textContent = v ? +(v / scale).toPrecision(3) + hashUnits[u] : "0";
+  }
+  const gap = p.every.find(n => (end - start) / (n * 3600e3) <= Math.max(2, pw / 72)) || p.every[p.every.length - 1];
+  for (const d of clockTicks(start, end, gap)) {
+    const tx = left + (d - start) / (end - start) * pw;
+    // A label too close to either end would be cut off or run into its neighbour.
+    if (tx > left + 26 && tx < left + pw - 26) svg("text", { x: tx, y: H - 6, "text-anchor": "middle" }).textContent = p.tick(d);
+  }
+
+  for (const b of bands) {
+    // A band is drawn only where its worker delivered something, so a worker
+    // that is away does not paint over the one below it.
+    const v = b.s.hashrate, alone = [];
+    let area = "", line = "", open = -1;
+    const close = to => {
+      if (to === open) alone.push(to);
+      for (let j = to; j >= open; j--) area += "L" + x(j) + " " + y(b.low[j]);
+      area += "Z";
+      open = -1;
+    };
+    for (let j = first; j < h.steps; j++) {
+      if (v[j] > 0 || v[j - 1] > 0 || v[j + 1] > 0) {
+        const point = (open < 0 ? "M" : "L") + x(j) + " " + y(b.high[j]);
+        area += point;
+        line += point;
+        if (open < 0) open = j;
+      } else if (open >= 0) close(j - 1);
+    }
+    if (open >= 0) close(h.steps - 1);
+    svg("path", { d: area, style: "fill:" + b.s.color + ";fill-opacity:.14" });
+    svg("path", { d: line, style: "fill:none;stroke:" + b.s.color + ";stroke-width:2;stroke-linejoin:round;stroke-linecap:round" });
+    // A single point has no line to show it.
+    for (const j of alone) svg("circle", { cx: x(j), cy: y(b.high[j]), r: 4, style: "fill:" + b.s.color + ";stroke:var(--panel);stroke-width:2" });
+    const last = h.steps - 1;
+    if (named && y(b.low[last]) - y(b.high[last]) >= 14) {
+      svg("text", { x: left + pw + 8, y: (y(b.low[last]) + y(b.high[last])) / 2, "dominant-baseline": "middle", class: "name" })
+        .textContent = nameOf(b.s);
+    }
+  }
+
+  // The hover layer: a hairline that snaps to the nearest step, a dot on
+  // every band and one box that lists them all.
+  const cross = svg("g", { visibility: "hidden" });
+  const hair = svg("line", { y1: top, y2: top + ph, style: "stroke:var(--dim)" }, cross);
+  for (const b of bands) b.dot = svg("circle", { r: 4, style: "fill:" + b.s.color + ";stroke:var(--panel);stroke-width:2" }, cross);
+  const say = (value, name, color) => {
+    const row = document.createElement("div"), strong = document.createElement("b");
+    strong.textContent = fmtHash(value);
+    row.append(strong);
+    if (color) row.append(key(color));
+    row.append(tag("dim", name));
+    tip.append(row);
+  };
+  const show = j => {
+    j = Math.min(h.steps - 1, Math.max(first, j));
+    drawn.at = j;
+    cross.setAttribute("visibility", "visible");
+    hair.setAttribute("x1", x(j));
+    hair.setAttribute("x2", x(j));
+    const from = new Date(start + j * stepMs);
+    tip.replaceChildren(tag("when", from.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" }) +
+      ", " + clock(from) + " – " + clock(new Date(start + (j + 1) * stepMs))));
+    if (bands.length > 1) say(total[j], "all workers");
+    for (const b of bands.slice().reverse()) {
+      b.dot.setAttribute("cx", x(j));
+      b.dot.setAttribute("cy", y(b.high[j]));
+      b.dot.setAttribute("visibility", b.s.hashrate[j] > 0 ? "inherit" : "hidden");
+      say(b.s.hashrate[j], workerName(b.s.worker), b.s.color);
+    }
+    tip.hidden = false;
+    // Beside the hairline, on the side with more room, and never off the chart.
+    tip.style.left = Math.max(0, Math.min(W - tip.offsetWidth, x(j) < W / 2 ? x(j) + 12 : x(j) - 12 - tip.offsetWidth)) + "px";
+  };
+  drawn = {
+    at: -1, width: W, last: h.steps - 1, show,
+    hide: () => { cross.setAttribute("visibility", "hidden"); tip.hidden = true; drawn.at = -1; },
+    point: e => show(Math.round((e.clientX - plot.getBoundingClientRect().left - left) / pw * h.steps - 0.5)),
+  };
+}
+
+// The chart is redrawn often; its listeners stay and act on the latest drawing.
+plot.addEventListener("pointermove", e => drawn?.point(e));
+plot.addEventListener("pointerdown", e => drawn?.point(e));
+plot.addEventListener("pointerleave", () => drawn?.hide());
+plot.addEventListener("focus", () => { if (drawn && drawn.at < 0) drawn.show(drawn.last); });
+plot.addEventListener("blur", () => drawn?.hide());
+plot.addEventListener("keydown", e => {
+  if (!drawn) return;
+  if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    drawn.show(drawn.at < 0 ? drawn.last : drawn.at + (e.key === "ArrowLeft" ? -1 : 1));
+    e.preventDefault();
+  } else if (e.key === "Escape") drawn.hide();
+});
+
+for (const button of $("ranges").children) {
+  button.addEventListener("click", () => {
+    period = button.dataset.range;
+    for (const b of $("ranges").children) b.setAttribute("aria-pressed", String(b === button));
+    $("chart").classList.add("stale");   // the old chart stays, dimmed, until the new one arrives
+    loadHistory();
+  });
+}
+addEventListener("resize", () => { if (drawn && drawn.width !== $("chart").clientWidth) drawHistory(); });
+
 refresh();
 setInterval(refresh, 5000);
 </script>

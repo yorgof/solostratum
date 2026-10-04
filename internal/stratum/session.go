@@ -156,10 +156,13 @@ func (s *session) run() {
 	}
 
 	s.mu.Lock()
-	authorized := s.authorized
+	authorized, worker := s.authorized, s.worker
 	s.mu.Unlock()
 	if authorized {
 		log.Printf("Miner disconnected: %s", s.label())
+		if s.srv.stats != nil {
+			s.srv.stats.Disconnected(worker, time.Now())
+		}
 	}
 }
 
@@ -352,6 +355,9 @@ func (s *session) handleAuthorize(req *request, params []json.RawMessage) {
 		note = "paying to its own address " + payout
 	}
 	log.Printf("Miner connected: %s from %s [%s], %s", user, s.remote, client, note)
+	if s.srv.stats != nil {
+		s.srv.stats.Connected(user, time.Now())
+	}
 	if ready {
 		s.sendCurrentJob()
 	}
@@ -515,8 +521,13 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 			s.rejectReasons = make(map[string]uint64)
 		}
 		s.rejectReasons[msg]++
+		worker := s.worker
 		s.mu.Unlock()
 		s.srv.rejected.Add(1)
+		// A miner that has not logged in yet has no name to record it under.
+		if s.srv.stats != nil && worker != "" {
+			s.srv.stats.Rejected(worker, time.Now())
+		}
 		s.reply(req.ID, nil, code, msg)
 	}
 
@@ -635,6 +646,9 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	s.mu.Unlock()
 	s.srv.accepted.Add(1)
 	s.srv.noteBest(shareDiff)
+	if s.srv.stats != nil {
+		s.srv.stats.Accepted(worker, now, credit, shareDiff)
+	}
 	s.reply(req.ID, true, 0, "")
 
 	if isBlock {

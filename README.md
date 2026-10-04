@@ -11,7 +11,9 @@ your address. No pool, no account, no fees.
 - Checks your settings and your node before it starts, and tells you in
   plain words what is wrong.
 - Every block found is saved to disk before it is sent to the node.
-- A simple status page shows your miners, hashrate and best shares.
+- A simple status page shows your miners, hashrate and best shares, with
+  charts of the last day, week and month.
+- The history of every miner is kept for good, in plain text files.
 - No external dependencies: Go standard library only.
 
 > **Project status: new.** solostratum has been tested with real miners:
@@ -141,6 +143,7 @@ All settings live in `solostratum.conf`, next to the program. Use
 | `start_difficulty` | `1024`            | Share difficulty for a new miner. Adjusts automatically. |
 | `min_difficulty`   | `0.001`           | Lowest share difficulty. |
 | `blocks_dir`       | `blocks`          | Folder for found blocks. |
+| `stats_dir`        | `stats`           | Folder for the mining history. Empty keeps no history and shows no charts. |
 
 A typo in a setting name is reported with its line number instead of being
 silently ignored.
@@ -161,8 +164,53 @@ the node, the block being worked on, and every miner with its hashrate,
 difficulty, shares and best share. It is read-only and loads nothing from
 the internet. The same data is available as JSON at `/api/status`.
 
+- **Miners** are the ones connected right now, with their numbers since
+  they connected. The top of the page says how long solostratum itself has
+  been running.
+- **Offline miners** have mined here before and are not connected. The
+  list shows when each was last seen and its numbers since it was first
+  seen, so a miner that has dropped out does not go unnoticed.
+- **History** charts the hashrate over the last 24 hours, 7 days or 30
+  days, one band per miner stacked up to the total. Below it are each
+  miner's average, shares, best share, number of connections and share of
+  the time it was online in that period. A miner that keeps reconnecting
+  shows up here. The chart's data is at `/api/history?range=24h` (or `7d`,
+  `30d`).
+
+A miner named `bc1q....workername` is listed as `workername`; hover over
+the name to see all of it. On a narrow screen the tables turn into one
+block per miner, so nothing needs sideways scrolling.
+
 The page has no login. Anyone on your network can view it; nobody can
 change anything through it.
+
+## Mining history
+
+The offline list and the charts come from the `stats` folder, which
+outlives restarts. It holds plain text files that are yours to read, chart
+or back up:
+
+- `workers.json` has the lifetime totals of every worker: when it was first
+  and last seen, accepted and rejected shares, total work, best share,
+  number of connections and time online.
+- `history-2026-10.jsonl`, one file per month, has one line per worker for
+  every five minutes in which it was connected:
+
+  ```json
+  {"t":"2026-10-03T12:05:00Z","worker":"bitaxe1","accepted":42,"rejected":0,"work":43008,"bestShare":182934.2,"connections":0,"online":300}
+  ```
+
+`t` is the start of the five minutes, in UTC. `work` is the sum of the
+accepted shares' difficulties, so the average hashrate over any period is
+`work × 2³² ÷ seconds`. `connections` counts how often the miner logged in
+and `online` the seconds it was connected. Lines add up: after a restart
+the same worker and time can appear twice. A worker is recorded under its
+full Stratum username.
+
+The files are written every five minutes and when solostratum stops, so a
+power cut loses at most the last five minutes. One miner adds 15 to 20 MB
+a year. To drop a miner you no longer own from the offline list, stop
+solostratum and remove its entry from `workers.json`.
 
 ## When you find a block
 

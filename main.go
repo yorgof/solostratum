@@ -24,6 +24,7 @@ import (
 	"github.com/yorgof/solostratum/internal/btc"
 	"github.com/yorgof/solostratum/internal/config"
 	"github.com/yorgof/solostratum/internal/rpc"
+	"github.com/yorgof/solostratum/internal/stats"
 	"github.com/yorgof/solostratum/internal/status"
 	"github.com/yorgof/solostratum/internal/stratum"
 	"github.com/yorgof/solostratum/internal/work"
@@ -123,6 +124,13 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	manager := work.NewManager(node, info.Chain, cfg.CoinbaseTag, server.Broadcast)
 	server.SetJobs(manager)
 	managerRef.Store(manager)
+	var history *stats.Store
+	if cfg.StatsDir != "" {
+		if history, err = stats.Open(cfg.StatsDir); err != nil {
+			return fmt.Errorf("cannot use stats_dir %s: %v\n  (change stats_dir in the settings file, or leave it empty to keep no history)", cfg.StatsDir, err)
+		}
+		server.SetRecorder(history)
+	}
 
 	if err := selfTest(ctx, manager, payoutScript, checkOnly); err != nil {
 		return err
@@ -150,14 +158,22 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	wg.Add(2)
 	go func() { defer wg.Done(); manager.Run(ctx) }()
 	go func() { defer wg.Done(); server.Serve(ctx) }()
+	if history != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); history.Run(ctx) }()
+	}
 	if statusListener != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := status.Serve(ctx, statusListener, status.Sources{
+			src := status.Sources{
 				Version: version, PayoutAddress: cfg.PayoutAddress, StratumPort: stratumPort,
 				Node: manager.State, Pool: server.Status, Blocks: store.Records,
-			})
+			}
+			if history != nil {
+				src.Offline, src.History = history.Offline, history.Series
+			}
+			err := status.Serve(ctx, statusListener, src)
 			if err != nil {
 				log.Printf("Status page stopped: %v", err)
 			}
