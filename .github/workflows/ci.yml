@@ -13,10 +13,11 @@ jobs:
     name: Unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
+          cache: false # no go.sum to key a cache on: the program has no dependencies
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
       - name: Vet and test
@@ -28,9 +29,10 @@ jobs:
     name: End-to-end (Bitcoin Core in Docker)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
+          cache: false # no go.sum to key a cache on: the program has no dependencies
       - name: Mine blocks against real Bitcoin Core nodes
         run: make e2e

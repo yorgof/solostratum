@@ -1,10 +1,10 @@
 name: Release
 
-# Pushing a tag like v0.1.0 builds the program for every supported platform
-# and publishes the archives as a GitHub release.
+# Pushing a version tag like 1.0.0 builds the program for every supported
+# platform and publishes the archives as a GitHub release.
 on:
   push:
-    tags: ["v*"]
+    tags: ["[0-9]*"]
 
 permissions:
   contents: write
@@ -13,10 +13,11 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
+          cache: false # no go.sum to key a cache on: the program has no dependencies
       - name: Test
         run: make test
       - name: Build archives
