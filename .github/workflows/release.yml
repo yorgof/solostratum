@@ -1,10 +1,10 @@
 name: Release
 
-# Pushing a tag like v0.1.0 builds the program for every supported platform
-# and publishes the archives as a GitHub release.
+# Pushing a version tag like 1.0.0 builds the program for every supported
+# platform and publishes the archives as a GitHub release.
 on:
   push:
-    tags: ["v*"]
+    tags: ["[0-9]*"]
 
 permissions:
   contents: write

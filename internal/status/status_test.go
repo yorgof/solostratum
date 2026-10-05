@@ -25,7 +25,7 @@ func testServer(t *testing.T, found []blocks.Record) *httptest.Server {
 // serve starts the status page; change may adjust its sources first.
 func serve(t *testing.T, found []blocks.Record, change func(*Sources)) *httptest.Server {
 	src := Sources{
-		Version: "v1.2.3", PayoutAddress: "bc1qexample", StratumPort: "3333",
+		Version: "1.2.3", PayoutAddress: "bc1qexample", StratumPort: "3333",
 		Node: func() work.NodeState { return work.NodeState{Chain: "main", Connected: true, Height: 900000} },
 		Pool: func() stratum.Status {
 			return stratum.Status{Started: time.Now(), Miners: []stratum.MinerStatus{{Worker: `<script>alert(1)</script>`}}}
@@ -54,7 +54,7 @@ func TestAPI(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		t.Fatal(err)
 	}
-	if r["version"] != "v1.2.3" || r["payoutAddress"] != "bc1qexample" || r["stratumPort"] != "3333" {
+	if r["version"] != "1.2.3" || r["payoutAddress"] != "bc1qexample" || r["stratumPort"] != "3333" {
 		t.Errorf("report: %v", r)
 	}
 	// Lists must be arrays, never null, so the page can iterate them.
