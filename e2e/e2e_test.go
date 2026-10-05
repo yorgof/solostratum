@@ -370,6 +370,12 @@ type statusReport struct {
 		Status string `json:"status"`
 		Worker string `json:"worker"`
 	} `json:"blocks"`
+	Offline []struct {
+		Worker      string `json:"worker"`
+		Accepted    uint64 `json:"accepted"`
+		Connections uint64 `json:"connections"`
+	} `json:"offline"`
+	History bool `json:"history"`
 }
 
 func (b *bridge) status() statusReport {
@@ -567,6 +573,11 @@ func testUsernameOverride(t *testing.T, image string) {
 		}
 		m.Close()
 		eventually(t, 5*time.Second, "miner to disappear from the status page", func() bool { return len(b.status().Pool.Miners) == 0 })
+		// A miner that has left is remembered, the last to leave first.
+		eventually(t, 5*time.Second, "miner to be listed as offline", func() bool {
+			off := b.status().Offline
+			return len(off) > 0 && off[0].Worker == c.user && off[0].Accepted > 0 && off[0].Connections == 1
+		})
 	}
 }
 
@@ -656,11 +667,49 @@ func testConsecutiveBlocks(t *testing.T, image string) {
 		t.Errorf("%d result files, want %d", len(results), count)
 	}
 
+	// The charts on the status page are fed from the mining history.
+	var series struct {
+		Steps   int `json:"steps"`
+		Workers []struct {
+			Worker      string    `json:"worker"`
+			Connections uint64    `json:"connections"`
+			Hashrate    []float64 `json:"hashrate"`
+		} `json:"workers"`
+	}
+	resp, err := http.Get(b.statusURL + "/api/history?range=24h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&series)
+	resp.Body.Close()
+	if err != nil || !b.status().History || series.Steps != 96 || len(series.Workers) != 1 ||
+		series.Workers[0].Worker != "bitaxe" || len(series.Workers[0].Hashrate) != 96 {
+		t.Errorf("history (%v): %+v", err, series)
+	}
+
 	// A restart must not lose the history of found blocks.
 	m.Close()
 	b.stop()
 	if !strings.Contains(b.logs.String(), "Shutting down") {
 		t.Error("no clean shutdown message in the log")
+	}
+
+	// Shutting down writes the mining history: the worker's lifetime totals
+	// and its shares per interval.
+	var totals map[string]struct {
+		Accepted    uint64 `json:"accepted"`
+		Connections uint64 `json:"connections"`
+	}
+	raw, err := os.ReadFile(filepath.Join(b.dir, "stats", "workers.json"))
+	if err != nil || json.Unmarshal(raw, &totals) != nil || totals["bitaxe"].Accepted < count || totals["bitaxe"].Connections != 1 {
+		t.Errorf("worker totals after shutdown: %s (%v)", raw, err)
+	}
+	history, _ := filepath.Glob(filepath.Join(b.dir, "stats", "history-*.jsonl"))
+	if len(history) == 0 {
+		t.Fatal("no history file after shutdown")
+	}
+	if lines, _ := os.ReadFile(history[0]); !strings.Contains(string(lines), `"worker":"bitaxe"`) {
+		t.Errorf("history after shutdown: %s", lines)
 	}
 }
 

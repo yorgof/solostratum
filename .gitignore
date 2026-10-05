@@ -4,9 +4,11 @@
 /axesim
 /dist/
 
-# Your own settings and found blocks never belong in the repository
+# Your own settings, found blocks and mining history never belong in the
+# repository
 *.conf
 !*.conf.example
 /blocks/
+/stats/
 /data/
 .cookie

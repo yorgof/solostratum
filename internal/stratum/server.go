@@ -29,6 +29,15 @@ type BlockSink interface {
 	Found(height int64, hash string, block []byte, worker string)
 }
 
+// Recorder receives every connection and share for the long-term
+// statistics. It is implemented by stats.Store.
+type Recorder interface {
+	Connected(worker string, at time.Time)
+	Disconnected(worker string, at time.Time)
+	Accepted(worker string, at time.Time, credit, shareDiff float64)
+	Rejected(worker string, at time.Time)
+}
+
 // Options configures a Server.
 type Options struct {
 	Network         btc.Network
@@ -43,6 +52,7 @@ type Server struct {
 	opts   Options
 	jobs   Jobs
 	blocks BlockSink
+	stats  Recorder // nil when no statistics are kept
 
 	mu       sync.Mutex
 	sessions map[[work.Extranonce1Size]byte]*session
@@ -68,6 +78,10 @@ func NewServer(opts Options, jobs Jobs, blocks BlockSink) *Server {
 
 // SetJobs sets the job source. It must be called before Serve.
 func (s *Server) SetJobs(jobs Jobs) { s.jobs = jobs }
+
+// SetRecorder makes the server report every connection and share to stats.
+// It must be called before Serve.
+func (s *Server) SetRecorder(stats Recorder) { s.stats = stats }
 
 // Listen opens the listening socket.
 func (s *Server) Listen(addr string) error {

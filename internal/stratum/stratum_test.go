@@ -87,6 +87,46 @@ func (f *fakeSink) Found(height int64, hash string, block []byte, worker string)
 	f.ch <- foundBlock{height, hash, block, worker}
 }
 
+// recorded is one call to the Recorder.
+type recorded struct {
+	event             string
+	worker            string
+	credit, shareDiff float64
+}
+
+type fakeRecorder struct {
+	mu     sync.Mutex
+	events []recorded
+}
+
+func (f *fakeRecorder) add(e recorded) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, e)
+}
+
+func (f *fakeRecorder) Connected(worker string, at time.Time) {
+	f.add(recorded{event: "connected", worker: worker})
+}
+
+func (f *fakeRecorder) Disconnected(worker string, at time.Time) {
+	f.add(recorded{event: "disconnected", worker: worker})
+}
+
+func (f *fakeRecorder) Accepted(worker string, at time.Time, credit, shareDiff float64) {
+	f.add(recorded{"accepted", worker, credit, shareDiff})
+}
+
+func (f *fakeRecorder) Rejected(worker string, at time.Time) {
+	f.add(recorded{event: "rejected", worker: worker})
+}
+
+func (f *fakeRecorder) all() []recorded {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]recorded(nil), f.events...)
+}
+
 func makeJob(t *testing.T, id, bits string, version uint32, txs int, clean bool) *work.Job {
 	t.Helper()
 	tmpl := &rpc.BlockTemplate{
@@ -113,21 +153,23 @@ func makeJob(t *testing.T, id, bits string, version uint32, txs int, clean bool)
 }
 
 type harness struct {
-	t    *testing.T
-	srv  *Server
-	jobs *fakeJobs
-	sink *fakeSink
-	addr string
+	t     *testing.T
+	srv   *Server
+	jobs  *fakeJobs
+	sink  *fakeSink
+	stats *fakeRecorder
+	addr  string
 }
 
 func newHarness(t *testing.T, startDiff float64, job *work.Job) *harness {
 	t.Helper()
-	h := &harness{t: t, jobs: &fakeJobs{}, sink: &fakeSink{ch: make(chan foundBlock, 16)}}
+	h := &harness{t: t, jobs: &fakeJobs{}, sink: &fakeSink{ch: make(chan foundBlock, 16)}, stats: &fakeRecorder{}}
 	h.jobs.add(job)
 	h.srv = NewServer(Options{
 		Network: regtest, DefaultAddress: defaultAddress, DefaultScript: defaultScript,
 		StartDifficulty: startDiff, MinDifficulty: startDiff / 100,
 	}, h.jobs, h.sink)
+	h.srv.SetRecorder(h.stats)
 	if err := h.srv.Listen("127.0.0.1:0"); err != nil {
 		t.Fatal(err)
 	}
@@ -279,6 +321,52 @@ func TestLowDifficultyDuplicateAndStale(t *testing.T) {
 
 // A second connection must not be able to replay another miner's share: the
 // extranonce differs, so the same numbers give a different hash.
+func TestConnectionsAndSharesAreRecorded(t *testing.T) {
+	h := newHarness(t, lowDifficulty, makeJob(t, "1", diff1Bits, 0x20000000, 0, true))
+
+	// A miner that has not logged in has no name to be recorded under.
+	c := h.raw()
+	c.send(`{"id":1,"method":"mining.submit","params":["w","1","00000000","6553f100","00000000"]}`)
+	if msg := c.answer(1); msg["error"] == nil {
+		t.Fatal("submit before subscribe was not rejected")
+	}
+	c.conn.Close()
+
+	worker := otherAddress + ".rig"
+	m := h.dial(axesim.Options{User: worker})
+	good := mustMine(t, m, firstJob(t, m), lowDifficulty)
+	if res := mustSubmit(t, m, good); !res.Accepted {
+		t.Fatalf("good share rejected: %+v", res)
+	}
+	if res := mustSubmit(t, m, good); res.Accepted {
+		t.Fatal("duplicate share accepted")
+	}
+	m.Close()
+
+	want := []recorded{
+		{event: "connected", worker: worker},
+		{"accepted", worker, lowDifficulty, axesim.HashDifficulty(good.Hash)},
+		{event: "rejected", worker: worker},
+		{event: "disconnected", worker: worker},
+	}
+	var got []recorded
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got = h.stats.all(); len(got) >= len(want) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("recorded: %+v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("event %d recorded as %+v, want %+v", i+1, got[i], want[i])
+		}
+	}
+}
+
 func TestSharesAreBoundToTheConnection(t *testing.T) {
 	h := newHarness(t, lowDifficulty, makeJob(t, "1", diff1Bits, 0x20000000, 1, true))
 	a, b := h.dial(axesim.Options{}), h.dial(axesim.Options{})

@@ -5,7 +5,7 @@
 #       -p 3333:3333 -p 3334:3334 -v "$PWD/data:/data" solostratum
 #
 # Put your solostratum.conf into the mounted data folder. Found blocks are
-# saved to data/blocks.
+# saved to data/blocks and the mining history to data/stats.
 FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod ./

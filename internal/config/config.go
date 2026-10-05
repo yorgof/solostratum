@@ -38,6 +38,7 @@ type Config struct {
 	StartDifficulty float64
 	MinDifficulty   float64
 	BlocksDir       string
+	StatsDir        string // empty turns the statistics off
 
 	// Dir is the directory of the settings file; relative paths resolve
 	// against it.
@@ -54,6 +55,7 @@ func Defaults() Config {
 		StartDifficulty: 1024,
 		MinDifficulty:   0.001,
 		BlocksDir:       "blocks",
+		StatsDir:        "stats",
 	}
 }
 
@@ -135,6 +137,8 @@ func (c *Config) set(key, value string) error {
 		c.CoinbaseTag = value
 	case "blocks_dir":
 		c.BlocksDir = value
+	case "stats_dir":
+		c.StatsDir = value
 	case "start_difficulty":
 		return parsePositive(key, value, &c.StartDifficulty)
 	case "min_difficulty":
@@ -198,6 +202,9 @@ func (c *Config) validate() error {
 		return errors.New("blocks_dir must not be empty")
 	}
 	c.BlocksDir = c.resolve(c.BlocksDir)
+	if c.StatsDir != "" {
+		c.StatsDir = c.resolve(c.StatsDir)
+	}
 	if c.NodeCookieFile != "" {
 		c.NodeCookieFile = c.resolve(c.NodeCookieFile)
 	}
