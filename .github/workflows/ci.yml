@@ -43,9 +43,9 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Run native race tests
-        run: go test -race -coverprofile=coverage.out ./...
+        run: go test -race -coverprofile coverage.out ./...
       - name: Report coverage
-        run: go tool cover -func=coverage.out
+        run: go tool cover -func coverage.out
 
   e2e:
     name: End-to-end (Bitcoin Core in Docker)
