@@ -235,7 +235,11 @@ bitcoin-cli submitblock "$(cat blocks/block-....hex)"
   current template and asks the node to validate it (everything except the
   proof of work). If the node objects, mining does not start.
 - **Unit tests** check the Bitcoin building blocks against real mainnet
-  blocks and the official address test vectors.
+  blocks and the official address test vectors. They also cover startup,
+  protocol errors, node outages, shutdown, disk-write recovery, and the CPU
+  miner. CI runs them natively on Linux, Windows and macOS.
+- **Cache regression and fuzz tests** check that transaction caching never
+  changes a template's block bytes or hides malformed data.
 - **End-to-end tests** start real Bitcoin Core nodes in Docker, mine
   through the Stratum port, and assert that Core accepts the blocks and
   that the coinbase pays the right address. They use three independent
@@ -243,8 +247,18 @@ bitcoin-cli submitblock "$(cat blocks/block-....hex)"
   code compiled for the test, and cpuminer. See [e2e/README.md](e2e/README.md).
 
 ```sh
-make test   # fast, no Docker
-make e2e    # needs Docker, takes a few minutes
+make test      # vet and race tests, no Docker; writes coverage.out
+make coverage  # the same checks, followed by coverage for every function
+make e2e       # needs Docker, takes a few minutes
+```
+
+For the annotated coverage report, run `go tool cover -html=coverage.out`.
+Statement coverage helps locate untested code; the tests also check failure
+handling and boundary behavior that a percentage alone cannot establish.
+To extend the cache fuzz run locally:
+
+```sh
+go test ./internal/work -run '^$' -fuzz '^FuzzCachedTemplateMatchesFresh$' -fuzztime 30s -parallel 2
 ```
 
 To try your own setup without mining hardware there is a CPU miner that

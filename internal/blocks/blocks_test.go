@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -271,6 +272,9 @@ func TestInterruptedSubmissionIsResumed(t *testing.T) {
 }
 
 func TestUnwritableDirectoryIsReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows permissions are not controlled by Unix mode bits")
+	}
 	if os.Getuid() == 0 {
 		t.Skip("root can write anywhere")
 	}
@@ -279,6 +283,23 @@ func TestUnwritableDirectoryIsReported(t *testing.T) {
 	defer os.Chmod(parent, 0o700)
 	if _, err := Open(filepath.Join(parent, "blocks"), &fakeNode{}, nil); err == nil {
 		t.Fatal("an unwritable blocks folder was accepted")
+	}
+}
+
+func TestBlockIsDeliveredWhenSavingFails(t *testing.T) {
+	node := &fakeNode{}
+	s, dir, accepted := open(t, node)
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.Found(100, "aa", []byte{1, 2}, "rig")
+	s.Wait()
+	records := s.Records()
+	if node.calls != 1 || accepted.Load() != 1 || len(records) != 1 || records[0].Status != "accepted" || records[0].File != "" {
+		t.Fatalf("disk failure prevented delivery: calls %d, accepted %d, records %+v", node.calls, accepted.Load(), records)
 	}
 }
 

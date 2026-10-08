@@ -1,9 +1,11 @@
 package status
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -198,5 +200,44 @@ func TestHistoryIsOffWithoutStatistics(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("history without statistics = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestServeCancellationAndListenerFailure(t *testing.T) {
+	for _, broken := range []bool{false, true} {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if broken {
+			l.Close()
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- Serve(ctx, l, Sources{}) }()
+		if !broken {
+			client := &http.Client{Timeout: time.Second}
+			resp, err := client.Head("http://" + l.Addr().String() + "/")
+			if err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil || len(body) != 0 || resp.StatusCode != 200 {
+				t.Errorf("HEAD: status %d, body %q, error %v", resp.StatusCode, body, err)
+			}
+			cancel()
+		}
+		select {
+		case err := <-done:
+			if broken != (err != nil) {
+				t.Errorf("closed listener %v: %v", broken, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("status server did not stop")
+		}
+		cancel()
+		l.Close()
 	}
 }

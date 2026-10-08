@@ -724,3 +724,84 @@ func TestUnwrittenHistoryIsBounded(t *testing.T) {
 		t.Fatalf("lifetime totals %d, want %d", got, intervals)
 	}
 }
+
+func TestFlushAfterRunKeepsLateMinerEvents(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	start := time.Now().UTC().Truncate(time.Second)
+	s.Connected("rig", start)
+	s.Accepted("rig", start, 2, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.Run(ctx)
+	// The server drains after the history loop has stopped.
+	s.Accepted("rig", start.Add(5*time.Second), 4, 8)
+	s.Disconnected("rig", start.Add(10*time.Second))
+	s.Flush(start.Add(11 * time.Second))
+	s.Flush(start.Add(12 * time.Second)) // repeating the final flush is harmless
+	want := Counts{Accepted: 2, Work: 6, BestShare: 8, Connections: 1, Online: 10}
+	if got := open(t, dir).totals["rig"].Counts; got != want {
+		t.Fatalf("persisted totals %+v, want %+v", got, want)
+	}
+	var sum Counts
+	if err := s.readHistory(start.Add(-Interval), start.Add(24*time.Hour), func(sample Sample) { sum.add(sample.Counts) }); err != nil {
+		t.Fatal(err)
+	}
+	if sum != want {
+		t.Fatalf("history %+v, want %+v", sum, want)
+	}
+}
+
+func TestTotalsRetryDoesNotDuplicateHistory(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:00:00Z")
+	s.Accepted("rig", when, 1, 2)
+	s.Flush(when)
+	blocked := filepath.Join(dir, totalsFile+".tmp")
+	if err := os.Mkdir(blocked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.Accepted("rig", when.Add(time.Second), 4, 8)
+	s.Flush(when.Add(2 * time.Second))
+	if !s.changed || open(t, dir).totals["rig"].Accepted != 1 {
+		t.Fatal("failed write changed disk totals or was not retained for retry")
+	}
+	if err := os.Remove(blocked); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	s.Flush(when.Add(3 * time.Second))
+	if got := open(t, dir).totals["rig"].Counts; got != (Counts{Accepted: 2, Work: 5, BestShare: 8}) {
+		t.Fatalf("recovered totals %+v", got)
+	}
+	if lines := history(t, dir, "2026-10"); len(lines) != 2 {
+		t.Fatalf("retry duplicated history: %+v", lines)
+	}
+}
+
+func TestFailedTailRepairDoesNotAppend(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:00:00Z")
+	path := filepath.Join(dir, historyFile(when))
+	if err := os.WriteFile(path, []byte("unfinished"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := appendHistoryBatch(shortHistoryFile{File: f, failTruncate: true}, []byte("new\n"))
+	f.Close()
+	if err == nil || n != 0 {
+		t.Fatalf("failed repair committed %d lines, error %v", n, err)
+	}
+	if raw, err := os.ReadFile(path); err != nil || string(raw) != "unfinished" {
+		t.Fatalf("failed repair modified file: %q, %v", raw, err)
+	}
+	sample := Sample{when, "rig", Counts{Accepted: 1}}
+	if n, err := s.appendHistory([]Sample{sample}); err != nil || n != 1 {
+		t.Fatalf("retry: %d, %v", n, err)
+	}
+	checkHistory(t, history(t, dir, "2026-10"), []Sample{sample})
+}

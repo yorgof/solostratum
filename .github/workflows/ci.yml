@@ -21,9 +21,31 @@ jobs:
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
       - name: Vet and test
-        run: make test
+        run: make coverage
+      - name: Fuzz transaction cache consistency
+        run: go test ./internal/work -run '^$' -fuzz '^FuzzCachedTemplateMatchesFresh$' -fuzztime 10s -parallel 2
       - name: Build for every release platform
         run: make release VERSION=ci
+
+  platforms:
+    name: Unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Vet
+        run: go vet ./...
+      - name: Run native race tests
+        run: go test -race -coverprofile=coverage.out ./...
+      - name: Report coverage
+        run: go tool cover -func=coverage.out
 
   e2e:
     name: End-to-end (Bitcoin Core in Docker)

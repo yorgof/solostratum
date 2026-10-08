@@ -144,10 +144,6 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 			if hashes[i], err = btc.HashFromDisplayHex(tx.Hash); err != nil {
 				return nil, nil, fmt.Errorf("template transaction %d hash: %w", i, err)
 			}
-			if data, ok := cache[hashes[i]]; ok {
-				j.txData[i] = data
-				continue
-			}
 		}
 		if j.txData[i], err = hex.DecodeString(tx.Data); err != nil {
 			return nil, nil, fmt.Errorf("template transaction %d: %w", i, err)
@@ -161,13 +157,12 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 				log.Printf("WARNING: the node's block template reports a hash for transaction %s that does not match its data. Mining continues with the data.", tx.TxID)
 			})
 		}
-		if hashes[i] != hash {
-			// The template gave no hash field, or a wrong one: the full
-			// bytes decide. Only now can the cache be consulted.
-			hashes[i] = hash
-			if data, ok := cache[hash]; ok {
-				j.txData[i] = data
-			}
+		// Always decode and hash the current bytes before consulting the
+		// cache: a stale hash field must not select an older witness or
+		// hide malformed data. Unchanged transactions still share storage.
+		hashes[i] = hash
+		if data, ok := cache[hash]; ok {
+			j.txData[i] = data
 		}
 	}
 	j.Branches = btc.MerkleBranches(txids)

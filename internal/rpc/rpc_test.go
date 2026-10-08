@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -200,5 +202,91 @@ func TestProxyFromEnvironmentIsIgnored(t *testing.T) {
 	fresh := New(strings.Replace(c.url, "127.0.0.1", "localhost", 1), "u", "p", "")
 	if _, err := fresh.GetBlockchainInfo(context.Background()); err != nil {
 		t.Fatalf("request went to the proxy instead of the node: %v", err)
+	}
+}
+
+func TestResponseFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, want string
+		status           int
+	}{
+		{"forbidden", "denied", "refused the connection", http.StatusForbidden},
+		{"invalid JSON", "{broken", "unreadable answer", http.StatusOK},
+		{"wrong result type", `{"result":false}`, "cannot unmarshal", http.StatusOK},
+		{"missing result", `{"error":null}`, "unexpected end", http.StatusOK},
+		{"RPC error", `{"error":{"code":-1,"message":"invalid block"}}`, "invalid block", http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, c := newFake(t)
+			f.answer = func(string, []any) (int, string) { return tc.status, tc.body }
+			for _, call := range []func(context.Context, []byte) (string, error){c.SubmitBlock, c.ProposeBlock} {
+				if _, err := call(context.Background(), []byte{1}); err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("error %v, want %q", err, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestLongPollCancellationAndDeadline(t *testing.T) {
+	for _, cancelEarly := range []bool{true, false} {
+		t.Run(fmt.Sprintf("cancel=%v", cancelEarly), func(t *testing.T) {
+			started := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				close(started)
+				<-r.Context().Done()
+			}))
+			defer srv.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			wait := 50 * time.Millisecond
+			if cancelEarly {
+				wait = 5 * time.Second
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := New(srv.URL, "u", "p", "").GetBlockTemplate(ctx, "tip-1", wait)
+				done <- err
+			}()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("long poll did not start")
+			}
+			want := context.DeadlineExceeded
+			if cancelEarly {
+				cancel()
+				want = context.Canceled
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, want) {
+					t.Fatalf("error %v, want %v", err, want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("request did not stop")
+			}
+		})
+	}
+}
+
+func TestExplainFailures(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{&Error{Code: CodeInWarmup, Message: "loading"}, "still starting up"},
+		{&Error{Code: CodeNotConnected}, "not connected to any peers"},
+		{&Error{Code: -1, Message: "bad request"}, "node error -1: bad request"},
+		{&HTTPError{Status: 503}, "HTTP status 503"},
+		{fmt.Errorf("wrapped: %w", os.ErrNotExist), "cookie file not found"},
+		{fmt.Errorf("wrapped: %w", context.DeadlineExceeded), "did not answer in time"},
+		{fmt.Errorf("wrapped: %w", syscall.ECONNREFUSED), "connection refused"},
+		{errors.New("custom failure"), "custom failure"},
+	} {
+		if got := Explain(tc.err); !strings.Contains(got, tc.want) {
+			t.Errorf("Explain(%v) = %q, want %q", tc.err, got, tc.want)
+		}
 	}
 }
