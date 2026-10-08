@@ -99,6 +99,19 @@ func TestLoadErrors(t *testing.T) {
 	}
 }
 
+func TestNonfiniteDifficultiesAreRejected(t *testing.T) {
+	for _, key := range []string{"start_difficulty", "min_difficulty"} {
+		for _, value := range []string{"NaN", "nan", "+Inf", "-Inf", "Infinity", "1e999"} {
+			t.Run(key+"/"+value, func(t *testing.T) {
+				_, err := Load(write(t, minimal+key+" = "+value+"\n"))
+				if err == nil || !strings.Contains(err.Error(), key+" must be a positive number") {
+					t.Fatalf("error %v, want invalid difficulty", err)
+				}
+			})
+		}
+	}
+}
+
 // The file written on first run must parse, and must fail only because the
 // required values are still empty.
 func TestExampleFile(t *testing.T) {

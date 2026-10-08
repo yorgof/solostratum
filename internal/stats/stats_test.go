@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -544,6 +546,130 @@ func TestRunWritesOnShutdown(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		if got := again.totals[fmt.Sprintf("worker%d", i)].Counts; got.Accepted != 100 || got.Connections != 1 {
 			t.Errorf("worker%d on disk: %+v, want 100 accepted shares and 1 connection", i, got)
+		}
+	}
+}
+
+func TestHistoryRetriesAfterWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:01:00Z")
+	s.Accepted("rig", when, 1024, 2048)
+	path := filepath.Join(dir, historyFile(when))
+	// A directory at the file path causes a write failure even as root.
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.flush(when.Add(10*time.Minute), false)
+	if len(s.pending) != 1 {
+		t.Fatal("failed samples were discarded")
+	}
+	// More work in the same bucket must be merged with the pending sample.
+	s.Accepted("rig", when.Add(time.Second), 512, 4096)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	s.flush(when.Add(15*time.Minute), false)
+	s.flush(when.Add(20*time.Minute), false)
+	want := Counts{Accepted: 2, Work: 1536, BestShare: 4096}
+	checkHistory(t, history(t, dir, "2026-10"), []Sample{{when.Truncate(Interval), "rig", want}})
+	if got := open(t, dir).totals["rig"].Counts; got != want {
+		t.Errorf("retries changed lifetime totals: %+v, want %+v", got, want)
+	}
+	if len(s.pending) != 0 {
+		t.Fatal("written samples still pending")
+	}
+}
+
+func TestHistoryRetryDoesNotDuplicateAnEarlierMonth(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	sept := at(t, "2026-09-30T23:59:00Z")
+	oct := at(t, "2026-10-01T00:01:00Z")
+	s.Accepted("rig", sept, 1, 1)
+	s.Accepted("rig", oct, 2, 2)
+	path := filepath.Join(dir, historyFile(oct))
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.flush(oct.Add(10*time.Minute), false)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	s.flush(oct.Add(15*time.Minute), false)
+	checkHistory(t, history(t, dir, "2026-09"), []Sample{{sept.Truncate(Interval), "rig", Counts{Accepted: 1, Work: 1, BestShare: 1}}})
+	checkHistory(t, history(t, dir, "2026-10"), []Sample{{oct.Truncate(Interval), "rig", Counts{Accepted: 1, Work: 2, BestShare: 2}}})
+}
+
+// shortHistoryFile injects a disk that writes part of a batch and may also
+// refuse the attempt to remove its incomplete last line.
+type shortHistoryFile struct {
+	*os.File
+	limit        int
+	failTruncate bool
+}
+
+func (f shortHistoryFile) Write(p []byte) (int, error) {
+	n, err := f.File.Write(p[:f.limit])
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
+func (f shortHistoryFile) Truncate(size int64) error {
+	if f.failTruncate {
+		return errors.New("disk unavailable")
+	}
+	return f.File.Truncate(size)
+}
+
+func TestHistoryRetriesPartialBatchesWithoutDuplicates(t *testing.T) {
+	when := at(t, "2026-10-03T12:00:00Z")
+	samples := []Sample{
+		{when, "a", Counts{Accepted: 1, Work: 1}},
+		{when, "b", Counts{Accepted: 1, Work: 2}},
+	}
+	var data []byte
+	var firstEnd int
+	for i, sample := range samples {
+		line, err := json.Marshal(sample)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(append(data, line...), '\n')
+		if i == 0 {
+			firstEnd = len(data)
+		}
+	}
+	for _, limit := range []int{0, 10, firstEnd, firstEnd + 10, len(data) - 1} {
+		for _, failTruncate := range []bool{false, true} {
+			t.Run(fmt.Sprintf("bytes=%d/truncateFails=%v", limit, failTruncate), func(t *testing.T) {
+				dir := t.TempDir()
+				s := open(t, dir)
+				f, err := os.OpenFile(filepath.Join(dir, historyFile(when)), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				written, err := appendHistoryBatch(shortHistoryFile{f, limit, failTruncate}, data)
+				f.Close()
+				wantWritten := 0
+				if limit >= firstEnd {
+					wantWritten = 1
+				}
+				if err == nil || written != wantWritten {
+					t.Fatalf("partial write: %d complete samples, error %v", written, err)
+				}
+				var got []Sample
+				if err := s.readHistory(when, when.Add(Interval), func(sample Sample) { got = append(got, sample) }); err != nil {
+					t.Fatal(err)
+				}
+				checkHistory(t, got, samples[:written])
+				if n, err := s.appendHistory(samples[written:]); err != nil || n != len(samples)-written {
+					t.Fatalf("retry: %d samples, error %v", n, err)
+				}
+				checkHistory(t, history(t, dir, "2026-10"), samples)
+			})
 		}
 	}
 }

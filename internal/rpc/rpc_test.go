@@ -73,7 +73,7 @@ func TestGetBlockTemplateRequestAndDecode(t *testing.T) {
 		if method != "getblocktemplate" || len(rules) != 1 || rules[0] != "segwit" {
 			t.Errorf("request: %s %v", method, params)
 		}
-		return 200, `{"result":{"version":536870912,"rules":["csv","!segwit"],"previousblockhash":"aa","transactions":[{"data":"0102","txid":"bb","fee":250}],
+		return 200, `{"result":{"version":536870912,"rules":["csv","!segwit"],"previousblockhash":"aa","transactions":[{"data":"0102","txid":"bb","hash":"cc","fee":250}],
 			"coinbasevalue":312500250,"longpollid":"lp1","target":"00","mintime":10,"curtime":20,"bits":"1d00ffff","height":7,"default_witness_commitment":"6a24"},"error":null,"id":1}`
 	}
 	tmpl, err := c.GetBlockTemplate(context.Background(), "", time.Second)
@@ -81,7 +81,7 @@ func TestGetBlockTemplateRequestAndDecode(t *testing.T) {
 		t.Fatal(err)
 	}
 	if tmpl.Version != 0x20000000 || tmpl.Height != 7 || tmpl.CoinbaseValue != 312500250 || tmpl.LongPollID != "lp1" ||
-		len(tmpl.Transactions) != 1 || tmpl.Transactions[0].Data != "0102" || tmpl.WitnessCommitment != "6a24" || tmpl.Bits != "1d00ffff" {
+		len(tmpl.Transactions) != 1 || tmpl.Transactions[0].Data != "0102" || tmpl.Transactions[0].Hash != "cc" || tmpl.WitnessCommitment != "6a24" || tmpl.Bits != "1d00ffff" {
 		t.Errorf("template: %+v", tmpl)
 	}
 	if _, has := f.lastReq["params"].([]any)[0].(map[string]any)["longpollid"]; has {

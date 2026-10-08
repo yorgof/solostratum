@@ -50,9 +50,13 @@ type Store struct {
 	records []Record
 	wg      sync.WaitGroup
 	pending atomic.Int64
+	// Leave RPC capacity for template updates and node health checks, even
+	// when regtest miners find many blocks at once.
+	submitSlots chan struct{}
 }
 
 const timeLayout = "20060102T150405.000000000Z"
+const maxSubmissions = 2
 
 // statusUnknown marks a block from an earlier run whose result was never
 // recorded.
@@ -71,7 +75,11 @@ func Open(dir string, node Submitter, onAccepted func()) (*Store, error) {
 	probe.Close()
 	os.Remove(probe.Name())
 
-	s := &Store{dir: dir, node: node, onAccepted: onAccepted, retryEvery: 2 * time.Second, retryFor: 30 * time.Minute}
+	s := &Store{
+		dir: dir, node: node, onAccepted: onAccepted,
+		retryEvery: 2 * time.Second, retryFor: 30 * time.Minute,
+		submitSlots: make(chan struct{}, maxSubmissions),
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -96,7 +104,9 @@ func Open(dir string, node Submitter, onAccepted func()) (*Store, error) {
 				}
 			}
 		}
+		s.mu.Lock()
 		s.records = append(s.records, r)
+		s.mu.Unlock()
 	}
 	return s, nil
 }
@@ -143,7 +153,9 @@ func (s *Store) Found(height int64, hash string, block []byte, worker string) {
 		log.Printf("WARNING: could not save the found block to disk: %v", err)
 	} else {
 		log.Printf("Block saved to %s", filepath.Join(s.dir, base+".hex"))
+		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
 			if err := file.Sync(); err != nil {
 				log.Printf("WARNING: could not flush the block file to disk: %v", err)
 			}
@@ -187,7 +199,8 @@ func (s *Store) track(rec Record, base string, block []byte) {
 // Pending returns the number of blocks still being delivered to the node.
 func (s *Store) Pending() int { return int(s.pending.Load()) }
 
-// Wait blocks until all pending submissions have finished.
+// Wait blocks until all submissions and disk flushes have finished. Callers
+// must finish handing off blocks through Found before calling Wait.
 func (s *Store) Wait() { s.wg.Wait() }
 
 // save writes the block as hex to a new file that is never overwritten: the
@@ -218,9 +231,20 @@ func (s *Store) save(height int64, hash string, block []byte, now time.Time) (st
 
 // submit delivers the block and returns its final status.
 func (s *Store) submit(hash string, block []byte) string {
-	deadline := time.Now().Add(s.retryFor)
+	ctx, cancel := context.WithTimeout(context.Background(), s.retryFor)
+	defer cancel()
+	giveUp := func(attempt int, err error) string {
+		log.Printf("Giving up submitting block %s after %d attempts: %s", hash, attempt, rpc.Explain(err))
+		return "not submitted: " + rpc.Explain(err)
+	}
 	for attempt := 1; ; attempt++ {
-		reason, err := s.node.SubmitBlock(context.Background(), block)
+		select {
+		case s.submitSlots <- struct{}{}:
+		case <-ctx.Done():
+			return giveUp(attempt-1, ctx.Err())
+		}
+		reason, err := s.node.SubmitBlock(ctx, block)
+		<-s.submitSlots
 		switch {
 		case err == nil && (reason == "" || reason == "duplicate"):
 			// "duplicate" means the node already has this exact block,
@@ -236,11 +260,14 @@ func (s *Store) submit(hash string, block []byte) string {
 			log.Printf("Block %s could not be submitted: %s", hash, rpc.Explain(err))
 			return "rejected: " + rpcErr.Message
 		}
-		if time.Now().After(deadline) {
-			log.Printf("Giving up submitting block %s after %d attempts: %s", hash, attempt, rpc.Explain(err))
-			return "not submitted: " + rpc.Explain(err)
+		if ctx.Err() != nil {
+			return giveUp(attempt, err)
 		}
 		log.Printf("Could not reach the node to submit block %s (attempt %d): %s. Retrying.", hash, attempt, rpc.Explain(err))
-		time.Sleep(s.retryEvery)
+		select {
+		case <-ctx.Done():
+			return giveUp(attempt, err)
+		case <-time.After(s.retryEvery):
+		}
 	}
 }

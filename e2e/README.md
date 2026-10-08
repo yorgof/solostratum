@@ -65,7 +65,9 @@ every scenario, and three unrelated clients guard against that:
   GPL-3.0; it is downloaded when the test image is built and none of it is
   stored in or distributed with this repository.
 - **cpuminer** (`cpuminer/`): pooler's `minerd`, built from its public
-  source.
+  source. A test relay forwards its messages unchanged at ten per second;
+  without pacing, regtest's easy target lets it flood the node with
+  thousands of solved blocks before the first new job arrives.
 
 The cpuminer scenario runs its container with host networking, which works
 out of the box on Linux. On Docker Desktop, enable host networking in the

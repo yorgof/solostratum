@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"math"
@@ -429,6 +430,7 @@ func (s *Store) readHistory(start, end time.Time, add func(Sample)) error {
 			return err
 		}
 		lines := bufio.NewScanner(f)
+		lines.Split(completeLines)
 		for lines.Scan() {
 			var sample Sample
 			// A power cut can leave half a line behind; skip it.
@@ -443,6 +445,19 @@ func (s *Store) readHistory(start, end time.Time, add func(Sample)) error {
 		}
 	}
 	return nil
+}
+
+// A history record is committed only when its newline was written. In
+// particular, a short write just before the newline must not be counted
+// both from disk and from the pending samples that will be retried.
+func completeLines(data []byte, atEOF bool) (int, []byte, error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF {
+		return len(data), nil, nil
+	}
+	return 0, nil, nil
 }
 
 // Run writes the statistics to disk at the end of every interval until ctx
@@ -483,13 +498,28 @@ func (s *Store) flush(now time.Time, final bool) {
 		if totals, err = json.MarshalIndent(s.totals, "", "  "); err != nil {
 			log.Printf("WARNING: could not encode the worker totals: %v", err)
 		}
-		s.changed = false
+		s.changed = totals == nil // retry an encoding failure too
 	}
 	s.mu.Unlock()
 
-	if err := s.appendHistory(samples); err != nil {
+	written, err := s.appendHistory(samples)
+	if err != nil {
 		log.Printf("WARNING: could not write the mining history: %v", err)
 	}
+	// Only complete lines have reached disk. Merge everything else back
+	// without adding it to lifetime totals a second time; a miner may have
+	// recorded more work in the same interval while the write was running.
+	s.mu.Lock()
+	for _, sample := range samples[written:] {
+		key := sampleKey{sample.Time.Unix(), sample.Worker}
+		if pending := s.pending[key]; pending != nil {
+			pending.add(sample.Counts)
+		} else {
+			copy := sample
+			s.pending[key] = &copy
+		}
+	}
+	s.mu.Unlock()
 	if totals != nil {
 		if err := s.replaceTotals(totals); err != nil {
 			log.Printf("WARNING: could not write the worker totals: %v", err)
@@ -500,46 +530,87 @@ func (s *Store) flush(now time.Time, final bool) {
 	}
 }
 
-// appendHistory adds one line per sample to the file of the sample's month.
-func (s *Store) appendHistory(samples []Sample) error {
+// appendHistory sorts the samples and returns how many complete lines were
+// appended, so a failure in one month does not duplicate earlier months.
+func (s *Store) appendHistory(samples []Sample) (int, error) {
 	sort.Slice(samples, func(i, j int) bool {
 		if !samples[i].Time.Equal(samples[j].Time) {
 			return samples[i].Time.Before(samples[j].Time)
 		}
 		return samples[i].Worker < samples[j].Worker
 	})
-	var name string
-	var lines bytes.Buffer
-	write := func() error {
-		if lines.Len() == 0 {
-			return nil
+	written := 0
+	for written < len(samples) {
+		name := historyFile(samples[written].Time)
+		var lines bytes.Buffer
+		for i := written; i < len(samples) && historyFile(samples[i].Time) == name; i++ {
+			line, err := json.Marshal(samples[i])
+			if err != nil {
+				return written, err
+			}
+			lines.Write(line)
+			lines.WriteByte('\n')
 		}
-		f, err := os.OpenFile(filepath.Join(s.dir, name), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+		f, err := os.OpenFile(filepath.Join(s.dir, name), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
 		if err != nil {
-			return err
+			return written, err
 		}
-		_, err = f.Write(lines.Bytes())
-		lines.Reset()
+		n, err := appendHistoryBatch(f, lines.Bytes())
+		written += n
 		if cerr := f.Close(); err == nil {
 			err = cerr
 		}
-		return err
-	}
-	for _, sample := range samples {
-		if month := historyFile(sample.Time); month != name {
-			if err := write(); err != nil {
-				return err
-			}
-			name = month
-		}
-		line, err := json.Marshal(sample)
 		if err != nil {
-			return err
+			return written, err
 		}
-		lines.Write(line)
-		lines.WriteByte('\n')
 	}
-	return write()
+	return written, nil
+}
+
+type historyAppender interface {
+	io.Writer
+	io.ReaderAt
+	Stat() (fs.FileInfo, error)
+	Truncate(int64) error
+}
+
+// appendHistoryBatch repairs an unfinished tail left by a previous short
+// write or power cut, then counts only fully written lines in this batch.
+func appendHistoryBatch(f historyAppender, data []byte) (int, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	end := info.Size()
+	var buf [4096]byte
+	for end > 0 {
+		start := max(end-int64(len(buf)), 0)
+		chunk := buf[:end-start]
+		if _, err := f.ReadAt(chunk, start); err != nil {
+			return 0, err
+		}
+		if last := bytes.LastIndexByte(chunk, '\n'); last >= 0 {
+			end = start + int64(last) + 1
+			break
+		}
+		end = start
+	}
+	if end != info.Size() {
+		if err := f.Truncate(end); err != nil {
+			return 0, err
+		}
+	}
+	n, err := f.Write(data)
+	complete := bytes.LastIndexByte(data[:n], '\n') + 1
+	if n != len(data) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		// If truncation also fails, the reader ignores the partial line
+		// and the next append will try repairing it again.
+		err = errors.Join(err, f.Truncate(end+int64(complete)))
+	}
+	return bytes.Count(data[:complete], []byte{'\n'}), err
 }
 
 // replaceTotals swaps in a new totals file. The new contents are forced

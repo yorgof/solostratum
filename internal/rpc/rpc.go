@@ -209,6 +209,7 @@ type BlockTemplate struct {
 type TemplateTx struct {
 	Data string `json:"data"`
 	TxID string `json:"txid"`
+	Hash string `json:"hash"` // includes witness data (wtxid)
 	Fee  int64  `json:"fee"`
 }
 

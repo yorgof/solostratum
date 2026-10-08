@@ -75,13 +75,13 @@ func NewJob(id string, t *rpc.BlockTemplate, tag string, now time.Time) (*Job, e
 // so reusing the bytes lets many jobs for the same tip stay in memory at the
 // cost of little more than one. It returns the cache for the next call.
 func newJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache map[btc.Hash][]byte) (*Job, map[btc.Hash][]byte, error) {
-	job, txids, err := buildJob(id, t, tag, now, cache)
+	job, hashes, err := buildJob(id, t, tag, now, cache)
 	if err != nil {
 		return nil, cache, err
 	}
-	next := make(map[btc.Hash][]byte, len(txids))
-	for i, txid := range txids {
-		next[txid] = job.txData[i]
+	next := make(map[btc.Hash][]byte, len(hashes))
+	for i, hash := range hashes {
+		next[hash] = job.txData[i]
 	}
 	return job, next, nil
 }
@@ -128,18 +128,34 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 	}
 
 	txids := make([]btc.Hash, len(t.Transactions))
+	hashes := make([]btc.Hash, len(t.Transactions))
 	for i, tx := range t.Transactions {
 		if txids[i], err = btc.HashFromDisplayHex(tx.TxID); err != nil {
 			return nil, nil, fmt.Errorf("template transaction %d: %w", i, err)
 		}
-		// The same txid can carry different witness data, so the cached
-		// bytes are only reused when their length matches.
-		if data, ok := cache[txids[i]]; ok && len(data)*2 == len(tx.Data) {
-			j.txData[i] = data
-			continue
+		// Only the witness-inclusive hash identifies the full bytes. A
+		// different witness can have the same txid and serialized length.
+		if tx.Hash != "" {
+			if hashes[i], err = btc.HashFromDisplayHex(tx.Hash); err != nil {
+				return nil, nil, fmt.Errorf("template transaction %d hash: %w", i, err)
+			}
+			if data, ok := cache[hashes[i]]; ok {
+				j.txData[i] = data
+				continue
+			}
 		}
 		if j.txData[i], err = hex.DecodeString(tx.Data); err != nil {
 			return nil, nil, fmt.Errorf("template transaction %d: %w", i, err)
+		}
+		hash := btc.SHA256d(j.txData[i])
+		if tx.Hash != "" && hashes[i] != hash {
+			return nil, nil, fmt.Errorf("template transaction %d: witness hash does not match data", i)
+		}
+		hashes[i] = hash
+		// Templates without a hash field still work; compute it from the
+		// full bytes before looking in the cache.
+		if data, ok := cache[hash]; ok {
+			j.txData[i] = data
 		}
 	}
 	j.Branches = btc.MerkleBranches(txids)
@@ -172,7 +188,7 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 	cb = append(cb, 0xff, 0xff, 0xff, 0xff)
 	cb = btc.AppendVarInt(cb, uint64(scriptLen))
 	j.coinbase1 = append(cb, script...)
-	return j, txids, nil
+	return j, hashes, nil
 }
 
 // Coinbase1 returns the part of the coinbase transaction before the

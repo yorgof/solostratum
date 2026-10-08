@@ -918,3 +918,72 @@ func TestRateMeter(t *testing.T) {
 		t.Errorf("hashrate after 30 idle minutes = %v, want 0", got)
 	}
 }
+
+type blockingSink struct{ entered, release chan struct{} }
+
+func (s *blockingSink) Found(int64, string, []byte, string) {
+	close(s.entered)
+	<-s.release
+}
+
+func TestShutdownWaitsForBlockHandoffAndDisconnect(t *testing.T) {
+	job := makeJob(t, "1", regtestBits, 0x20000000, 0, true)
+	jobs := &fakeJobs{}
+	jobs.add(job)
+	sink := &blockingSink{make(chan struct{}), make(chan struct{})}
+	recorder := &fakeRecorder{}
+	srv := NewServer(Options{
+		Network: regtest, DefaultAddress: defaultAddress, DefaultScript: defaultScript,
+		StartDifficulty: 1, MinDifficulty: 0.001,
+	}, jobs, sink)
+	srv.SetRecorder(recorder)
+	if err := srv.Listen("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { srv.Serve(ctx); close(done) }()
+	unblock := sync.OnceFunc(func() { close(sink.release) })
+	t.Cleanup(func() {
+		cancel()
+		unblock()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("server did not finish shutdown")
+		}
+	})
+	m, err := axesim.Dial(srv.Addr().String(), axesim.Options{User: "rig", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	share := mustMine(t, m, firstJob(t, m), job.NetDiff)
+	if result := mustSubmit(t, m, share); !result.Accepted {
+		t.Fatal(result)
+	}
+	select {
+	case <-sink.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("block handoff did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+		t.Fatal("server exited while a solved block was still being handed off")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not finish after the block handoff")
+	}
+	events := recorder.all()
+	if len(events) != 3 || events[0].event != "connected" || events[1].event != "accepted" || events[2].event != "disconnected" {
+		t.Fatalf("shutdown returned before all statistics were recorded: %+v", events)
+	}
+	if len(srv.Status().Miners) != 0 {
+		t.Fatal("a miner is still registered after shutdown")
+	}
+}

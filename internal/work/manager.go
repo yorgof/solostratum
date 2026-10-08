@@ -67,7 +67,7 @@ type Manager struct {
 	tipGen   uint64    // counts published tip changes
 
 	fetchMu  sync.Mutex          // serializes template processing
-	txCache  map[btc.Hash][]byte // transactions of the newest job; guarded by fetchMu
+	txCache  map[btc.Hash][]byte // newest job's transactions by wtxid; guarded by fetchMu
 	onJob    func(*Job)
 	refreshC chan struct{}
 }
