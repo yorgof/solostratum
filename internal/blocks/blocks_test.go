@@ -383,7 +383,30 @@ func TestQueuedSubmissionHonorsRetryDeadline(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("a queued block waited beyond its retry budget")
 	}
-	if node.calls != 0 || !strings.HasPrefix(s.Records()[0].Status, "not submitted:") {
+	if node.calls != 0 || s.Records()[0].Status != "not submitted: waited 20ms behind other block deliveries" {
 		t.Fatalf("queued block: %d calls, records %+v", node.calls, s.Records())
+	}
+}
+
+func TestAttemptInFlightAtTheDeadlineIsNotCutShort(t *testing.T) {
+	// The node takes longer to validate the block than the retry budget
+	// allows. Cancelling the request now could lose an accepted block.
+	node := submitFunc(func(ctx context.Context, _ []byte) (string, error) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+			return "", nil
+		}
+	})
+	s, err := Open(t.TempDir(), node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.retryEvery, s.retryFor = time.Millisecond, 20*time.Millisecond
+	s.Found(100, "aa", []byte{1}, "rig")
+	s.Wait()
+	if status := s.Records()[0].Status; status != "accepted" {
+		t.Fatalf("status %q, want accepted", status)
 	}
 }

@@ -609,8 +609,8 @@ type shortHistoryFile struct {
 	failTruncate bool
 }
 
-func (f shortHistoryFile) Write(p []byte) (int, error) {
-	n, err := f.File.Write(p[:f.limit])
+func (f shortHistoryFile) WriteAt(p []byte, off int64) (int, error) {
+	n, err := f.File.WriteAt(p[:f.limit], off)
 	if err == nil {
 		err = io.ErrShortWrite
 	}
@@ -647,7 +647,7 @@ func TestHistoryRetriesPartialBatchesWithoutDuplicates(t *testing.T) {
 			t.Run(fmt.Sprintf("bytes=%d/truncateFails=%v", limit, failTruncate), func(t *testing.T) {
 				dir := t.TempDir()
 				s := open(t, dir)
-				f, err := os.OpenFile(filepath.Join(dir, historyFile(when)), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+				f, err := os.OpenFile(filepath.Join(dir, historyFile(when)), os.O_RDWR|os.O_CREATE, 0o600)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -671,5 +671,56 @@ func TestHistoryRetriesPartialBatchesWithoutDuplicates(t *testing.T) {
 				checkHistory(t, history(t, dir, "2026-10"), samples)
 			})
 		}
+	}
+}
+
+func TestUnfinishedTailIsRepairedBeforeAppending(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:00:00Z")
+	first := Sample{when, "a", Counts{Accepted: 1, Work: 1}}
+	line, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A complete line followed by half of another: what a power cut leaves.
+	torn := append(append(line, '\n'), line[:len(line)/2]...)
+	if err := os.WriteFile(filepath.Join(dir, historyFile(when)), torn, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next := Sample{when.Add(Interval), "a", Counts{Accepted: 2, Work: 2}}
+	// Through the real file: the flags it is opened with must allow the
+	// repair on every platform.
+	if n, err := s.appendHistory([]Sample{next}); err != nil || n != 1 {
+		t.Fatalf("append after a torn write: %d samples, error %v", n, err)
+	}
+	checkHistory(t, history(t, dir, "2026-10"), []Sample{first, next})
+}
+
+func TestUnwrittenHistoryIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T00:00:00Z")
+	if err := os.Mkdir(filepath.Join(dir, historyFile(when)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// One worker mines through more intervals than can be kept, while the
+	// disk refuses every write.
+	const extra = 10
+	intervals := maxPending + extra
+	for i := range intervals {
+		s.Accepted("rig", when.Add(time.Duration(i)*Interval), 1, 1)
+	}
+	s.flush(when.Add(time.Duration(intervals)*Interval), false)
+	if len(s.pending) != maxPending {
+		t.Fatalf("%d samples kept, want %d", len(s.pending), maxPending)
+	}
+	for i := range extra {
+		if s.pending[sampleKey{when.Add(time.Duration(i) * Interval).Unix(), "rig"}] != nil {
+			t.Fatalf("interval %d was kept although it is among the oldest", i)
+		}
+	}
+	if got := s.totals["rig"].Accepted; got != uint64(intervals) {
+		t.Fatalf("lifetime totals %d, want %d", got, intervals)
 	}
 }

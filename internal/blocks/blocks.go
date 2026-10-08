@@ -229,21 +229,24 @@ func (s *Store) save(height int64, hash string, block []byte, now time.Time) (st
 	}
 }
 
-// submit delivers the block and returns its final status.
+// submit delivers the block and returns its final status. The retry budget
+// covers waiting for a slot and the pauses between attempts, never an attempt
+// itself: the node may be validating the block at that very moment, and the
+// RPC call has its own timeout.
 func (s *Store) submit(hash string, block []byte) string {
 	ctx, cancel := context.WithTimeout(context.Background(), s.retryFor)
 	defer cancel()
-	giveUp := func(attempt int, err error) string {
-		log.Printf("Giving up submitting block %s after %d attempts: %s", hash, attempt, rpc.Explain(err))
-		return "not submitted: " + rpc.Explain(err)
+	giveUp := func(attempt int, why string) string {
+		log.Printf("Giving up submitting block %s after %d attempts: %s", hash, attempt, why)
+		return "not submitted: " + why
 	}
 	for attempt := 1; ; attempt++ {
 		select {
 		case s.submitSlots <- struct{}{}:
 		case <-ctx.Done():
-			return giveUp(attempt-1, ctx.Err())
+			return giveUp(attempt-1, fmt.Sprintf("waited %s behind other block deliveries", s.retryFor))
 		}
-		reason, err := s.node.SubmitBlock(ctx, block)
+		reason, err := s.node.SubmitBlock(context.Background(), block)
 		<-s.submitSlots
 		switch {
 		case err == nil && (reason == "" || reason == "duplicate"):
@@ -261,12 +264,12 @@ func (s *Store) submit(hash string, block []byte) string {
 			return "rejected: " + rpcErr.Message
 		}
 		if ctx.Err() != nil {
-			return giveUp(attempt, err)
+			return giveUp(attempt, rpc.Explain(err))
 		}
 		log.Printf("Could not reach the node to submit block %s (attempt %d): %s. Retrying.", hash, attempt, rpc.Explain(err))
 		select {
 		case <-ctx.Done():
-			return giveUp(attempt, err)
+			return giveUp(attempt, rpc.Explain(err))
 		case <-time.After(s.retryEvery):
 		}
 	}

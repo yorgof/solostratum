@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"strconv"
 	"sync"
@@ -15,6 +16,10 @@ import (
 	"github.com/yorgof/solostratum/internal/btc"
 	"github.com/yorgof/solostratum/internal/rpc"
 )
+
+// witnessHashWarning makes sure a node that keeps reporting wrong
+// transaction hashes is mentioned once, not with every template.
+var witnessHashWarning sync.Once
 
 const (
 	// Extranonce1Size is the per-connection part of the extranonce.
@@ -149,13 +154,20 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 		}
 		hash := btc.SHA256d(j.txData[i])
 		if tx.Hash != "" && hashes[i] != hash {
-			return nil, nil, fmt.Errorf("template transaction %d: witness hash does not match data", i)
+			// The bytes are what goes into the block, and the node's
+			// witness commitment is checked when the block is submitted.
+			// Refusing the template would leave miners on a stale tip.
+			witnessHashWarning.Do(func() {
+				log.Printf("WARNING: the node's block template reports a hash for transaction %s that does not match its data. Mining continues with the data.", tx.TxID)
+			})
 		}
-		hashes[i] = hash
-		// Templates without a hash field still work; compute it from the
-		// full bytes before looking in the cache.
-		if data, ok := cache[hash]; ok {
-			j.txData[i] = data
+		if hashes[i] != hash {
+			// The template gave no hash field, or a wrong one: the full
+			// bytes decide. Only now can the cache be consulted.
+			hashes[i] = hash
+			if data, ok := cache[hash]; ok {
+				j.txData[i] = data
+			}
 		}
 	}
 	j.Branches = btc.MerkleBranches(txids)

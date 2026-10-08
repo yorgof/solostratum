@@ -6,7 +6,8 @@
 //     whole whenever the totals have changed.
 //   - history-<year>-<month>.jsonl has one line per worker for every
 //     interval in which that worker was connected. Lines are only ever
-//     appended.
+//     appended. The one exception is an unfinished last line, as a power
+//     cut can leave behind: it is removed before the next line is added.
 //
 // A history line counts what happened in the interval that starts at "t".
 // Lines add up: after a restart the same worker and interval can appear
@@ -47,6 +48,10 @@ const (
 	maxWorkers = 10000
 	// maxOffline limits the list of workers that are not connected.
 	maxOffline = 100
+	// maxPending limits the history kept in memory while the disk refuses
+	// to take it, so a folder that stays unwritable cannot exhaust memory.
+	// It holds several intervals of the largest possible set of workers.
+	maxPending = 5 * maxWorkers
 	// recent is how far back a Series looks for workers. It is the longest
 	// period worth charting, so a worker keeps its place in every chart.
 	recent = 30 * 24 * time.Hour
@@ -477,6 +482,11 @@ func (s *Store) Run(ctx context.Context) {
 	}
 }
 
+// Flush writes everything recorded so far, including the interval still in
+// progress. It may be called after Run has returned: miners record their
+// last shares and their disconnection while the program shuts down.
+func (s *Store) Flush(now time.Time) { s.flush(now, true) }
+
 // flush writes the totals and every interval that has ended. The interval
 // still in progress is kept in memory, unless final is set.
 func (s *Store) flush(now time.Time, final bool) {
@@ -515,9 +525,12 @@ func (s *Store) flush(now time.Time, final bool) {
 		if pending := s.pending[key]; pending != nil {
 			pending.add(sample.Counts)
 		} else {
-			copy := sample
-			s.pending[key] = &copy
+			retained := sample
+			s.pending[key] = &retained
 		}
+	}
+	if dropped := s.trimPendingLocked(); dropped > 0 {
+		log.Printf("WARNING: the mining history could not be written for so long that its oldest %d samples have been dropped. The lifetime totals are not affected.", dropped)
 	}
 	s.mu.Unlock()
 	if totals != nil {
@@ -528,6 +541,29 @@ func (s *Store) flush(now time.Time, final bool) {
 			s.mu.Unlock()
 		}
 	}
+}
+
+// trimPendingLocked forgets the oldest unwritten samples beyond maxPending
+// and returns how many were dropped.
+func (s *Store) trimPendingLocked() int {
+	excess := len(s.pending) - maxPending
+	if excess <= 0 {
+		return 0
+	}
+	keys := make([]sampleKey, 0, len(s.pending))
+	for key := range s.pending {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].start != keys[j].start {
+			return keys[i].start < keys[j].start
+		}
+		return keys[i].worker < keys[j].worker
+	})
+	for _, key := range keys[:excess] {
+		delete(s.pending, key)
+	}
+	return excess
 }
 
 // appendHistory sorts the samples and returns how many complete lines were
@@ -551,7 +587,9 @@ func (s *Store) appendHistory(samples []Sample) (int, error) {
 			lines.Write(line)
 			lines.WriteByte('\n')
 		}
-		f, err := os.OpenFile(filepath.Join(s.dir, name), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+		// Not O_APPEND: on Windows an append-only handle may not truncate
+		// the file, and the unfinished tail could never be repaired.
+		f, err := os.OpenFile(filepath.Join(s.dir, name), os.O_RDWR|os.O_CREATE, 0o644)
 		if err != nil {
 			return written, err
 		}
@@ -568,7 +606,7 @@ func (s *Store) appendHistory(samples []Sample) (int, error) {
 }
 
 type historyAppender interface {
-	io.Writer
+	io.WriterAt
 	io.ReaderAt
 	Stat() (fs.FileInfo, error)
 	Truncate(int64) error
@@ -596,11 +634,12 @@ func appendHistoryBatch(f historyAppender, data []byte) (int, error) {
 		end = start
 	}
 	if end != info.Size() {
+		log.Printf("WARNING: %s ends in an unfinished line, probably from a power cut. Its last %d bytes are being removed.", info.Name(), info.Size()-end)
 		if err := f.Truncate(end); err != nil {
 			return 0, err
 		}
 	}
-	n, err := f.Write(data)
+	n, err := f.WriteAt(data, end)
 	complete := bytes.LastIndexByte(data[:n], '\n') + 1
 	if n != len(data) {
 		if err == nil {

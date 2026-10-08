@@ -833,48 +833,28 @@ func pacedMiner(t *testing.T, upstream string) string {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	var relays sync.WaitGroup
+	relays.Add(1)
 	go func() {
-		defer close(done)
-		miner, err := l.Accept()
-		if err != nil {
-			return
-		}
-		defer miner.Close()
-		pool, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstream)
-		if err != nil {
-			return
-		}
-		stop := context.AfterFunc(ctx, func() { miner.Close(); pool.Close() })
-		defer stop()
-		replies := make(chan struct{})
-		go func() {
-			defer close(replies)
-			io.Copy(miner, pool)
-			miner.Close()
-		}()
-		defer func() { pool.Close(); miner.Close(); <-replies }()
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-		reader := bufio.NewReader(miner)
+		defer relays.Done()
+		// The miner reconnects when the bridge drops it; serve every attempt.
 		for {
-			line, err := reader.ReadBytes('\n')
+			miner, err := l.Accept()
 			if err != nil {
 				return
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-			if _, err := pool.Write(line); err != nil {
-				return
-			}
+			relays.Add(1)
+			go func() {
+				defer relays.Done()
+				relayPaced(ctx, miner, upstream)
+			}()
 		}
 	}()
 	t.Cleanup(func() {
 		cancel()
 		l.Close()
+		done := make(chan struct{})
+		go func() { relays.Wait(); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
@@ -882,6 +862,42 @@ func pacedMiner(t *testing.T, upstream string) string {
 		}
 	})
 	return l.Addr().String()
+}
+
+// relayPaced forwards one miner connection to the pool at the paced rate,
+// and the pool's replies back unchanged.
+func relayPaced(ctx context.Context, miner net.Conn, upstream string) {
+	defer miner.Close()
+	pool, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstream)
+	if err != nil {
+		return
+	}
+	stop := context.AfterFunc(ctx, func() { miner.Close(); pool.Close() })
+	defer stop()
+	replies := make(chan struct{})
+	go func() {
+		defer close(replies)
+		io.Copy(miner, pool)
+		miner.Close()
+	}()
+	defer func() { pool.Close(); miner.Close(); <-replies }()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	reader := bufio.NewReader(miner)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if _, err := pool.Write(line); err != nil {
+			return
+		}
+	}
 }
 
 // cpuminer is an independent Stratum client. Its blocks must be accepted by

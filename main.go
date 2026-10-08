@@ -158,14 +158,9 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	wg.Add(2)
 	go func() { defer wg.Done(); manager.Run(ctx) }()
 	go func() { defer wg.Done(); server.Serve(ctx) }()
-	// Keep recording until every miner has completed its last share and
-	// disconnect. Only then may the history perform its final flush.
-	historyCtx, stopHistory := context.WithCancel(context.Background())
-	defer stopHistory()
-	var historyWG sync.WaitGroup
 	if history != nil {
-		historyWG.Add(1)
-		go func() { defer historyWG.Done(); history.Run(historyCtx) }()
+		wg.Add(1)
+		go func() { defer wg.Done(); history.Run(ctx) }()
 	}
 	if statusListener != nil {
 		wg.Add(1)
@@ -191,8 +186,11 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	<-ctx.Done()
 	log.Printf("Shutting down.")
 	wg.Wait()
-	stopHistory()
-	historyWG.Wait()
+	if history != nil {
+		// Miners recorded their last shares and their disconnection while
+		// the server drained, after the history's own final write.
+		history.Flush(time.Now())
+	}
 	if n := store.Pending(); n > 0 {
 		// Give the default signal behaviour back, so a second Ctrl-C ends
 		// the program even while a block is still being delivered.

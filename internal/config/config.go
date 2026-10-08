@@ -152,7 +152,7 @@ func (c *Config) set(key, value string) error {
 
 func parsePositive(key, value string, dst *float64) error {
 	f, err := strconv.ParseFloat(value, 64)
-	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 || f > 1e18 {
+	if err != nil || math.IsNaN(f) || f <= 0 || f > 1e18 {
 		return fmt.Errorf("%s must be a positive number, got %q", key, value)
 	}
 	*dst = f
