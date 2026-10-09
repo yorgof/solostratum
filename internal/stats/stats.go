@@ -512,7 +512,7 @@ func (s *Store) flush(now time.Time, final bool) {
 	}
 	s.mu.Unlock()
 
-	written, err := s.appendHistory(samples)
+	unwritten, err := s.appendHistory(samples)
 	if err != nil {
 		log.Printf("WARNING: could not write the mining history: %v", err)
 	}
@@ -520,7 +520,7 @@ func (s *Store) flush(now time.Time, final bool) {
 	// without adding it to lifetime totals a second time; a miner may have
 	// recorded more work in the same interval while the write was running.
 	s.mu.Lock()
-	for _, sample := range samples[written:] {
+	for _, sample := range unwritten {
 		key := sampleKey{sample.Time.Unix(), sample.Worker}
 		if pending := s.pending[key]; pending != nil {
 			pending.add(sample.Counts)
@@ -566,23 +566,23 @@ func (s *Store) trimPendingLocked() int {
 	return excess
 }
 
-// appendHistory sorts the samples and returns how many complete lines were
-// appended, so a failure in one month does not duplicate earlier months.
-func (s *Store) appendHistory(samples []Sample) (int, error) {
+// appendHistory sorts the samples and appends them month by month. It
+// returns the samples that did not reach disk as complete lines, so that a
+// retry after a failure in one month does not duplicate earlier months.
+func (s *Store) appendHistory(samples []Sample) ([]Sample, error) {
 	sort.Slice(samples, func(i, j int) bool {
 		if !samples[i].Time.Equal(samples[j].Time) {
 			return samples[i].Time.Before(samples[j].Time)
 		}
 		return samples[i].Worker < samples[j].Worker
 	})
-	written := 0
-	for written < len(samples) {
-		name := historyFile(samples[written].Time)
+	for len(samples) > 0 {
+		name := historyFile(samples[0].Time)
 		var lines bytes.Buffer
-		for i := written; i < len(samples) && historyFile(samples[i].Time) == name; i++ {
+		for i := 0; i < len(samples) && historyFile(samples[i].Time) == name; i++ {
 			line, err := json.Marshal(samples[i])
 			if err != nil {
-				return written, err
+				return samples, err
 			}
 			lines.Write(line)
 			lines.WriteByte('\n')
@@ -591,18 +591,18 @@ func (s *Store) appendHistory(samples []Sample) (int, error) {
 		// the file, and the unfinished tail could never be repaired.
 		f, err := os.OpenFile(filepath.Join(s.dir, name), os.O_RDWR|os.O_CREATE, 0o644)
 		if err != nil {
-			return written, err
+			return samples, err
 		}
 		n, err := appendHistoryBatch(f, lines.Bytes())
-		written += n
+		samples = samples[n:]
 		if cerr := f.Close(); err == nil {
 			err = cerr
 		}
 		if err != nil {
-			return written, err
+			return samples, err
 		}
 	}
-	return written, nil
+	return nil, nil
 }
 
 type historyAppender interface {

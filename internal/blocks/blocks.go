@@ -21,7 +21,9 @@ import (
 	"github.com/yorgof/solostratum/internal/rpc"
 )
 
-// Submitter is the part of the RPC client the store needs.
+// Submitter is the part of the RPC client the store needs. SubmitBlock must
+// bound its own duration: the store never cancels an attempt in flight,
+// since the node may be validating the block at that very moment.
 type Submitter interface {
 	SubmitBlock(ctx context.Context, block []byte) (string, error)
 }
@@ -240,11 +242,15 @@ func (s *Store) submit(hash string, block []byte) string {
 		log.Printf("Giving up submitting block %s after %d attempts: %s", hash, attempt, why)
 		return "not submitted: " + why
 	}
+	var lastErr error // from the latest attempt, if there was one
 	for attempt := 1; ; attempt++ {
 		select {
 		case s.submitSlots <- struct{}{}:
 		case <-ctx.Done():
-			return giveUp(attempt-1, fmt.Sprintf("waited %s behind other block deliveries", s.retryFor))
+			if lastErr != nil {
+				return giveUp(attempt-1, rpc.Explain(lastErr))
+			}
+			return giveUp(0, fmt.Sprintf("waited %s behind other block deliveries", s.retryFor))
 		}
 		reason, err := s.node.SubmitBlock(context.Background(), block)
 		<-s.submitSlots
@@ -263,6 +269,7 @@ func (s *Store) submit(hash string, block []byte) string {
 			log.Printf("Block %s could not be submitted: %s", hash, rpc.Explain(err))
 			return "rejected: " + rpcErr.Message
 		}
+		lastErr = err
 		if ctx.Err() != nil {
 			return giveUp(attempt, rpc.Explain(err))
 		}

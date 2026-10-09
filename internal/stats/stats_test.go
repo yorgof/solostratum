@@ -665,8 +665,8 @@ func TestHistoryRetriesPartialBatchesWithoutDuplicates(t *testing.T) {
 					t.Fatal(err)
 				}
 				checkHistory(t, got, samples[:written])
-				if n, err := s.appendHistory(samples[written:]); err != nil || n != len(samples)-written {
-					t.Fatalf("retry: %d samples, error %v", n, err)
+				if rest, err := s.appendHistory(samples[written:]); err != nil || len(rest) != 0 {
+					t.Fatalf("retry: %d samples unwritten, error %v", len(rest), err)
 				}
 				checkHistory(t, history(t, dir, "2026-10"), samples)
 			})
@@ -691,8 +691,8 @@ func TestUnfinishedTailIsRepairedBeforeAppending(t *testing.T) {
 	next := Sample{when.Add(Interval), "a", Counts{Accepted: 2, Work: 2}}
 	// Through the real file: the flags it is opened with must allow the
 	// repair on every platform.
-	if n, err := s.appendHistory([]Sample{next}); err != nil || n != 1 {
-		t.Fatalf("append after a torn write: %d samples, error %v", n, err)
+	if rest, err := s.appendHistory([]Sample{next}); err != nil || len(rest) != 0 {
+		t.Fatalf("append after a torn write: %d samples unwritten, error %v", len(rest), err)
 	}
 	checkHistory(t, history(t, dir, "2026-10"), []Sample{first, next})
 }
@@ -800,8 +800,8 @@ func TestFailedTailRepairDoesNotAppend(t *testing.T) {
 		t.Fatalf("failed repair modified file: %q, %v", raw, err)
 	}
 	sample := Sample{when, "rig", Counts{Accepted: 1}}
-	if n, err := s.appendHistory([]Sample{sample}); err != nil || n != 1 {
-		t.Fatalf("retry: %d, %v", n, err)
+	if rest, err := s.appendHistory([]Sample{sample}); err != nil || len(rest) != 0 {
+		t.Fatalf("retry: %d unwritten, %v", len(rest), err)
 	}
 	checkHistory(t, history(t, dir, "2026-10"), []Sample{sample})
 }

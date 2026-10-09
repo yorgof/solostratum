@@ -3,6 +3,7 @@
 package work
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -17,9 +18,15 @@ import (
 	"github.com/yorgof/solostratum/internal/rpc"
 )
 
-// witnessHashWarning makes sure a node that keeps reporting wrong
+// witnessHashWarning makes sure a node that keeps reporting unusable
 // transaction hashes is mentioned once, not with every template.
 var witnessHashWarning sync.Once
+
+func warnWitnessHash(txid, problem string) {
+	witnessHashWarning.Do(func() {
+		log.Printf("WARNING: the node's block template reports a hash for transaction %s that %s. Mining continues with the data.", txid, problem)
+	})
+}
 
 const (
 	// Extranonce1Size is the per-connection part of the extranonce.
@@ -138,28 +145,32 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 		if txids[i], err = btc.HashFromDisplayHex(tx.TxID); err != nil {
 			return nil, nil, fmt.Errorf("template transaction %d: %w", i, err)
 		}
-		// Only the witness-inclusive hash identifies the full bytes. A
-		// different witness can have the same txid and serialized length.
-		if tx.Hash != "" {
-			if hashes[i], err = btc.HashFromDisplayHex(tx.Hash); err != nil {
-				return nil, nil, fmt.Errorf("template transaction %d hash: %w", i, err)
-			}
-		}
 		if j.txData[i], err = hex.DecodeString(tx.Data); err != nil {
 			return nil, nil, fmt.Errorf("template transaction %d: %w", i, err)
 		}
-		hash := btc.SHA256d(j.txData[i])
-		if tx.Hash != "" && hashes[i] != hash {
-			// The bytes are what goes into the block, and the node's
-			// witness commitment is checked when the block is submitted.
-			// Refusing the template would leave miners on a stale tip.
-			witnessHashWarning.Do(func() {
-				log.Printf("WARNING: the node's block template reports a hash for transaction %s that does not match its data. Mining continues with the data.", tx.TxID)
-			})
+		// The template's hash field is advisory: it names the cache entry
+		// to compare the bytes with. The bytes decide, as they are what
+		// goes into the block, and refusing a template over a bad field
+		// would leave the miners on a stale tip.
+		var reported btc.Hash
+		hasReported := false
+		if tx.Hash != "" {
+			if r, err := btc.HashFromDisplayHex(tx.Hash); err != nil {
+				warnWitnessHash(tx.TxID, "cannot be read")
+			} else if data, ok := cache[r]; ok && bytes.Equal(data, j.txData[i]) {
+				// Unchanged since the last template: share the bytes and
+				// skip hashing them again. A cache key is always the hash
+				// of its bytes, so the reported hash is thereby verified.
+				j.txData[i], hashes[i] = data, r
+				continue
+			} else {
+				reported, hasReported = r, true
+			}
 		}
-		// Always decode and hash the current bytes before consulting the
-		// cache: a stale hash field must not select an older witness or
-		// hide malformed data. Unchanged transactions still share storage.
+		hash := btc.SHA256d(j.txData[i])
+		if hasReported && reported != hash {
+			warnWitnessHash(tx.TxID, "does not match its data")
+		}
 		hashes[i] = hash
 		if data, ok := cache[hash]; ok {
 			j.txData[i] = data

@@ -185,6 +185,11 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 
 	<-ctx.Done()
 	log.Printf("Shutting down.")
+	// Give the default signal behaviour back at once, so a second Ctrl-C
+	// ends the program even if a miner's last share or a disk write hangs.
+	// A found block is on disk by then, and a recent one is delivered
+	// again at the next start.
+	restoreSignals()
 	wg.Wait()
 	if history != nil {
 		// Miners recorded their last shares and their disconnection while
@@ -192,9 +197,6 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 		history.Flush(time.Now())
 	}
 	if n := store.Pending(); n > 0 {
-		// Give the default signal behaviour back, so a second Ctrl-C ends
-		// the program even while a block is still being delivered.
-		restoreSignals()
 		log.Printf("Still delivering %d found block(s) to the node. They are saved in %s. Press Ctrl-C again to quit anyway.", n, cfg.BlocksDir)
 	}
 	store.Wait()

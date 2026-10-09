@@ -221,7 +221,6 @@ func TestTemplateRejections(t *testing.T) {
 		"zero target":      mutate(func(t *rpc.BlockTemplate) { t.Bits = "00000000" }),
 		"bad tx data":      mutate(func(t *rpc.BlockTemplate) { t.Transactions[1].Data = "0g" }),
 		"bad txid":         mutate(func(t *rpc.BlockTemplate) { t.Transactions[0].TxID = "00" }),
-		"bad witness hash": mutate(func(t *rpc.BlockTemplate) { t.Transactions[0].Hash = "00" }),
 		"bad commitment":   mutate(func(t *rpc.BlockTemplate) { t.WitnessCommitment = "zz" }),
 		"negative value":   mutate(func(t *rpc.BlockTemplate) { t.CoinbaseValue = -1 }),
 		"no time":          mutate(func(t *rpc.BlockTemplate) { t.CurTime = 0 }),
@@ -549,33 +548,38 @@ func witnessTx(w byte) (string, []byte) {
 }
 
 func TestWrongWitnessHashFieldDoesNotStopMining(t *testing.T) {
-	// A node or proxy that reports a hash that does not match the bytes
-	// must not leave the miners on a stale tip: the bytes decide.
-	tmpl := template(1, 100, 1000, 3)
-	data, _ := hex.DecodeString(tmpl.Transactions[1].Data)
-	wrong := strings.Repeat("01", 32)
-	tmpl.Transactions[1].Hash = wrong
-	job, cache, err := newJob("1", tmpl, "", time.Now(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(job.txData[1], data) {
-		t.Fatal("the transaction bytes were not taken from the template")
-	}
-	wrongHash, _ := btc.HashFromDisplayHex(wrong)
-	if _, ok := cache[wrongHash]; ok {
-		t.Fatal("the reported hash was used as the cache key")
-	}
-	if cached, ok := cache[btc.SHA256d(data)]; !ok || &cached[0] != &job.txData[1][0] {
-		t.Fatal("the bytes are not cached under their real hash")
-	}
-	// The next template from the same node reuses the bytes all the same.
-	again, _, err := newJob("2", tmpl, "", time.Now(), cache)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if &again.txData[1][0] != &job.txData[1][0] {
-		t.Fatal("unchanged bytes were not shared between jobs")
+	// A node or proxy that reports a hash that does not match the bytes,
+	// or no hash at all, must not leave the miners on a stale tip: the
+	// bytes decide.
+	for _, field := range []string{strings.Repeat("01", 32), "00", "not a hash"} {
+		t.Run(field, func(t *testing.T) {
+			tmpl := template(1, 100, 1000, 3)
+			data, _ := hex.DecodeString(tmpl.Transactions[1].Data)
+			tmpl.Transactions[1].Hash = field
+			job, cache, err := newJob("1", tmpl, "", time.Now(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(job.txData[1], data) {
+				t.Fatal("the transaction bytes were not taken from the template")
+			}
+			if wrong, err := btc.HashFromDisplayHex(field); err == nil {
+				if _, ok := cache[wrong]; ok {
+					t.Fatal("the reported hash was used as the cache key")
+				}
+			}
+			if cached, ok := cache[btc.SHA256d(data)]; !ok || &cached[0] != &job.txData[1][0] {
+				t.Fatal("the bytes are not cached under their real hash")
+			}
+			// The next template from the same node reuses the bytes all the same.
+			again, _, err := newJob("2", tmpl, "", time.Now(), cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if &again.txData[1][0] != &job.txData[1][0] {
+				t.Fatal("unchanged bytes were not shared between jobs")
+			}
+		})
 	}
 }
 

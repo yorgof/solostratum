@@ -431,3 +431,36 @@ func TestAttemptInFlightAtTheDeadlineIsNotCutShort(t *testing.T) {
 		t.Fatalf("status %q, want accepted", status)
 	}
 }
+
+func TestGivingUpWhileQueuedKeepsTheLastError(t *testing.T) {
+	// The node was unreachable; the budget then runs out while other
+	// deliveries hold every slot. The record must name the real problem.
+	called := make(chan struct{}, 1)
+	node := submitFunc(func(context.Context, []byte) (string, error) {
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+		return "", errors.New("dial tcp: connection refused")
+	})
+	s, err := Open(t.TempDir(), node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.retryEvery, s.retryFor = 50*time.Millisecond, 300*time.Millisecond
+	s.Found(100, "aa", []byte{1}, "rig")
+	<-called
+	for i := 0; i < maxSubmissions; i++ {
+		s.submitSlots <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for i := 0; i < maxSubmissions; i++ {
+			<-s.submitSlots
+		}
+	})
+	s.Wait()
+	status := s.Records()[0].Status
+	if !strings.Contains(status, "connection refused") || strings.Contains(status, "behind") {
+		t.Fatalf("status %q does not name the node's unreachability", status)
+	}
+}
