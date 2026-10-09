@@ -6,7 +6,8 @@
 //     whole whenever the totals have changed.
 //   - history-<year>-<month>.jsonl has one line per worker for every
 //     interval in which that worker was connected. Lines are only ever
-//     appended.
+//     appended. The one exception is an unfinished last line, as a power
+//     cut can leave behind: it is removed before the next line is added.
 //
 // A history line counts what happened in the interval that starts at "t".
 // Lines add up: after a restart the same worker and interval can appear
@@ -22,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"math"
@@ -46,6 +48,10 @@ const (
 	maxWorkers = 10000
 	// maxOffline limits the list of workers that are not connected.
 	maxOffline = 100
+	// maxPending limits the history kept in memory while the disk refuses
+	// to take it, so a folder that stays unwritable cannot exhaust memory.
+	// It holds several intervals of the largest possible set of workers.
+	maxPending = 5 * maxWorkers
 	// recent is how far back a Series looks for workers. It is the longest
 	// period worth charting, so a worker keeps its place in every chart.
 	recent = 30 * 24 * time.Hour
@@ -429,6 +435,7 @@ func (s *Store) readHistory(start, end time.Time, add func(Sample)) error {
 			return err
 		}
 		lines := bufio.NewScanner(f)
+		lines.Split(completeLines)
 		for lines.Scan() {
 			var sample Sample
 			// A power cut can leave half a line behind; skip it.
@@ -443,6 +450,19 @@ func (s *Store) readHistory(start, end time.Time, add func(Sample)) error {
 		}
 	}
 	return nil
+}
+
+// A history record is committed only when its newline was written. In
+// particular, a short write just before the newline must not be counted
+// both from disk and from the pending samples that will be retried.
+func completeLines(data []byte, atEOF bool) (int, []byte, error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF {
+		return len(data), nil, nil
+	}
+	return 0, nil, nil
 }
 
 // Run writes the statistics to disk at the end of every interval until ctx
@@ -461,6 +481,11 @@ func (s *Store) Run(ctx context.Context) {
 		}
 	}
 }
+
+// Flush writes everything recorded so far, including the interval still in
+// progress. It may be called after Run has returned: miners record their
+// last shares and their disconnection while the program shuts down.
+func (s *Store) Flush(now time.Time) { s.flush(now, true) }
 
 // flush writes the totals and every interval that has ended. The interval
 // still in progress is kept in memory, unless final is set.
@@ -483,13 +508,31 @@ func (s *Store) flush(now time.Time, final bool) {
 		if totals, err = json.MarshalIndent(s.totals, "", "  "); err != nil {
 			log.Printf("WARNING: could not encode the worker totals: %v", err)
 		}
-		s.changed = false
+		s.changed = totals == nil // retry an encoding failure too
 	}
 	s.mu.Unlock()
 
-	if err := s.appendHistory(samples); err != nil {
+	unwritten, err := s.appendHistory(samples)
+	if err != nil {
 		log.Printf("WARNING: could not write the mining history: %v", err)
 	}
+	// Only complete lines have reached disk. Merge everything else back
+	// without adding it to lifetime totals a second time; a miner may have
+	// recorded more work in the same interval while the write was running.
+	s.mu.Lock()
+	for _, sample := range unwritten {
+		key := sampleKey{sample.Time.Unix(), sample.Worker}
+		if pending := s.pending[key]; pending != nil {
+			pending.add(sample.Counts)
+		} else {
+			retained := sample
+			s.pending[key] = &retained
+		}
+	}
+	if dropped := s.trimPendingLocked(); dropped > 0 {
+		log.Printf("WARNING: the mining history could not be written for so long that its oldest %d samples have been dropped. The lifetime totals are not affected.", dropped)
+	}
+	s.mu.Unlock()
 	if totals != nil {
 		if err := s.replaceTotals(totals); err != nil {
 			log.Printf("WARNING: could not write the worker totals: %v", err)
@@ -500,46 +543,113 @@ func (s *Store) flush(now time.Time, final bool) {
 	}
 }
 
-// appendHistory adds one line per sample to the file of the sample's month.
-func (s *Store) appendHistory(samples []Sample) error {
+// trimPendingLocked forgets the oldest unwritten samples beyond maxPending
+// and returns how many were dropped.
+func (s *Store) trimPendingLocked() int {
+	excess := len(s.pending) - maxPending
+	if excess <= 0 {
+		return 0
+	}
+	keys := make([]sampleKey, 0, len(s.pending))
+	for key := range s.pending {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].start != keys[j].start {
+			return keys[i].start < keys[j].start
+		}
+		return keys[i].worker < keys[j].worker
+	})
+	for _, key := range keys[:excess] {
+		delete(s.pending, key)
+	}
+	return excess
+}
+
+// appendHistory sorts the samples and appends them month by month. It
+// returns the samples that did not reach disk as complete lines, so that a
+// retry after a failure in one month does not duplicate earlier months.
+func (s *Store) appendHistory(samples []Sample) ([]Sample, error) {
 	sort.Slice(samples, func(i, j int) bool {
 		if !samples[i].Time.Equal(samples[j].Time) {
 			return samples[i].Time.Before(samples[j].Time)
 		}
 		return samples[i].Worker < samples[j].Worker
 	})
-	var name string
-	var lines bytes.Buffer
-	write := func() error {
-		if lines.Len() == 0 {
-			return nil
+	for len(samples) > 0 {
+		name := historyFile(samples[0].Time)
+		var lines bytes.Buffer
+		for i := 0; i < len(samples) && historyFile(samples[i].Time) == name; i++ {
+			line, err := json.Marshal(samples[i])
+			if err != nil {
+				return samples, err
+			}
+			lines.Write(line)
+			lines.WriteByte('\n')
 		}
-		f, err := os.OpenFile(filepath.Join(s.dir, name), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+		// Not O_APPEND: on Windows an append-only handle may not truncate
+		// the file, and the unfinished tail could never be repaired.
+		f, err := os.OpenFile(filepath.Join(s.dir, name), os.O_RDWR|os.O_CREATE, 0o644)
 		if err != nil {
-			return err
+			return samples, err
 		}
-		_, err = f.Write(lines.Bytes())
-		lines.Reset()
+		n, err := appendHistoryBatch(f, lines.Bytes())
+		samples = samples[n:]
 		if cerr := f.Close(); err == nil {
 			err = cerr
 		}
-		return err
-	}
-	for _, sample := range samples {
-		if month := historyFile(sample.Time); month != name {
-			if err := write(); err != nil {
-				return err
-			}
-			name = month
-		}
-		line, err := json.Marshal(sample)
 		if err != nil {
-			return err
+			return samples, err
 		}
-		lines.Write(line)
-		lines.WriteByte('\n')
 	}
-	return write()
+	return nil, nil
+}
+
+type historyAppender interface {
+	io.WriterAt
+	io.ReaderAt
+	Stat() (fs.FileInfo, error)
+	Truncate(int64) error
+}
+
+// appendHistoryBatch repairs an unfinished tail left by a previous short
+// write or power cut, then counts only fully written lines in this batch.
+func appendHistoryBatch(f historyAppender, data []byte) (int, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	end := info.Size()
+	var buf [4096]byte
+	for end > 0 {
+		start := max(end-int64(len(buf)), 0)
+		chunk := buf[:end-start]
+		if _, err := f.ReadAt(chunk, start); err != nil {
+			return 0, err
+		}
+		if last := bytes.LastIndexByte(chunk, '\n'); last >= 0 {
+			end = start + int64(last) + 1
+			break
+		}
+		end = start
+	}
+	if end != info.Size() {
+		log.Printf("WARNING: %s ends in an unfinished line, probably from a power cut. Its last %d bytes are being removed.", info.Name(), info.Size()-end)
+		if err := f.Truncate(end); err != nil {
+			return 0, err
+		}
+	}
+	n, err := f.WriteAt(data, end)
+	complete := bytes.LastIndexByte(data[:n], '\n') + 1
+	if n != len(data) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		// If truncation also fails, the reader ignores the partial line
+		// and the next append will try repairing it again.
+		err = errors.Join(err, f.Truncate(end+int64(complete)))
+	}
+	return bytes.Count(data[:complete], []byte{'\n'}), err
 }
 
 // replaceTotals swaps in a new totals file. The new contents are forced

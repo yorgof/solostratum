@@ -410,19 +410,18 @@ func (j *Job) NetworkDifficulty() float64 {
 	return d
 }
 
-// incrementBitmask is the firmware's increment_bitmask: it steps the version
-// through the values allowed by the mask.
+// incrementBitmask steps through version combinations, wrapping within the
+// negotiated mask without changing any of the other version bits.
 func incrementBitmask(value, mask uint32) uint32 {
-	if mask == 0 {
-		return value
+	for bit := uint32(1); bit != 0; bit <<= 1 {
+		if mask&bit != 0 {
+			value ^= bit
+			if value&bit != 0 {
+				break
+			}
+		}
 	}
-	carry := (value & mask) + (mask & -mask)
-	overflow := carry &^ mask
-	next := (value &^ mask) | (carry & mask)
-	if overflow > 0 {
-		next = incrementBitmask(next, overflow<<1)
-	}
-	return next
+	return value
 }
 
 // Mine searches for a share of at least minDifficulty for job, trying up to

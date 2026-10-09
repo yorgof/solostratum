@@ -35,7 +35,7 @@ func template(prev byte, height int64, curTime int64, txs int) *rpc.BlockTemplat
 	}
 	for i := 0; i < txs; i++ {
 		data := []byte{2, 0, 0, 0, byte(i), byte(i >> 8)}
-		t.Transactions = append(t.Transactions, rpc.TemplateTx{Data: hex.EncodeToString(data), TxID: btc.SHA256d(data).String()})
+		t.Transactions = append(t.Transactions, rpc.TemplateTx{Data: hex.EncodeToString(data), TxID: btc.SHA256d(data).String(), Hash: btc.SHA256d(data).String()})
 	}
 	return t
 }
@@ -441,6 +441,8 @@ func TestJobsShareTransactionData(t *testing.T) {
 	// Same txid but different bytes (other witness): must not be reused.
 	changed := template(1, 100, 1060, 60)
 	changed.Transactions[3].Data += "00"
+	data, _ := hex.DecodeString(changed.Transactions[3].Data)
+	changed.Transactions[3].Hash = btc.SHA256d(data).String()
 	third, _, err := newJob("3", changed, "", time.Now(), cache2)
 	if err != nil {
 		t.Fatal(err)
@@ -530,4 +532,184 @@ func TestSelfTest(t *testing.T) {
 	if !errors.As(err, &st) || st.Reason != "bad-txnmrklroot" {
 		t.Fatalf("error %v, want SelfTestError", err)
 	}
+}
+
+func witnessTx(w byte) (string, []byte) {
+	// Two structurally valid witness serializations with identical non-witness
+	// bytes and same length, differing only in a one-byte witness stack item.
+	body := append([]byte{1}, make([]byte, 32)...)
+	body = append(body, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 1)
+	body = append(body, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0x51)
+	base := append([]byte{2, 0, 0, 0}, body...)
+	base = append(base, 0, 0, 0, 0)
+	raw := append([]byte{2, 0, 0, 0, 0, 1}, body...)
+	raw = append(raw, 1, 1, w, 0, 0, 0, 0)
+	return btc.SHA256d(base).String(), raw
+}
+
+func TestWrongWitnessHashFieldDoesNotStopMining(t *testing.T) {
+	// A node or proxy that reports a hash that does not match the bytes,
+	// or no hash at all, must not leave the miners on a stale tip: the
+	// bytes decide.
+	for _, field := range []string{strings.Repeat("01", 32), "00", "not a hash"} {
+		t.Run(field, func(t *testing.T) {
+			tmpl := template(1, 100, 1000, 3)
+			data, _ := hex.DecodeString(tmpl.Transactions[1].Data)
+			tmpl.Transactions[1].Hash = field
+			job, cache, err := newJob("1", tmpl, "", time.Now(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(job.txData[1], data) {
+				t.Fatal("the transaction bytes were not taken from the template")
+			}
+			if wrong, err := btc.HashFromDisplayHex(field); err == nil {
+				if _, ok := cache[wrong]; ok {
+					t.Fatal("the reported hash was used as the cache key")
+				}
+			}
+			if cached, ok := cache[btc.SHA256d(data)]; !ok || &cached[0] != &job.txData[1][0] {
+				t.Fatal("the bytes are not cached under their real hash")
+			}
+			// The next template from the same node reuses the bytes all the same.
+			again, _, err := newJob("2", tmpl, "", time.Now(), cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if &again.txData[1][0] != &job.txData[1][0] {
+				t.Fatal("unchanged bytes were not shared between jobs")
+			}
+		})
+	}
+}
+
+func TestCacheTracksWitnessChangesOfTheSameLength(t *testing.T) {
+	for _, includeHash := range []bool{true, false} {
+		t.Run(fmt.Sprintf("hash=%v", includeHash), func(t *testing.T) {
+			txid, firstBytes := witnessTx(1)
+			_, nextBytes := witnessTx(2)
+			makeTemplate := func(data []byte) *rpc.BlockTemplate {
+				tmpl := template(1, 100, 1000, 0)
+				tx := rpc.TemplateTx{TxID: txid, Data: hex.EncodeToString(data)}
+				if includeHash {
+					tx.Hash = btc.SHA256d(data).String()
+				}
+				tmpl.Transactions = []rpc.TemplateTx{tx}
+				return tmpl
+			}
+			first, cache, err := newJob("1", makeTemplate(firstBytes), "", time.Now(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmpl := makeTemplate(nextBytes)
+			next, cache, err := newJob("2", tmpl, "", time.Now(), cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(first.txData[0], firstBytes) || !bytes.Equal(next.txData[0], nextBytes) {
+				t.Fatal("cached jobs did not preserve their own witness bytes")
+			}
+			fresh := mustJob(t, tmpl, "")
+			cb := fresh.Coinbase(payout, make([]byte, 4), make([]byte, 4))
+			header := fresh.Header(cb, fresh.Version, fresh.CurTime, 0)
+			if !bytes.Equal(next.Block(header, cb), fresh.Block(header, cb)) {
+				t.Fatal("cached block differs from the current template")
+			}
+			again, _, err := newJob("3", tmpl, "", time.Now(), cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if &again.txData[0][0] != &next.txData[0][0] {
+				t.Fatal("unchanged witness bytes were not shared")
+			}
+		})
+	}
+}
+
+func TestCachedTemplateDataIsAuthoritative(t *testing.T) {
+	txid, before := witnessTx(1)
+	_, after := witnessTx(2)
+	for _, tc := range []struct {
+		name, data string
+		wantError  bool
+	}{
+		{"changed witness with stale hash", hex.EncodeToString(after), false},
+		{"different length with stale hash", hex.EncodeToString(append(after, 0)), false},
+		{"uppercase hex", strings.ToUpper(hex.EncodeToString(before)), false},
+		{"invalid hex with cached hash", "zz", true},
+		{"odd length with cached hash", "0", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpl := template(1, 100, 1000, 0)
+			tmpl.Transactions = []rpc.TemplateTx{{
+				TxID: txid, Hash: btc.SHA256d(before).String(), Data: hex.EncodeToString(before),
+			}}
+			first, cache, err := newJob("1", tmpl, "", time.Now(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmpl.Transactions[0].Data = tc.data
+			cached, next, err := newJob("2", tmpl, "", time.Now(), cache)
+			if tc.wantError {
+				if err == nil {
+					t.Fatal("a cache hit hid malformed transaction data")
+				}
+				if len(next) != 1 || !bytes.Equal(next[btc.SHA256d(before)], before) {
+					t.Fatal("a rejected template changed the cache")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			fresh := mustJob(t, tmpl, "")
+			cb := fresh.Coinbase(payout, make([]byte, 4), make([]byte, 4))
+			header := fresh.Header(cb, fresh.Version, fresh.CurTime, 0)
+			if !bytes.Equal(cached.Block(header, cb), fresh.Block(header, cb)) {
+				t.Fatal("the same template builds different blocks with and without cached transactions")
+			}
+			data, _ := hex.DecodeString(tc.data)
+			if len(next) != 1 || !bytes.Equal(next[btc.SHA256d(data)], data) {
+				t.Fatal("the updated cache does not use the actual transaction hash")
+			}
+			if !bytes.Equal(first.txData[0], before) {
+				t.Fatal("updating the cache mutated an earlier job")
+			}
+			if bytes.Equal(data, before) && &cached.txData[0][0] != &first.txData[0][0] {
+				t.Fatal("unchanged bytes were not shared")
+			}
+		})
+	}
+}
+
+// Cache state must never change which block a template builds or whether
+// malformed transaction data is rejected.
+func FuzzCachedTemplateMatchesFresh(f *testing.F) {
+	before := []byte{0xab, 0xcd}
+	hash := btc.SHA256d(before).String()
+	for _, data := range []string{"abcd", "ABCD", "abce", "", "0", "zz"} {
+		f.Add(data, hash)
+	}
+	f.Add("abcd", "")
+	f.Add("abcd", "not a hash")
+	f.Fuzz(func(t *testing.T, data, reportedHash string) {
+		if len(data) > 8192 || len(reportedHash) > 128 {
+			t.Skip()
+		}
+		tmpl := template(1, 100, 1000, 0)
+		tmpl.Transactions = []rpc.TemplateTx{{TxID: hash, Hash: reportedHash, Data: data}}
+		cache := map[btc.Hash][]byte{btc.SHA256d(before): before}
+		fresh, _, freshErr := newJob("1", tmpl, "", time.Now(), nil)
+		cached, _, cachedErr := newJob("1", tmpl, "", time.Now(), cache)
+		if (freshErr == nil) != (cachedErr == nil) {
+			t.Fatalf("cache changed validation: fresh %v, cached %v", freshErr, cachedErr)
+		}
+		if freshErr == nil {
+			cb := fresh.Coinbase(payout, make([]byte, 4), make([]byte, 4))
+			header := fresh.Header(cb, fresh.Version, fresh.CurTime, 0)
+			if !bytes.Equal(fresh.Block(header, cb), cached.Block(header, cb)) {
+				t.Fatal("cache changed the serialized block")
+			}
+		}
+	})
 }

@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 windows/amd64
 
-.PHONY: build test e2e e2e-clean release docker clean
+.PHONY: build test coverage e2e e2e-clean release docker clean
 
 # Build the program for this computer.
 build:
@@ -12,7 +12,11 @@ build:
 test:
 	go vet ./...
 	go vet -tags e2e ./e2e/
-	go test -race ./...
+	go test -race -coverprofile=coverage.out ./...
+
+# Statement coverage for every package, including both command entry points.
+coverage: test
+	go tool cover -func=coverage.out
 
 # End-to-end tests against real Bitcoin Core nodes in Docker.
 # Choose the versions with: make e2e E2E_CORE_IMAGES="bitcoin/bitcoin:31"

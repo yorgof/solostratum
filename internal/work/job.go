@@ -3,10 +3,12 @@
 package work
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"strconv"
 	"sync"
@@ -15,6 +17,16 @@ import (
 	"github.com/yorgof/solostratum/internal/btc"
 	"github.com/yorgof/solostratum/internal/rpc"
 )
+
+// witnessHashWarning makes sure a node that keeps reporting unusable
+// transaction hashes is mentioned once, not with every template.
+var witnessHashWarning sync.Once
+
+func warnWitnessHash(txid, problem string) {
+	witnessHashWarning.Do(func() {
+		log.Printf("WARNING: the node's block template reports a hash for transaction %s that %s. Mining continues with the data.", txid, problem)
+	})
+}
 
 const (
 	// Extranonce1Size is the per-connection part of the extranonce.
@@ -75,13 +87,13 @@ func NewJob(id string, t *rpc.BlockTemplate, tag string, now time.Time) (*Job, e
 // so reusing the bytes lets many jobs for the same tip stay in memory at the
 // cost of little more than one. It returns the cache for the next call.
 func newJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache map[btc.Hash][]byte) (*Job, map[btc.Hash][]byte, error) {
-	job, txids, err := buildJob(id, t, tag, now, cache)
+	job, hashes, err := buildJob(id, t, tag, now, cache)
 	if err != nil {
 		return nil, cache, err
 	}
-	next := make(map[btc.Hash][]byte, len(txids))
-	for i, txid := range txids {
-		next[txid] = job.txData[i]
+	next := make(map[btc.Hash][]byte, len(hashes))
+	for i, hash := range hashes {
+		next[hash] = job.txData[i]
 	}
 	return job, next, nil
 }
@@ -128,18 +140,40 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 	}
 
 	txids := make([]btc.Hash, len(t.Transactions))
+	hashes := make([]btc.Hash, len(t.Transactions))
 	for i, tx := range t.Transactions {
 		if txids[i], err = btc.HashFromDisplayHex(tx.TxID); err != nil {
 			return nil, nil, fmt.Errorf("template transaction %d: %w", i, err)
 		}
-		// The same txid can carry different witness data, so the cached
-		// bytes are only reused when their length matches.
-		if data, ok := cache[txids[i]]; ok && len(data)*2 == len(tx.Data) {
-			j.txData[i] = data
-			continue
-		}
 		if j.txData[i], err = hex.DecodeString(tx.Data); err != nil {
 			return nil, nil, fmt.Errorf("template transaction %d: %w", i, err)
+		}
+		// The template's hash field is advisory: it names the cache entry
+		// to compare the bytes with. The bytes decide, as they are what
+		// goes into the block, and refusing a template over a bad field
+		// would leave the miners on a stale tip.
+		var reported btc.Hash
+		hasReported := false
+		if tx.Hash != "" {
+			if r, err := btc.HashFromDisplayHex(tx.Hash); err != nil {
+				warnWitnessHash(tx.TxID, "cannot be read")
+			} else if data, ok := cache[r]; ok && bytes.Equal(data, j.txData[i]) {
+				// Unchanged since the last template: share the bytes and
+				// skip hashing them again. A cache key is always the hash
+				// of its bytes, so the reported hash is thereby verified.
+				j.txData[i], hashes[i] = data, r
+				continue
+			} else {
+				reported, hasReported = r, true
+			}
+		}
+		hash := btc.SHA256d(j.txData[i])
+		if hasReported && reported != hash {
+			warnWitnessHash(tx.TxID, "does not match its data")
+		}
+		hashes[i] = hash
+		if data, ok := cache[hash]; ok {
+			j.txData[i] = data
 		}
 	}
 	j.Branches = btc.MerkleBranches(txids)
@@ -172,7 +206,7 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 	cb = append(cb, 0xff, 0xff, 0xff, 0xff)
 	cb = btc.AppendVarInt(cb, uint64(scriptLen))
 	j.coinbase1 = append(cb, script...)
-	return j, txids, nil
+	return j, hashes, nil
 }
 
 // Coinbase1 returns the part of the coinbase transaction before the

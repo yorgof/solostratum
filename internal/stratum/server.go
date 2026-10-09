@@ -102,12 +102,17 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// Serve accepts connections until ctx is cancelled.
+// Serve accepts connections until ctx is cancelled, then closes the miners
+// and waits for their in-flight shares and block handoffs to finish.
 func (s *Server) Serve(ctx context.Context) error {
+	var sessions sync.WaitGroup
+	defer sessions.Wait()
+	// Close after the accept loop ends so even a connection accepted at
+	// the same time as cancellation is included.
+	defer s.closeAll()
 	go func() {
 		<-ctx.Done()
 		s.listener.Close()
-		s.closeAll()
 	}()
 	go s.watchNode(ctx)
 
@@ -134,7 +139,9 @@ func (s *Server) Serve(ctx context.Context) error {
 			conn.Close()
 			continue
 		}
+		sessions.Add(1)
 		go func() {
+			defer sessions.Done()
 			sess.run()
 			s.unregister(sess)
 		}()

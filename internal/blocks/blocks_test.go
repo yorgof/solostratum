@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -270,6 +272,9 @@ func TestInterruptedSubmissionIsResumed(t *testing.T) {
 }
 
 func TestUnwritableDirectoryIsReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows permissions are not controlled by Unix mode bits")
+	}
 	if os.Getuid() == 0 {
 		t.Skip("root can write anywhere")
 	}
@@ -278,5 +283,184 @@ func TestUnwritableDirectoryIsReported(t *testing.T) {
 	defer os.Chmod(parent, 0o700)
 	if _, err := Open(filepath.Join(parent, "blocks"), &fakeNode{}, nil); err == nil {
 		t.Fatal("an unwritable blocks folder was accepted")
+	}
+}
+
+func TestBlockIsDeliveredWhenSavingFails(t *testing.T) {
+	node := &fakeNode{}
+	s, dir, accepted := open(t, node)
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.Found(100, "aa", []byte{1, 2}, "rig")
+	s.Wait()
+	records := s.Records()
+	if node.calls != 1 || accepted.Load() != 1 || len(records) != 1 || records[0].Status != "accepted" || records[0].File != "" {
+		t.Fatalf("disk failure prevented delivery: calls %d, accepted %d, records %+v", node.calls, accepted.Load(), records)
+	}
+}
+
+func TestRestartMixedPendingAndCompleted(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC().Add(-time.Minute)
+	for i := 0; i < 200; i++ {
+		base := fmt.Sprintf("block-%d-%s-%s", 100+i, now.Add(time.Duration(i)*time.Nanosecond).Format(timeLayout), strings.Repeat("0", 64))
+		if err := os.WriteFile(filepath.Join(dir, base+".hex"), []byte("deadbeef\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if i > 0 {
+			if err := os.WriteFile(filepath.Join(dir, base+".result"), []byte("accepted\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	s, err := Open(dir, &fakeNode{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Wait()
+	if len(s.Records()) != 200 {
+		t.Fatal("records lost")
+	}
+	for i, r := range s.Records() {
+		if r.Height != int64(100+i) || r.Status != "accepted" {
+			t.Errorf("record %d after recovery: %+v", i, r)
+		}
+	}
+}
+
+type submitFunc func(context.Context, []byte) (string, error)
+
+func (f submitFunc) SubmitBlock(ctx context.Context, block []byte) (string, error) {
+	return f(ctx, block)
+}
+
+func TestSubmissionBurstLeavesRPCCapacity(t *testing.T) {
+	const count = 12
+	started := make(chan struct{}, count)
+	release := make(chan struct{})
+	var calls atomic.Int64
+	node := submitFunc(func(context.Context, []byte) (string, error) {
+		calls.Add(1)
+		started <- struct{}{}
+		<-release
+		return "", nil
+	})
+	s, err := Open(t.TempDir(), node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(func() { unblock(); s.Wait() })
+	for i := 0; i < count; i++ {
+		s.Found(int64(100+i), fmt.Sprintf("%064x", i), []byte{byte(i)}, "rig")
+	}
+	for i := 0; i < maxSubmissions; i++ {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("block delivery did not start")
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("too many simultaneous submitblock requests")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unblock()
+	s.Wait()
+	if calls.Load() != count || s.Pending() != 0 {
+		t.Fatalf("delivered %d of %d blocks; %d pending", calls.Load(), count, s.Pending())
+	}
+	for _, r := range s.Records() {
+		if r.Status != "accepted" {
+			t.Errorf("block %s: %s", r.Hash, r.Status)
+		}
+	}
+}
+
+func TestQueuedSubmissionHonorsRetryDeadline(t *testing.T) {
+	node := &fakeNode{}
+	s, _, _ := open(t, node)
+	s.retryFor = 20 * time.Millisecond
+	// Keep the RPC slots occupied throughout this block's retry budget.
+	for i := 0; i < maxSubmissions; i++ {
+		s.submitSlots <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for i := 0; i < maxSubmissions; i++ {
+			<-s.submitSlots
+		}
+		s.Wait()
+	})
+	s.Found(100, "aa", []byte{1}, "rig")
+	done := make(chan struct{})
+	go func() { s.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("a queued block waited beyond its retry budget")
+	}
+	if node.calls != 0 || s.Records()[0].Status != "not submitted: waited 20ms behind other block deliveries" {
+		t.Fatalf("queued block: %d calls, records %+v", node.calls, s.Records())
+	}
+}
+
+func TestAttemptInFlightAtTheDeadlineIsNotCutShort(t *testing.T) {
+	// The node takes longer to validate the block than the retry budget
+	// allows. Cancelling the request now could lose an accepted block.
+	node := submitFunc(func(ctx context.Context, _ []byte) (string, error) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+			return "", nil
+		}
+	})
+	s, err := Open(t.TempDir(), node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.retryEvery, s.retryFor = time.Millisecond, 20*time.Millisecond
+	s.Found(100, "aa", []byte{1}, "rig")
+	s.Wait()
+	if status := s.Records()[0].Status; status != "accepted" {
+		t.Fatalf("status %q, want accepted", status)
+	}
+}
+
+func TestGivingUpWhileQueuedKeepsTheLastError(t *testing.T) {
+	// The node was unreachable; the budget then runs out while other
+	// deliveries hold every slot. The record must name the real problem.
+	called := make(chan struct{}, 1)
+	node := submitFunc(func(context.Context, []byte) (string, error) {
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+		return "", errors.New("dial tcp: connection refused")
+	})
+	s, err := Open(t.TempDir(), node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.retryEvery, s.retryFor = 50*time.Millisecond, 300*time.Millisecond
+	s.Found(100, "aa", []byte{1}, "rig")
+	<-called
+	for i := 0; i < maxSubmissions; i++ {
+		s.submitSlots <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for i := 0; i < maxSubmissions; i++ {
+			<-s.submitSlots
+		}
+	})
+	s.Wait()
+	status := s.Records()[0].Status
+	if !strings.Contains(status, "connection refused") || strings.Contains(status, "behind") {
+		t.Fatalf("status %q does not name the node's unreachability", status)
 	}
 }

@@ -3,6 +3,7 @@
 /solostratum.exe
 /axesim
 /dist/
+/coverage.out
 
 # Your own settings, found blocks and mining history never belong in the
 # repository

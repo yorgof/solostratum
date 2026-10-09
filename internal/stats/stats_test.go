@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -546,4 +548,260 @@ func TestRunWritesOnShutdown(t *testing.T) {
 			t.Errorf("worker%d on disk: %+v, want 100 accepted shares and 1 connection", i, got)
 		}
 	}
+}
+
+func TestHistoryRetriesAfterWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:01:00Z")
+	s.Accepted("rig", when, 1024, 2048)
+	path := filepath.Join(dir, historyFile(when))
+	// A directory at the file path causes a write failure even as root.
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.flush(when.Add(10*time.Minute), false)
+	if len(s.pending) != 1 {
+		t.Fatal("failed samples were discarded")
+	}
+	// More work in the same bucket must be merged with the pending sample.
+	s.Accepted("rig", when.Add(time.Second), 512, 4096)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	s.flush(when.Add(15*time.Minute), false)
+	s.flush(when.Add(20*time.Minute), false)
+	want := Counts{Accepted: 2, Work: 1536, BestShare: 4096}
+	checkHistory(t, history(t, dir, "2026-10"), []Sample{{when.Truncate(Interval), "rig", want}})
+	if got := open(t, dir).totals["rig"].Counts; got != want {
+		t.Errorf("retries changed lifetime totals: %+v, want %+v", got, want)
+	}
+	if len(s.pending) != 0 {
+		t.Fatal("written samples still pending")
+	}
+}
+
+func TestHistoryRetryDoesNotDuplicateAnEarlierMonth(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	sept := at(t, "2026-09-30T23:59:00Z")
+	oct := at(t, "2026-10-01T00:01:00Z")
+	s.Accepted("rig", sept, 1, 1)
+	s.Accepted("rig", oct, 2, 2)
+	path := filepath.Join(dir, historyFile(oct))
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.flush(oct.Add(10*time.Minute), false)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	s.flush(oct.Add(15*time.Minute), false)
+	checkHistory(t, history(t, dir, "2026-09"), []Sample{{sept.Truncate(Interval), "rig", Counts{Accepted: 1, Work: 1, BestShare: 1}}})
+	checkHistory(t, history(t, dir, "2026-10"), []Sample{{oct.Truncate(Interval), "rig", Counts{Accepted: 1, Work: 2, BestShare: 2}}})
+}
+
+// shortHistoryFile injects a disk that writes part of a batch and may also
+// refuse the attempt to remove its incomplete last line.
+type shortHistoryFile struct {
+	*os.File
+	limit        int
+	failTruncate bool
+}
+
+func (f shortHistoryFile) WriteAt(p []byte, off int64) (int, error) {
+	n, err := f.File.WriteAt(p[:f.limit], off)
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
+func (f shortHistoryFile) Truncate(size int64) error {
+	if f.failTruncate {
+		return errors.New("disk unavailable")
+	}
+	return f.File.Truncate(size)
+}
+
+func TestHistoryRetriesPartialBatchesWithoutDuplicates(t *testing.T) {
+	when := at(t, "2026-10-03T12:00:00Z")
+	samples := []Sample{
+		{when, "a", Counts{Accepted: 1, Work: 1}},
+		{when, "b", Counts{Accepted: 1, Work: 2}},
+	}
+	var data []byte
+	var firstEnd int
+	for i, sample := range samples {
+		line, err := json.Marshal(sample)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(append(data, line...), '\n')
+		if i == 0 {
+			firstEnd = len(data)
+		}
+	}
+	for _, limit := range []int{0, 10, firstEnd, firstEnd + 10, len(data) - 1} {
+		for _, failTruncate := range []bool{false, true} {
+			t.Run(fmt.Sprintf("bytes=%d/truncateFails=%v", limit, failTruncate), func(t *testing.T) {
+				dir := t.TempDir()
+				s := open(t, dir)
+				f, err := os.OpenFile(filepath.Join(dir, historyFile(when)), os.O_RDWR|os.O_CREATE, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				written, err := appendHistoryBatch(shortHistoryFile{f, limit, failTruncate}, data)
+				f.Close()
+				wantWritten := 0
+				if limit >= firstEnd {
+					wantWritten = 1
+				}
+				if err == nil || written != wantWritten {
+					t.Fatalf("partial write: %d complete samples, error %v", written, err)
+				}
+				var got []Sample
+				if err := s.readHistory(when, when.Add(Interval), func(sample Sample) { got = append(got, sample) }); err != nil {
+					t.Fatal(err)
+				}
+				checkHistory(t, got, samples[:written])
+				if rest, err := s.appendHistory(samples[written:]); err != nil || len(rest) != 0 {
+					t.Fatalf("retry: %d samples unwritten, error %v", len(rest), err)
+				}
+				checkHistory(t, history(t, dir, "2026-10"), samples)
+			})
+		}
+	}
+}
+
+func TestUnfinishedTailIsRepairedBeforeAppending(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:00:00Z")
+	first := Sample{when, "a", Counts{Accepted: 1, Work: 1}}
+	line, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A complete line followed by half of another: what a power cut leaves.
+	torn := append(append(line, '\n'), line[:len(line)/2]...)
+	if err := os.WriteFile(filepath.Join(dir, historyFile(when)), torn, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next := Sample{when.Add(Interval), "a", Counts{Accepted: 2, Work: 2}}
+	// Through the real file: the flags it is opened with must allow the
+	// repair on every platform.
+	if rest, err := s.appendHistory([]Sample{next}); err != nil || len(rest) != 0 {
+		t.Fatalf("append after a torn write: %d samples unwritten, error %v", len(rest), err)
+	}
+	checkHistory(t, history(t, dir, "2026-10"), []Sample{first, next})
+}
+
+func TestUnwrittenHistoryIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T00:00:00Z")
+	if err := os.Mkdir(filepath.Join(dir, historyFile(when)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// One worker mines through more intervals than can be kept, while the
+	// disk refuses every write.
+	const extra = 10
+	intervals := maxPending + extra
+	for i := range intervals {
+		s.Accepted("rig", when.Add(time.Duration(i)*Interval), 1, 1)
+	}
+	s.flush(when.Add(time.Duration(intervals)*Interval), false)
+	if len(s.pending) != maxPending {
+		t.Fatalf("%d samples kept, want %d", len(s.pending), maxPending)
+	}
+	for i := range extra {
+		if s.pending[sampleKey{when.Add(time.Duration(i) * Interval).Unix(), "rig"}] != nil {
+			t.Fatalf("interval %d was kept although it is among the oldest", i)
+		}
+	}
+	if got := s.totals["rig"].Accepted; got != uint64(intervals) {
+		t.Fatalf("lifetime totals %d, want %d", got, intervals)
+	}
+}
+
+func TestFlushAfterRunKeepsLateMinerEvents(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	start := time.Now().UTC().Truncate(time.Second)
+	s.Connected("rig", start)
+	s.Accepted("rig", start, 2, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.Run(ctx)
+	// The server drains after the history loop has stopped.
+	s.Accepted("rig", start.Add(5*time.Second), 4, 8)
+	s.Disconnected("rig", start.Add(10*time.Second))
+	s.Flush(start.Add(11 * time.Second))
+	s.Flush(start.Add(12 * time.Second)) // repeating the final flush is harmless
+	want := Counts{Accepted: 2, Work: 6, BestShare: 8, Connections: 1, Online: 10}
+	if got := open(t, dir).totals["rig"].Counts; got != want {
+		t.Fatalf("persisted totals %+v, want %+v", got, want)
+	}
+	var sum Counts
+	if err := s.readHistory(start.Add(-Interval), start.Add(24*time.Hour), func(sample Sample) { sum.add(sample.Counts) }); err != nil {
+		t.Fatal(err)
+	}
+	if sum != want {
+		t.Fatalf("history %+v, want %+v", sum, want)
+	}
+}
+
+func TestTotalsRetryDoesNotDuplicateHistory(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:00:00Z")
+	s.Accepted("rig", when, 1, 2)
+	s.Flush(when)
+	blocked := filepath.Join(dir, totalsFile+".tmp")
+	if err := os.Mkdir(blocked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.Accepted("rig", when.Add(time.Second), 4, 8)
+	s.Flush(when.Add(2 * time.Second))
+	if !s.changed || open(t, dir).totals["rig"].Accepted != 1 {
+		t.Fatal("failed write changed disk totals or was not retained for retry")
+	}
+	if err := os.Remove(blocked); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	s.Flush(when.Add(3 * time.Second))
+	if got := open(t, dir).totals["rig"].Counts; got != (Counts{Accepted: 2, Work: 5, BestShare: 8}) {
+		t.Fatalf("recovered totals %+v", got)
+	}
+	if lines := history(t, dir, "2026-10"); len(lines) != 2 {
+		t.Fatalf("retry duplicated history: %+v", lines)
+	}
+}
+
+func TestFailedTailRepairDoesNotAppend(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:00:00Z")
+	path := filepath.Join(dir, historyFile(when))
+	if err := os.WriteFile(path, []byte("unfinished"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := appendHistoryBatch(shortHistoryFile{File: f, failTruncate: true}, []byte("new\n"))
+	f.Close()
+	if err == nil || n != 0 {
+		t.Fatalf("failed repair committed %d lines, error %v", n, err)
+	}
+	if raw, err := os.ReadFile(path); err != nil || string(raw) != "unfinished" {
+		t.Fatalf("failed repair modified file: %q, %v", raw, err)
+	}
+	sample := Sample{when, "rig", Counts{Accepted: 1}}
+	if rest, err := s.appendHistory([]Sample{sample}); err != nil || len(rest) != 0 {
+		t.Fatalf("retry: %d unwritten, %v", len(rest), err)
+	}
+	checkHistory(t, history(t, dir, "2026-10"), []Sample{sample})
 }

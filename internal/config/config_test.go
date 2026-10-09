@@ -45,27 +45,29 @@ func TestLoadMinimal(t *testing.T) {
 }
 
 func TestLoadAllSettings(t *testing.T) {
+	cookie := filepath.Join(t.TempDir(), ".cookie")
+	blocks := filepath.Join(t.TempDir(), "found")
 	cfg, err := Load(write(t, "\xef\xbb\xbf# comment\r\n"+
 		"; another comment\r\n"+
 		"NODE_URL = https://node.example.com/rpc \r\n"+
-		"node_cookie_file = \"/var/lib/bitcoin/.cookie\"\r\n"+
+		"node_cookie_file = \""+cookie+"\"\r\n"+
 		"payout_address='bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4'\r\n"+
 		"stratum_listen = 127.0.0.1:4000\r\n"+
 		"status_listen =\r\n"+
 		"coinbase_tag = /my rig/\r\n"+
 		"start_difficulty = 512\r\n"+
 		"min_difficulty = 0.5\r\n"+
-		"blocks_dir = /srv/found\r\n"+
+		"blocks_dir = "+blocks+"\r\n"+
 		"stats_dir =\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.NodeURL != "https://node.example.com/rpc" || cfg.NodeCookieFile != "/var/lib/bitcoin/.cookie" {
+	if cfg.NodeURL != "https://node.example.com/rpc" || cfg.NodeCookieFile != cookie {
 		t.Errorf("node: %+v", cfg)
 	}
 	if cfg.PayoutAddress != "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4" || cfg.StratumListen != "127.0.0.1:4000" ||
 		cfg.StatusListen != "" || cfg.CoinbaseTag != "/my rig/" || cfg.StartDifficulty != 512 ||
-		cfg.MinDifficulty != 0.5 || cfg.BlocksDir != "/srv/found" || cfg.StatsDir != "" {
+		cfg.MinDifficulty != 0.5 || cfg.BlocksDir != blocks || cfg.StatsDir != "" {
 		t.Errorf("settings: %+v", cfg)
 	}
 }
@@ -96,6 +98,19 @@ func TestLoadErrors(t *testing.T) {
 				t.Errorf("error %v, want it to mention %q", err, c.want)
 			}
 		})
+	}
+}
+
+func TestNonfiniteDifficultiesAreRejected(t *testing.T) {
+	for _, key := range []string{"start_difficulty", "min_difficulty"} {
+		for _, value := range []string{"NaN", "nan", "+Inf", "-Inf", "Infinity", "1e999"} {
+			t.Run(key+"/"+value, func(t *testing.T) {
+				_, err := Load(write(t, minimal+key+" = "+value+"\n"))
+				if err == nil || !strings.Contains(err.Error(), key+" must be a positive number") {
+					t.Fatalf("error %v, want invalid difficulty", err)
+				}
+			})
+		}
 	}
 }
 
@@ -137,5 +152,39 @@ func TestExampleFile(t *testing.T) {
 func TestMissingFile(t *testing.T) {
 	if _, err := Load(filepath.Join(t.TempDir(), "nope.conf")); !os.IsNotExist(err) {
 		t.Fatalf("error %v, want not-exist", err)
+	}
+}
+
+func TestPathsAndInputBoundaries(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	if got, want := DefaultPath(), filepath.Join(filepath.Dir(exe), FileName); got != want {
+		t.Fatalf("default config %q, want %q", got, want)
+	}
+	path := write(t, "node_cookie_file = auth/.cookie\npayout_address = x\nblocks_dir = found\nstats_dir = history\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(path)
+	if cfg.NodeCookieFile != filepath.Join(dir, "auth", ".cookie") || cfg.BlocksDir != filepath.Join(dir, "found") || cfg.StatsDir != filepath.Join(dir, "history") {
+		t.Fatalf("relative paths were not resolved next to the settings: %+v", cfg)
+	}
+	for _, value := range []string{"1e-15", "1e18", "0", "1e19"} {
+		_, err := Load(write(t, minimal+"start_difficulty = "+value+"\nmin_difficulty = "+value+"\n"))
+		valid := value == "1e-15" || value == "1e18"
+		if valid != (err == nil) {
+			t.Errorf("difficulty %s: %v", value, err)
+		}
+	}
+	for name, extra := range map[string]string{"empty blocks folder": "blocks_dir =\n", "oversized line": "#" + strings.Repeat("x", 128*1024)} {
+		if _, err := Load(write(t, minimal+extra)); err == nil {
+			t.Errorf("accepted %s", name)
+		}
 	}
 }

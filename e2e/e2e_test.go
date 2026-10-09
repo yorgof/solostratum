@@ -7,7 +7,9 @@
 package e2e
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -820,8 +822,86 @@ func buildImage(t *testing.T, name, dir string) {
 	}
 }
 
-// cpuminer is an independent Stratum client. Left alone against the bridge
-// it must produce blocks Core accepts.
+// pacedMiner forwards the miner's messages unchanged, at most ten per
+// second. On regtest half of all hashes solve a block; an unrestricted CPU
+// miner can queue thousands of blocks before Core announces the first new
+// tip. Pacing keeps this interoperability test independent of CPU speed.
+func pacedMiner(t *testing.T, upstream string) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var relays sync.WaitGroup
+	relays.Add(1)
+	go func() {
+		defer relays.Done()
+		// The miner reconnects when the bridge drops it; serve every attempt.
+		for {
+			miner, err := l.Accept()
+			if err != nil {
+				return
+			}
+			relays.Add(1)
+			go func() {
+				defer relays.Done()
+				relayPaced(ctx, miner, upstream)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		l.Close()
+		done := make(chan struct{})
+		go func() { relays.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("miner relay did not stop")
+		}
+	})
+	return l.Addr().String()
+}
+
+// relayPaced forwards one miner connection to the pool at the paced rate,
+// and the pool's replies back unchanged.
+func relayPaced(ctx context.Context, miner net.Conn, upstream string) {
+	defer miner.Close()
+	pool, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstream)
+	if err != nil {
+		return
+	}
+	stop := context.AfterFunc(ctx, func() { miner.Close(); pool.Close() })
+	defer stop()
+	replies := make(chan struct{})
+	go func() {
+		defer close(replies)
+		io.Copy(miner, pool)
+		miner.Close()
+	}()
+	defer func() { pool.Close(); miner.Close(); <-replies }()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	reader := bufio.NewReader(miner)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if _, err := pool.Write(line); err != nil {
+			return
+		}
+	}
+}
+
+// cpuminer is an independent Stratum client. Its blocks must be accepted by
+// Core, with only the message rate limited for regtest.
 func testCpuminer(t *testing.T, image string) {
 	buildImage(t, "solostratum-e2e-cpuminer", "cpuminer")
 	n := startNode(t, image)
@@ -829,13 +909,14 @@ func testCpuminer(t *testing.T, image string) {
 	n.fillMempool(3)
 	b := startBridge(t, n, payout)
 	start := n.height()
+	addr := pacedMiner(t, b.stratumAddr)
 
 	name := fmt.Sprintf("%s-cpuminer-%d-%d", label, os.Getpid(), time.Now().UnixNano())
 	docker(t, "run", "-d", "--name", name, "--label", label,
 		"--network", "host",
 		"solostratum-e2e-cpuminer",
 		"-a", "sha256d", "-t", "1", "-r", "2", "-R", "1",
-		"-o", fmt.Sprintf("stratum+tcp://127.0.0.1:%d", b.stratumPort),
+		"-o", "stratum+tcp://"+addr,
 		"-u", "cpuminer", "-p", "x")
 	t.Cleanup(func() {
 		if t.Failed() {
