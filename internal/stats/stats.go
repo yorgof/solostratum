@@ -622,7 +622,9 @@ func completeLines(data []byte, atEOF bool) (int, []byte, error) {
 func (s *Store) Run(ctx context.Context) {
 	for {
 		now := time.Now()
-		timer := time.NewTimer(now.Truncate(Interval).Add(Interval).Sub(now))
+		// The checkpoint for the interval that is open now.
+		deadline := now.Truncate(Interval).Add(Interval)
+		timer := time.NewTimer(deadline.Sub(now))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -631,12 +633,18 @@ func (s *Store) Run(ctx context.Context) {
 		case <-timer.C:
 			s.flush(time.Now(), false)
 		case <-s.bestWake:
-			// Go 1.23: do not receive from timer.C after Stop. A false
-			// result means this interval already ended, so write history
-			// too; flush also writes any best share still waiting.
-			if timer.Stop() {
-				s.writeBestShares()
-			} else {
+			// Stop's true result is not "the interval is still open": on
+			// Go 1.23 it also means a tick that already fired was discarded.
+			// A best share arriving as the interval ends must not skip that
+			// checkpoint. Do not receive from timer.C after Stop; that
+			// receive can block.
+			timer.Stop()
+			if !time.Now().Before(deadline) {
+				s.flush(time.Now(), false)
+				continue
+			}
+			s.writeBestShares()
+			if !time.Now().Before(deadline) {
 				s.flush(time.Now(), false)
 			}
 		}
