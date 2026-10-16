@@ -25,10 +25,15 @@ const (
 	// nodeTimeout is how long the node may be unreachable before miners are
 	// disconnected so they can switch to their fallback pool.
 	nodeTimeout = 90 * time.Second
-	// keepJobs is how many jobs for the current tip stay valid. Pools
-	// conventionally accept work on any job for the current tip, and slow
-	// miners rely on that; 240 jobs cover two hours without a new block.
+	// keepJobs is how many jobs for the current tip stay valid for ordinary
+	// shares. Pools conventionally accept work on any job for the current
+	// tip, and slow miners rely on that; 240 jobs cover two hours without
+	// a new block.
 	keepJobs = 240
+	// retiredJobGrace is how long a job that no longer pays ordinary shares
+	// is kept, so a block solved on it that is still on its way from the
+	// miner can be rebuilt. Miners switch to new work within seconds.
+	retiredJobGrace = time.Minute
 )
 
 // Node is the part of the RPC client the manager needs.
@@ -88,11 +93,26 @@ func (m *Manager) Current() *Job {
 	return m.current
 }
 
-// Get returns a recent job by id.
+// Get returns a job by id. A job that no longer pays shares is still
+// returned for retiredJobGrace, so a solved block can be rebuilt after the
+// tip has moved on.
 func (m *Manager) Get(id string) *Job {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.jobs[id]
+	job := m.jobs[id]
+	m.mu.RUnlock()
+	if job == nil || job.expired(time.Now()) {
+		return nil
+	}
+	return job
+}
+
+// pruneLocked drops retired jobs past retiredJobGrace.
+func (m *Manager) pruneLocked(now time.Time) {
+	for id, job := range m.jobs {
+		if job.expired(now) {
+			delete(m.jobs, id)
+		}
+	}
 }
 
 // State reports the node status for display.
@@ -217,18 +237,28 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 	m.setOK()
 	job.CleanJobs = newTip
 
+	now := time.Now()
 	m.mu.Lock()
 	if newTip {
-		// Work on the old tip is worthless now.
-		m.jobs = make(map[string]*Job)
+		// Ordinary shares for the old tip are stale. A block solved on it
+		// may still be on its way: those jobs stay until pruneLocked drops
+		// them.
+		for _, id := range m.order {
+			if old := m.jobs[id]; old != nil {
+				old.Retire(now)
+			}
+		}
 		m.order = m.order[:0]
 	}
 	m.jobs[job.ID] = job
 	m.order = append(m.order, job.ID)
 	for len(m.order) > keepJobs {
-		delete(m.jobs, m.order[0])
+		if old := m.jobs[m.order[0]]; old != nil {
+			old.Retire(now)
+		}
 		m.order = m.order[1:]
 	}
+	m.pruneLocked(now)
 	m.current = job
 	m.longPoll = t.LongPollID
 	if newTip {

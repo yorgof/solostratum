@@ -722,9 +722,28 @@ func testNewBlockFromNetwork(t *testing.T, image string) {
 	b := startBridge(t, n, n.newAddress("bech32"))
 	m := b.dial("bitaxe")
 	old := waitJobOnTip(t, m, n, 0)
-	oldShare, ok := m.Mine(old, old.NetworkDifficulty(), 1_000_000)
+	// Regtest accepts about half of all hashes as blocks. Keep searching
+	// until the share is ordinary work: a header that meets the network
+	// target is still submitted after the tip moves.
+	var oldShare axesim.Share
+	foundOrdinary := false
+	for range 40 {
+		share, ok := m.Mine(old, old.NetworkDifficulty()/1000, 100_000)
+		if !ok {
+			continue
+		}
+		if axesim.HashDifficulty(share.Hash) < old.NetworkDifficulty() {
+			oldShare = share
+			foundOrdinary = true
+			break
+		}
+	}
+	if !foundOrdinary {
+		t.Fatal("no ordinary share found")
+	}
+	oldBlock, ok := m.Mine(old, old.NetworkDifficulty(), 1_000_000)
 	if !ok {
-		t.Fatal("no share found")
+		t.Fatal("no block found")
 	}
 
 	begin := time.Now()
@@ -752,6 +771,26 @@ func testNewBlockFromNetwork(t *testing.T, image string) {
 	}
 	if n.tip() != newTip {
 		t.Fatal("the stale share changed the chain")
+	}
+
+	// A block solved on the old tip is still submitted. The node keeps the
+	// block it saw first, and the record must not claim ours was accepted.
+	res, err = m.Submit(oldBlock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Accepted {
+		t.Fatalf("a block on the old tip was refused: %+v", res)
+	}
+	eventually(t, 10*time.Second, "the old-tip block's result", func() bool {
+		blocks := b.status().Blocks
+		return len(blocks) == 1 && blocks[0].Status != "submitting"
+	})
+	if blk := b.status().Blocks[0]; blk.Hash != axesim.DisplayHash(oldBlock.Hash) || blk.Status != "rejected: inconclusive" {
+		t.Fatalf("old-tip block recorded as %+v", blk)
+	}
+	if n.tip() != newTip {
+		t.Fatal("the old-tip block replaced the block the node saw first")
 	}
 	// Mining continues normally on the new tip.
 	mineBlock(t, m, n, 0)

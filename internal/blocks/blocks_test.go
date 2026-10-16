@@ -17,6 +17,11 @@ import (
 	"github.com/yorgof/solostratum/internal/rpc"
 )
 
+type submitAnswer struct {
+	reason string
+	err    error
+}
+
 type fakeNode struct {
 	mu       sync.Mutex
 	failures int    // transport failures before answering
@@ -24,6 +29,7 @@ type fakeNode struct {
 	rpcErr   error
 	calls    int
 	onCall   func()
+	answers  []submitAnswer // if set, each call returns the next one and then repeats the last
 }
 
 func (f *fakeNode) SubmitBlock(ctx context.Context, block []byte) (string, error) {
@@ -35,6 +41,13 @@ func (f *fakeNode) SubmitBlock(ctx context.Context, block []byte) (string, error
 	}
 	if f.calls <= f.failures {
 		return "", errors.New("dial tcp: connection refused")
+	}
+	if len(f.answers) > 0 {
+		i := f.calls - f.failures - 1
+		if i >= len(f.answers) {
+			i = len(f.answers) - 1
+		}
+		return f.answers[i].reason, f.answers[i].err
 	}
 	return f.reason, f.rpcErr
 }
@@ -208,6 +221,83 @@ func TestRejectedAndDuplicate(t *testing.T) {
 	s.Wait()
 	if recs := s.Records(); recs[0].Status != "rejected: Block decode failed" || node.calls != 1 {
 		t.Errorf("status %q, %d calls", recs[0].Status, node.calls)
+	}
+}
+
+// "inconclusive" means the node stored the block without making it the tip.
+// A second submission would answer "duplicate", which must not turn a lost
+// race into an accepted block.
+func TestInconclusiveIsFinal(t *testing.T) {
+	node := &fakeNode{answers: []submitAnswer{{reason: "inconclusive"}, {reason: "duplicate"}}}
+	s, _, accepted := open(t, node)
+	s.Found(100, "aa", []byte{1}, "rig")
+	s.Wait()
+	if node.calls != 1 || accepted.Load() != 0 || s.Records()[0].Status != "rejected: inconclusive" {
+		t.Fatalf("calls %d, accepted %d, status %q", node.calls, accepted.Load(), s.Records()[0].Status)
+	}
+}
+
+func TestNodeErrors(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		calls  int
+		status string
+	}{
+		// A malformed block or request will not change on retry.
+		{"decode", &rpc.Error{Code: rpc.CodeDeserialization, Message: "Block does not start with a coinbase"}, 1, "rejected: Block does not start with a coinbase"},
+		{"parameter", &rpc.Error{Code: rpc.CodeInvalidParameter, Message: "bad parameter"}, 1, "rejected: bad parameter"},
+		{"method", &rpc.Error{Code: rpc.CodeMethodNotFound, Message: "Method not found"}, 1, "rejected: Method not found"},
+		// Anything else may be passing, and giving up would lose the block.
+		{"warmup", &rpc.Error{Code: rpc.CodeInWarmup, Message: "Loading block index..."}, 2, "accepted"},
+		{"unexpected", &rpc.Error{Code: -1, Message: "Unexpected error"}, 2, "accepted"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			node := &fakeNode{answers: []submitAnswer{{err: c.err}, {reason: ""}}}
+			s, _, _ := open(t, node)
+			s.Found(100, "aa", []byte{1}, "rig")
+			s.Wait()
+			if node.calls != c.calls || s.Records()[0].Status != c.status {
+				t.Fatalf("calls %d, status %q", node.calls, s.Records()[0].Status)
+			}
+		})
+	}
+}
+
+// Only a block whose delivery was interrupted is submitted again at start.
+// A recorded answer, or giving up after the retry window, is final.
+func TestOnlyInterruptedBlocksAreResumed(t *testing.T) {
+	dir := t.TempDir()
+	recent := time.Now().UTC().Add(-time.Minute)
+	write := func(height int, hash, status string) {
+		t.Helper()
+		base := fmt.Sprintf("block-%d-%s-%s", height, recent.Format(timeLayout), hash)
+		if err := os.WriteFile(filepath.Join(dir, base+".hex"), []byte(hash+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if status != "" {
+			if err := os.WriteFile(filepath.Join(dir, base+".result"), []byte(status+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	write(100, "aa", "")
+	write(101, "bb", "rejected: inconclusive")
+	write(102, "cc", "not submitted: connection refused")
+
+	node := &fakeNode{}
+	s, err := Open(dir, node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Wait()
+	got := map[string]string{}
+	for _, r := range s.Records() {
+		got[r.Hash] = r.Status
+	}
+	if node.calls != 1 || got["aa"] != "accepted" || got["bb"] != "rejected: inconclusive" || got["cc"] != "not submitted: connection refused" {
+		t.Fatalf("calls %d, statuses %v", node.calls, got)
 	}
 }
 

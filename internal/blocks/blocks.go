@@ -261,12 +261,17 @@ func (s *Store) submit(hash string, block []byte) string {
 			log.Printf("BLOCK ACCEPTED by the node: %s", hash)
 			return "accepted"
 		case err == nil:
+			// Every other answer is final. "inconclusive" means the node
+			// stored the block without making it the tip, typically because
+			// another block at the same height arrived first. Submitting it
+			// again would return "duplicate", which here does not mean the
+			// block won.
 			log.Printf("Block %s was REJECTED by the node: %s", hash, reason)
 			return "rejected: " + reason
-		}
-		var rpcErr *rpc.Error
-		if errors.As(err, &rpcErr) && rpcErr.Code != rpc.CodeInWarmup {
+		case permanentSubmitError(err):
 			log.Printf("Block %s could not be submitted: %s", hash, rpc.Explain(err))
+			var rpcErr *rpc.Error
+			errors.As(err, &rpcErr)
 			return "rejected: " + rpcErr.Message
 		}
 		lastErr = err
@@ -280,4 +285,21 @@ func (s *Store) submit(hash string, block []byte) string {
 		case <-time.After(s.retryEvery):
 		}
 	}
+}
+
+// permanentSubmitError reports a node error that will not change on retry:
+// the block could not be decoded, or the request itself is malformed.
+// Consensus rejections arrive as result strings, not as errors. Any other
+// error is retried, since giving up on a block that may be valid loses it.
+func permanentSubmitError(err error) bool {
+	var rpcErr *rpc.Error
+	if !errors.As(err, &rpcErr) {
+		return false
+	}
+	switch rpcErr.Code {
+	case rpc.CodeDeserialization, rpc.CodeTypeError, rpc.CodeInvalidParameter,
+		rpc.CodeParseError, rpc.CodeInvalidRequest, rpc.CodeMethodNotFound, rpc.CodeInvalidParams:
+		return true
+	}
+	return false
 }

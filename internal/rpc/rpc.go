@@ -56,9 +56,18 @@ func (e *Error) Error() string { return fmt.Sprintf("node error %d: %s", e.Code,
 
 // Error codes used by Bitcoin Core that callers care about.
 const (
-	CodeNotConnected = -9  // node has no peers
-	CodeInWarmup     = -28 // node is still starting
-	CodeInIBD        = -10 // node is still downloading the chain
+	CodeNotConnected    = -9  // node has no peers
+	CodeInWarmup        = -28 // node is still starting
+	CodeInIBD           = -10 // node is still downloading the chain
+	CodeDeserialization = -22 // the block or the request could not be decoded
+
+	// The request itself is malformed, so sending it again cannot help.
+	CodeTypeError        = -3
+	CodeInvalidParameter = -8
+	CodeParseError       = -32700
+	CodeInvalidRequest   = -32600
+	CodeMethodNotFound   = -32601
+	CodeInvalidParams    = -32602
 )
 
 // HTTPError is a failure at the HTTP level, such as a rejected login.

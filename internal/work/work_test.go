@@ -348,15 +348,19 @@ func TestManagerPublishing(t *testing.T) {
 		t.Fatal("an older template replaced a newer one")
 	}
 
-	// A new tip invalidates everything before it.
+	// A new tip stops paying shares on the previous jobs, but keeps them so a
+	// solved block can still be rebuilt.
 	node.templates = []*rpc.BlockTemplate{template(2, 101, 1040, 0)}
 	m.Fetch(ctx)
 	tip := m.Current()
 	if len(*published) != 3 || !tip.CleanJobs || tip.Height != 101 {
 		t.Fatalf("new tip job: %+v", tip)
 	}
-	if m.Get(first.ID) != nil || m.Get(refresh.ID) != nil {
-		t.Fatal("jobs for the old tip are still accepted")
+	if m.Get(first.ID) == nil || m.Get(refresh.ID) == nil {
+		t.Fatal("jobs for the old tip were dropped while a solved block could still be rebuilt")
+	}
+	if m.Get(first.ID).AcceptsShares() || m.Get(refresh.ID).AcceptsShares() {
+		t.Fatal("jobs for the old tip are still accepted as shares")
 	}
 
 	// An answer that was requested before the tip changed and would switch
@@ -405,9 +409,42 @@ func TestManagerKeepsOnlyRecentJobs(t *testing.T) {
 		ids = append(ids, m.Current().ID)
 	}
 	for i, id := range ids {
-		if kept := m.Get(id) != nil; kept != (i >= len(ids)-keepJobs) {
-			t.Errorf("job %d kept=%v", i, kept)
+		job := m.Get(id)
+		if job == nil {
+			t.Fatalf("job %d was dropped while a solved block could still be rebuilt", i)
 		}
+		if shareable := i >= len(ids)-keepJobs; job.AcceptsShares() != shareable {
+			t.Errorf("job %d shareable=%v, want %v", i, job.AcceptsShares(), shareable)
+		}
+	}
+}
+
+func TestRetiredJobsExpire(t *testing.T) {
+	node := &fakeNode{templates: []*rpc.BlockTemplate{template(1, 100, 1000, 0)}}
+	m, _ := newTestManager(node)
+	if err := m.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	job := m.Current()
+	job.Retire(time.Now().Add(-retiredJobGrace + time.Second))
+	if m.Get(job.ID) == nil {
+		t.Fatal("a job retired moments ago is no longer returned")
+	}
+	job.retiredAt.Store(time.Now().Add(-retiredJobGrace - time.Second).UnixNano())
+	if m.Get(job.ID) != nil {
+		t.Fatal("a retired job past the grace period is still returned")
+	}
+
+	// The next job frees it.
+	node.templates = []*rpc.BlockTemplate{template(2, 101, 1040, 0)}
+	if err := m.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.RLock()
+	_, kept := m.jobs[job.ID]
+	m.mu.RUnlock()
+	if kept {
+		t.Fatal("an expired job is still held")
 	}
 }
 

@@ -418,6 +418,84 @@ func TestBlockFound(t *testing.T) {
 	}
 }
 
+// A job that no longer pays shares can still deliver a block. An ordinary
+// share on that job is stale.
+func TestStaleJobStillSubmitsABlock(t *testing.T) {
+	serverJob := makeJob(t, "a", regtestBits, 0x20000000, 1, true)
+	serverJob.Retire(time.Now())
+	h := newHarness(t, 1024, serverJob)
+	m := h.dial(axesim.Options{User: "rig1"})
+	job := firstJob(t, m)
+
+	ordinary := makeJob(t, "b", diff1Bits, 0x20000000, 0, false)
+	ordinary.Retire(time.Now())
+	h.jobs.add(ordinary)
+	var weak axesim.Share
+	for {
+		weak = mustMine(t, m, jobFromServer(t, ordinary), lowDifficulty)
+		if axesim.HashDifficulty(weak.Hash) < ordinary.NetDiff {
+			break
+		}
+	}
+	if res := mustSubmit(t, m, weak); res.Accepted || res.Code != errJobNotFound {
+		t.Fatalf("ordinary share on a retired job: %+v", res)
+	}
+
+	share := mustMine(t, m, job, job.NetworkDifficulty())
+	if res := mustSubmit(t, m, share); !res.Accepted {
+		t.Fatalf("block on a retired job rejected: %+v", res)
+	}
+	select {
+	case found := <-h.sink.ch:
+		if found.hash != axesim.DisplayHash(share.Hash) {
+			t.Errorf("hash %s, miner computed %s", found.hash, axesim.DisplayHash(share.Hash))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("block on a retired job was not submitted")
+	}
+}
+
+// jobFromServer builds the miner-side view of a job the server already has,
+// using the coinbase parts the server would have announced.
+func jobFromServer(t *testing.T, job *work.Job) *axesim.Job {
+	t.Helper()
+	return &axesim.Job{
+		ID:        job.ID,
+		PrevHash:  job.StratumPrevHash(),
+		Coinbase1: hex.EncodeToString(job.Coinbase1()),
+		Coinbase2: hex.EncodeToString(job.Coinbase2(defaultScript)),
+		Version:   job.Version,
+		NBits:     job.Bits,
+		NTime:     job.CurTime,
+	}
+}
+
+// A header that meets the network target is handed to the node whatever its
+// time: only the node can judge the time against its own clock.
+func TestBlockIsSubmittedWhateverItsTime(t *testing.T) {
+	serverJob := makeJob(t, "a", regtestBits, 0x20000000, 0, true)
+	h := newHarness(t, 1024, serverJob)
+	m := h.dial(axesim.Options{User: "rig1"})
+	notified := firstJob(t, m)
+
+	for _, ntime := range []uint32{serverJob.CurTime + maxNTimeRoll + 1, serverJob.MinTime - 1, math.MaxUint32} {
+		job := *notified
+		job.NTime = ntime
+		share := mustMine(t, m, &job, job.NetworkDifficulty())
+		if res := mustSubmit(t, m, share); !res.Accepted {
+			t.Fatalf("block with time %d was rejected: %+v", ntime, res)
+		}
+		select {
+		case found := <-h.sink.ch:
+			if found.hash != axesim.DisplayHash(share.Hash) {
+				t.Errorf("hash %s, miner computed %s", found.hash, axesim.DisplayHash(share.Hash))
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("block with time %d was not submitted", ntime)
+		}
+	}
+}
+
 // checkBlock parses a serialized block far enough to verify its structure:
 // transaction count, witness-form coinbase, payout output, and that the
 // merkle root in the header commits to the coinbase's transaction id.
@@ -959,9 +1037,9 @@ func TestShutdownWaitsForBlockHandoffAndDisconnect(t *testing.T) {
 	}
 	t.Cleanup(m.Close)
 	share := mustMine(t, m, firstJob(t, m), job.NetDiff)
-	if result := mustSubmit(t, m, share); !result.Accepted {
-		t.Fatal(result)
-	}
+	// The block is handed off before the miner gets its answer, so the
+	// answer only comes once the handoff below is released.
+	go m.Submit(share)
 	select {
 	case <-sink.entered:
 	case <-time.After(5 * time.Second):

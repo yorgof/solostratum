@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yorgof/solostratum/internal/btc"
@@ -64,8 +65,10 @@ type Job struct {
 	witnessCommitment []byte // output script, nil before segwit activation
 	txData            [][]byte
 
-	mu     sync.Mutex
-	shares map[shareKey]struct{}
+	mu        sync.Mutex
+	shares    map[shareKey]struct{}
+	shareable atomic.Bool  // false once ordinary shares are stale
+	retiredAt atomic.Int64 // unix nano, set when shareable becomes false
 }
 
 type shareKey struct {
@@ -138,6 +141,7 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 		txData:    make([][]byte, len(t.Transactions)),
 		CleanJobs: false,
 	}
+	j.shareable.Store(true)
 
 	txids := make([]btc.Hash, len(t.Transactions))
 	hashes := make([]btc.Hash, len(t.Transactions))
@@ -280,6 +284,25 @@ func (j *Job) Block(header [80]byte, coinbase []byte) []byte {
 		b = append(b, d...)
 	}
 	return b
+}
+
+// Retire stops ordinary share acceptance. The job is kept for a short while
+// so a header that already meets the network target, still on its way from
+// the miner, can be rebuilt into a block.
+func (j *Job) Retire(now time.Time) {
+	if j.shareable.CompareAndSwap(true, false) {
+		j.retiredAt.Store(now.UnixNano())
+	}
+}
+
+// AcceptsShares reports whether a non-block share for this job is still paid.
+func (j *Job) AcceptsShares() bool { return j.shareable.Load() }
+
+// expired reports whether a retired job is past retiredJobGrace, after
+// which a share for it is no longer expected.
+func (j *Job) expired(now time.Time) bool {
+	retired := j.retiredAt.Load()
+	return retired != 0 && now.Sub(time.Unix(0, retired)) > retiredJobGrace
 }
 
 // MarkShare records a share and reports whether it was new. Miners must not

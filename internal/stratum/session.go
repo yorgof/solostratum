@@ -581,12 +581,6 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 		reject(errJobNotFound, "Job not found (stale)")
 		return
 	}
-	// The block time may only move forward a little. Moving it further
-	// gains nothing, since new work arrives every few seconds.
-	if ntime < job.CurTime || ntime > job.CurTime+maxNTimeRoll {
-		reject(errOther, "Time out of range")
-		return
-	}
 
 	// BIP310 says the submitted bits replace the masked bits of the job's
 	// version. Some firmware sends the XOR against the job's version
@@ -611,6 +605,22 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	shareDiff := btc.DifficultyFromTarget(hashInt)
 	isBlock := hashInt.Cmp(job.Target) <= 0
 
+	// Ordinary shares use a short time window: new work arrives every few
+	// seconds, so rolling further gains nothing. A header that meets the
+	// network target is submitted whatever its job or time. Only the node
+	// can judge a block's time against its own clock, and refusing the
+	// header here would throw the block away.
+	if !isBlock {
+		if !job.AcceptsShares() {
+			reject(errJobNotFound, "Job not found (stale)")
+			return
+		}
+		if ntime < job.CurTime || ntime > job.CurTime+maxNTimeRoll {
+			reject(errOther, "Time out of range")
+			return
+		}
+	}
+
 	s.mu.Lock()
 	assigned, known := s.jobDiff[jobID]
 	if !known {
@@ -626,6 +636,10 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	if !job.MarkShare(s.extranonce1[:], extranonce2, ntime, nonce, version) {
 		reject(errDuplicate, "Duplicate share")
 		return
+	}
+	if isBlock {
+		log.Printf("*** BLOCK FOUND by %s: height %d, hash %s ***", worker, job.Height, hash)
+		s.srv.blocks.Found(job.Height, hash.String(), job.Block(header, coinbase), worker)
 	}
 
 	// Credit the share at the difficulty the miner was actually working at.
@@ -651,10 +665,6 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	}
 	s.reply(req.ID, true, 0, "")
 
-	if isBlock {
-		log.Printf("*** BLOCK FOUND by %s: height %d, hash %s ***", worker, job.Height, hash)
-		s.srv.blocks.Found(job.Height, hash.String(), job.Block(header, coinbase), worker)
-	}
 	if changed {
 		s.mu.Lock()
 		s.announceDifficultyLocked()
