@@ -176,6 +176,10 @@ the internet. The same data is available as JSON at `/api/status`.
   the time it was online in that period. A miner that keeps reconnecting
   shows up here. The chart's data is at `/api/history?range=24h` (or `7d`,
   `30d`).
+- **Best shares**, under the chart, are the ten workers with the highest
+  share difficulty each has reached, and when that share was accepted. The
+  list is all-time: the buttons above the chart do not change it. A worker
+  appears once. Shares that drop out of the ten stay on disk.
 
 A miner named `bc1q....workername` is listed as `workername`; hover over
 the name to see all of it. On a narrow screen the tables turn into one
@@ -207,10 +211,24 @@ and `online` the seconds it was connected. Lines add up: after a restart
 the same worker and time can appear twice. A worker is recorded under its
 full Stratum username.
 
-The files are written every five minutes and when solostratum stops, so a
-power cut loses at most the last five minutes. One miner adds 15 to 20 MB
-a year. To drop a miner you no longer own from the offline list, stop
-solostratum and remove its entry from `workers.json`.
+- `best-shares.jsonl` has one line each time a worker's best share made the
+  all-time top ten, or went higher while that worker was already in the ten:
+
+  ```json
+  {"t":"2026-10-03T12:04:10Z","worker":"bitaxe1","bestShare":182934.2}
+  ```
+
+  `t` is when that share was accepted, in UTC. The status page shows the ten
+  highest, one row per worker. Older lines stay in the file. A best share
+  from before this file existed has no time stored, so that worker joins the
+  list the next time it beats its old best. The line is written when the
+  share is accepted, and again on shutdown if a write was still waiting.
+
+The monthly history and the worker totals are written every five minutes and
+when solostratum stops, so a power cut loses at most the last five minutes
+of that history. One miner adds 15 to 20 MB a year. To drop a miner you no
+longer own from the offline list, stop solostratum and remove its entry from
+`workers.json`.
 
 ## When you find a block
 

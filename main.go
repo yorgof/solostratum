@@ -171,7 +171,7 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 				Node: manager.State, Pool: server.Status, Blocks: store.Records,
 			}
 			if history != nil {
-				src.Offline, src.History = history.Offline, history.Series
+				src.Offline, src.History, src.BestShares = history.Offline, history.Series, history.BestShares
 			}
 			err := status.Serve(ctx, statusListener, src)
 			if err != nil {

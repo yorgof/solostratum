@@ -90,7 +90,16 @@
   #tip b { display: inline-block; min-width: 72px; font-weight: 600; font-variant-numeric: tabular-nums; }
   /* A short stroke in a worker's chart colour, next to its name. */
   .key { display: inline-block; width: 12px; height: 3px; border-radius: 2px; margin-right: 8px; vertical-align: middle; }
-  #summary-box { margin-top: 10px; }
+  #summary-box, #best-box { margin-top: 10px; }
+  h2 .quiet { text-transform: none; letter-spacing: 0; font-weight: 500; margin-left: 8px; }
+  @media (max-width: 1020px) {
+    /* Rank and worker share the title row; the general rule would let the rank span the card. */
+    #best-shares tr { grid-template-columns: auto repeat(auto-fit, minmax(120px, 1fr)); }
+    #best-shares td.rank { grid-column: 1; grid-row: 1; font-size: 15px; font-weight: 600; }
+    #best-shares td.rank::before { content: none; }
+    #best-shares td.who { grid-column: 2 / -1; grid-row: 1; font-size: 15px; font-weight: 600; align-self: center; }
+    #best-shares td.who::before { content: none; }
+  }
   #summary tr.total td { color: var(--dim); }
 </style>
 </head>
@@ -157,6 +166,16 @@
     <div class="label">Hashrate<span id="chart-step"></span></div>
     <div id="chart"><svg id="plot" role="img" tabindex="0"></svg><div id="tip" hidden></div></div>
     <div class="empty" id="no-history" hidden>No shares in this period yet.</div>
+  </div>
+  <h2>Best shares <span class="quiet">all time</span></h2>
+  <div class="scroll" id="best-box">
+    <table id="best-shares" class="stack">
+      <thead><tr>
+        <th class="num">#</th><th>Worker</th><th class="num">Best share</th><th>When</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="empty" id="no-bests">None yet.</div>
   </div>
   <div class="scroll" id="summary-box">
     <table id="summary" class="stack">
@@ -358,6 +377,22 @@ function render(r) {
   }
   $("blocks").style.display = blocks.length ? "" : "none";
   $("no-blocks").style.display = blocks.length ? "none" : "";
+
+  // All-time best share of each worker, highest first. The range buttons
+  // do not apply: a share that falls out of the ten stays on disk only.
+  const best = r.bestShares || [];
+  const bestBody = $("best-shares").tBodies[0];
+  bestBody.replaceChildren();
+  best.forEach((b, i) => {
+    const row = bestBody.insertRow();
+    cell(row, String(i + 1), "num rank");
+    workerCell(row, b.worker, b.worker).classList.add("who");
+    cell(row, fmtDiff(b.bestShare), "num");
+    cell(row, new Date(b.t).toLocaleString());
+    label($("best-shares"), row);
+  });
+  $("best-shares").hidden = !best.length;
+  $("no-bests").hidden = best.length > 0;
 
   if (r.history && $("history-section").hidden) {
     $("history-section").hidden = false;

@@ -28,8 +28,9 @@ type Report struct {
 	Node          work.NodeState  `json:"node"`
 	Pool          stratum.Status  `json:"pool"`
 	Blocks        []blocks.Record `json:"blocks"`
-	Offline       []stats.Worker  `json:"offline"` // known workers that are not connected
-	History       bool            `json:"history"` // whether /api/history is available
+	Offline       []stats.Worker    `json:"offline"` // known workers that are not connected
+	History       bool              `json:"history"` // whether /api/history is available
+	BestShares    []stats.BestShare `json:"bestShares"`
 }
 
 // Sources are the functions the page reads its data from.
@@ -40,10 +41,11 @@ type Sources struct {
 	Node          func() work.NodeState
 	Pool          func() stratum.Status
 	Blocks        func() []blocks.Record
-	// Offline and History come from the statistics. Both are nil when no
-	// statistics are kept.
-	Offline func() []stats.Worker
-	History func(now time.Time, span, step time.Duration) (stats.Series, error)
+	// Offline, History and BestShares come from the statistics. All three are
+	// nil when no statistics are kept.
+	Offline    func() []stats.Worker
+	History    func(now time.Time, span, step time.Duration) (stats.Series, error)
+	BestShares func() []stats.BestShare
 }
 
 // ranges are the periods a history chart can cover, each with the width of
@@ -84,9 +86,16 @@ func Handler(src Sources) http.Handler {
 		if src.Offline != nil {
 			offline = src.Offline()
 		}
+		best := []stats.BestShare{}
+		if src.BestShares != nil {
+			if got := src.BestShares(); got != nil {
+				best = got
+			}
+		}
 		writeJSON(w, Report{
 			Version: src.Version, Now: time.Now(), PayoutAddress: src.PayoutAddress, StratumPort: src.StratumPort,
 			Node: src.Node(), Pool: src.Pool(), Blocks: found, Offline: offline, History: src.History != nil,
+			BestShares: best,
 		})
 	})
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {

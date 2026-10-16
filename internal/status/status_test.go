@@ -60,7 +60,7 @@ func TestAPI(t *testing.T) {
 		t.Errorf("report: %v", r)
 	}
 	// Lists must be arrays, never null, so the page can iterate them.
-	for _, list := range []string{"blocks", "offline"} {
+	for _, list := range []string{"blocks", "offline", "bestShares"} {
 		if _, ok := r[list].([]any); !ok {
 			t.Errorf("%s is %T, want an array", list, r[list])
 		}
@@ -200,6 +200,44 @@ func TestHistoryIsOffWithoutStatistics(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("history without statistics = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestBestSharesInStatus(t *testing.T) {
+	when := time.Date(2026, 10, 3, 12, 4, 10, 0, time.UTC)
+	srv := serve(t, nil, func(src *Sources) {
+		src.History = func(time.Time, time.Duration, time.Duration) (stats.Series, error) {
+			return stats.Series{Workers: []stats.WorkerSeries{}}, nil
+		}
+		src.BestShares = func() []stats.BestShare {
+			return []stats.BestShare{{Time: when, Worker: "bitaxe1", Difficulty: 5000}}
+		}
+	})
+	resp, err := http.Get(srv.URL + "/api/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var report struct {
+		History    bool              `json:"history"`
+		BestShares []stats.BestShare `json:"bestShares"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.History || len(report.BestShares) != 1 || report.BestShares[0].Worker != "bitaxe1" ||
+		report.BestShares[0].Difficulty != 5000 || !report.BestShares[0].Time.Equal(when) {
+		t.Fatalf("status: %+v", report)
+	}
+
+	page, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(page.Body)
+	page.Body.Close()
+	if !strings.Contains(string(body), `id="best-shares"`) || !strings.Contains(string(body), "all time") {
+		t.Fatal("status page has no best-share list")
 	}
 }
 
