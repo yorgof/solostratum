@@ -176,10 +176,12 @@ the internet. The same data is available as JSON at `/api/status`.
   the time it was online in that period. A miner that keeps reconnecting
   shows up here. The chart's data is at `/api/history?range=24h` (or `7d`,
   `30d`).
-- **Best shares**, under the chart, are the ten workers with the highest
-  share difficulty each has reached, and when that share was accepted. The
-  list is all-time: the buttons above the chart do not change it. A worker
-  appears once. Shares that drop out of the ten stay on disk.
+- **Best shares**, under the chart, are the ten highest shares solostratum
+  has accepted, from any worker, with the worker and when each was accepted.
+  A worker can appear more than once. The list is all-time: the buttons
+  above the chart do not change it. It starts with the first ten shares and
+  changes often at first, then less and less as only harder shares can enter
+  it. Shares that drop out of the ten stay on disk.
 
 A miner named `bc1q....workername` is listed as `workername`; hover over
 the name to see all of it. On a narrow screen the tables turn into one
@@ -211,18 +213,18 @@ and `online` the seconds it was connected. Lines add up: after a restart
 the same worker and time can appear twice. A worker is recorded under its
 full Stratum username.
 
-- `best-shares.jsonl` has one line each time a worker's best share made the
-  all-time top ten, or went higher while that worker was already in the ten:
+- `best-shares.jsonl` has one line for every share that made the list of the
+  ten highest shares, from any worker:
 
   ```json
   {"t":"2026-10-03T12:04:10Z","worker":"bitaxe1","bestShare":182934.2}
   ```
 
-  `t` is when that share was accepted, in UTC. The status page shows the ten
-  highest, one row per worker. Older lines stay in the file. A best share
-  from before this file existed has no time stored, so that worker joins the
-  list the next time it beats its old best. The line is written when the
-  share is accepted, and again on shutdown if a write was still waiting.
+  `t` is when that share was accepted, in UTC, and `bestShare` its
+  difficulty. The status page shows the ten highest. Older lines stay in the
+  file. Shares accepted before this file existed are not in it: the list
+  begins with the first shares after the update. The line is written when
+  the share is accepted, and again on shutdown if a write was still waiting.
 
 The monthly history and the worker totals are written every five minutes and
 when solostratum stops, so a power cut loses at most the last five minutes

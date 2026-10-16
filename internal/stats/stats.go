@@ -8,8 +8,8 @@
 //     interval in which that worker was connected. Lines are only ever
 //     appended. The one exception is an unfinished last line, as a power
 //     cut can leave behind: it is removed before the next line is added.
-//   - best-shares.jsonl has one line each time a worker's best share made
-//     the all-time top ten, or went higher while that worker was in it.
+//   - best-shares.jsonl has one line for every share that made the list of
+//     the ten highest shares this program has accepted, from any worker.
 //     Lines are only appended, so a share that later falls out of the ten
 //     stays in the file. An unfinished last line is removed before the
 //     next line is added, as with the history.
@@ -57,12 +57,13 @@ const (
 	// to take it, so a folder that stays unwritable cannot exhaust memory.
 	// It holds several intervals of the largest possible set of workers.
 	maxPending = 5 * maxWorkers
-	// bestShown is how many workers the best-share list displays.
+	// bestShown is how many shares the best-share list holds.
 	bestShown = 10
 	// maxBestPending limits best-share lines held in memory while the disk
-	// refuses them. The current best of each worker is kept ahead of older
-	// lines, and there is at most one of those per worker.
-	maxBestPending = maxWorkers
+	// refuses them. Lines of shares still on the list are kept ahead of the
+	// others. Only a handful of shares make the list in a day, so this is
+	// never reached unless something is wrong.
+	maxBestPending = 1000
 	// recent is how far back a Series looks for workers. It is the longest
 	// period worth charting, so a worker keeps its place in every chart.
 	recent = 30 * 24 * time.Hour
@@ -112,8 +113,8 @@ type Sample struct {
 	Counts
 }
 
-// BestShare is one line of the best-share file: a worker's best accepted
-// share at the moment it made, or improved its place in, the top ten.
+// BestShare is one line of the best-share file: a share that made the list
+// of the highest shares, and when it was accepted.
 type BestShare struct {
 	Time       time.Time `json:"t"`
 	Worker     string    `json:"worker"`
@@ -163,7 +164,8 @@ type cachedSeries struct {
 }
 
 // Store collects shares and connections in memory and writes them to disk
-// once per Interval. A best share that makes the top ten is written sooner.
+// once per Interval. A share that makes the list of the highest shares is
+// written sooner.
 type Store struct {
 	dir string
 
@@ -180,10 +182,10 @@ type Store struct {
 	live    map[string]*presence
 	full    bool // the maxWorkers warning has been logged
 
-	bestOf         map[string]BestShare // highest recorded best per worker
-	bestPend       []BestShare          // recorded bests not yet written
-	bestWake       chan struct{}        // a new best is waiting to be written
-	bestDropLogged bool                 // the pending-cap warning has been logged
+	best           []BestShare   // the highest shares accepted, highest first
+	bestPend       []BestShare   // shares that made the list, not yet written
+	bestWake       chan struct{} // a share is waiting to be written
+	bestDropLogged bool          // the pending-cap warning has been logged
 }
 
 // Open prepares the statistics folder, verifies it is writable and loads
@@ -202,7 +204,7 @@ func Open(dir string) (*Store, error) {
 	s := &Store{
 		dir: dir, cache: map[seriesKey]cachedSeries{},
 		totals: map[string]*Totals{}, pending: map[sampleKey]*Sample{}, live: map[string]*presence{},
-		bestOf: map[string]BestShare{}, bestWake: make(chan struct{}, 1),
+		bestWake: make(chan struct{}, 1),
 	}
 	path := filepath.Join(dir, totalsFile)
 	raw, err := os.ReadFile(path)
@@ -243,16 +245,11 @@ func (s *Store) finishOpen() (*Store, error) {
 func (s *Store) Accepted(worker string, at time.Time, credit, shareDiff float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prev := 0.0
-	if t := s.totals[worker]; t != nil {
-		prev = t.BestShare
-	}
-	if !s.recordLocked(worker, at, Counts{Accepted: 1, Work: credit, BestShare: shareDiff}) {
-		return
-	}
-	// Only a share that beats this worker's lifetime best can be its best
-	// share. Infinity would sort above every real share.
-	if shareDiff > prev && shareDiff < math.Inf(1) {
+	s.recordLocked(worker, at, Counts{Accepted: 1, Work: credit, BestShare: shareDiff})
+	// The list of the highest shares covers every worker, including one
+	// whose name is no longer recorded. Infinity would sort above every
+	// real share.
+	if shareDiff > 0 && shareDiff < math.Inf(1) {
 		s.noteBestLocked(worker, at, shareDiff)
 	}
 }
@@ -349,33 +346,25 @@ func (s *Store) countAllOnlineLocked(until time.Time) {
 	}
 }
 
-// BestShares returns the workers with the highest best share, at most ten,
-// the highest first. Each worker appears once, at the time that share was
-// accepted. Shares that have since fallen out of the ten stay in the file.
+// BestShares returns the highest shares this program has accepted, at most
+// ten, the highest first. They come from any workers, so one worker can
+// appear several times. Shares that have since fallen out of the ten stay in
+// the file.
 func (s *Store) BestShares() []BestShare {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ranked := s.rankedLocked()
-	if len(ranked) > bestShown {
-		ranked = ranked[:bestShown]
-	}
-	out := make([]BestShare, len(ranked))
-	copy(out, ranked)
+	out := make([]BestShare, len(s.best))
+	copy(out, s.best)
 	return out
 }
 
-// noteBestLocked records a share that has just become the worker's lifetime
-// best, when that best belongs on the top-ten list.
+// noteBestLocked puts an accepted share on the list of the highest shares
+// when it belongs there, and queues its line for the file.
 func (s *Store) noteBestLocked(worker string, at time.Time, diff float64) {
-	at = at.UTC().Truncate(time.Second)
-	if cur, ok := s.bestOf[worker]; ok && diff <= cur.Difficulty {
+	rec := BestShare{Time: at.UTC().Truncate(time.Second), Worker: worker, Difficulty: diff}
+	if !s.rankLocked(rec) {
 		return
 	}
-	if !s.makesBoardLocked(worker, diff) {
-		return
-	}
-	rec := BestShare{Time: at, Worker: worker, Difficulty: diff}
-	s.bestOf[worker] = rec
 	s.bestPend = append(s.bestPend, rec)
 	s.noteBestTrimLocked()
 	select {
@@ -384,55 +373,53 @@ func (s *Store) noteBestLocked(worker string, at time.Time, diff float64) {
 	}
 }
 
-// makesBoardLocked reports whether diff would put worker in the ten shown.
-// The worker's previous recorded best, if any, is still in bestOf.
-func (s *Store) makesBoardLocked(worker string, diff float64) bool {
-	ranked := s.rankedLocked()
-	shown := ranked
-	if len(shown) > bestShown {
-		shown = shown[:bestShown]
+// rankLocked places rec among the highest shares and reports whether it made
+// the list. A share that ties with the tenth does not: the earlier one stays.
+func (s *Store) rankLocked(rec BestShare) bool {
+	i := sort.Search(len(s.best), func(i int) bool { return ranksBefore(rec, s.best[i]) })
+	if i >= bestShown || (i > 0 && sameShare(s.best[i-1], rec)) {
+		return false
 	}
-	for _, b := range shown {
-		if b.Worker == worker {
+	s.best = append(s.best, BestShare{})
+	copy(s.best[i+1:], s.best[i:])
+	s.best[i] = rec
+	if len(s.best) > bestShown {
+		s.best = s.best[:bestShown]
+	}
+	return true
+}
+
+// ranksBefore orders the list: the higher share first, then the earlier one.
+func ranksBefore(a, b BestShare) bool {
+	if a.Difficulty != b.Difficulty {
+		return a.Difficulty > b.Difficulty
+	}
+	if !a.Time.Equal(b.Time) {
+		return a.Time.Before(b.Time)
+	}
+	return a.Worker < b.Worker
+}
+
+func sameShare(a, b BestShare) bool {
+	return a.Difficulty == b.Difficulty && a.Time.Equal(b.Time) && a.Worker == b.Worker
+}
+
+// onBestListLocked reports whether rec is one of the highest shares now.
+func (s *Store) onBestListLocked(rec BestShare) bool {
+	for _, b := range s.best {
+		if sameShare(b, rec) {
 			return true
 		}
 	}
-	if len(shown) < bestShown {
-		return true
-	}
-	return diff > shown[bestShown-1].Difficulty
+	return false
 }
 
-func (s *Store) rankedLocked() []BestShare {
-	out := make([]BestShare, 0, len(s.bestOf))
-	for _, b := range s.bestOf {
-		out = append(out, b)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Difficulty != out[j].Difficulty {
-			return out[i].Difficulty > out[j].Difficulty
-		}
-		if !out[i].Time.Equal(out[j].Time) {
-			return out[i].Time.Before(out[j].Time)
-		}
-		return out[i].Worker < out[j].Worker
-	})
-	return out
-}
-
-func (s *Store) keepBest(rec BestShare) {
-	cur, ok := s.bestOf[rec.Worker]
-	if !ok || rec.Difficulty > cur.Difficulty || (rec.Difficulty == cur.Difficulty && rec.Time.Before(cur.Time)) {
-		s.bestOf[rec.Worker] = rec
-	}
-}
-
-// noteBestTrimLocked drops superseded lines once the disk has fallen too
-// far behind. The line that is still each worker's current best stays.
+// noteBestTrimLocked drops lines of shares that are no longer on the list
+// once the disk has fallen too far behind. Shares still on it stay.
 func (s *Store) noteBestTrimLocked() {
 	if dropped := s.trimBestPendingLocked(); dropped > 0 && !s.bestDropLogged {
 		s.bestDropLogged = true
-		log.Printf("WARNING: the best-share list could not be written for so long that its oldest %d lines have been dropped. The ten shown are not affected.", dropped)
+		log.Printf("WARNING: the best-share list could not be written for so long that %d older shares have been dropped from the file. The ten shown are not affected.", dropped)
 	}
 }
 
@@ -444,12 +431,11 @@ func (s *Store) trimBestPendingLocked() int {
 	kept := make([]BestShare, 0, len(s.bestPend))
 	dropped := 0
 	for _, rec := range s.bestPend {
-		cur, ok := s.bestOf[rec.Worker]
-		if (ok && cur == rec) || dropped >= excess {
-			kept = append(kept, rec)
+		if dropped < excess && !s.onBestListLocked(rec) {
+			dropped++
 			continue
 		}
-		dropped++
+		kept = append(kept, rec)
 	}
 	s.bestPend = kept
 	return dropped
@@ -617,8 +603,8 @@ func completeLines(data []byte, atEOF bool) (int, []byte, error) {
 }
 
 // Run writes the statistics to disk at the end of every interval until ctx
-// is cancelled, and once more on the way out. A best share that makes the
-// top ten is written without waiting for the interval.
+// is cancelled, and once more on the way out. A share that makes the list of
+// the highest shares is written without waiting for the interval.
 func (s *Store) Run(ctx context.Context) {
 	for {
 		now := time.Now()
@@ -635,7 +621,7 @@ func (s *Store) Run(ctx context.Context) {
 		case <-s.bestWake:
 			// Stop's true result is not "the interval is still open": on
 			// Go 1.23 it also means a tick that already fired was discarded.
-			// A best share arriving as the interval ends must not skip that
+			// A share arriving as the interval ends must not skip that
 			// checkpoint. Do not receive from timer.C after Stop; that
 			// receive can block.
 			timer.Stop()
@@ -861,17 +847,17 @@ func (s *Store) loadBestShares() error {
 	lines.Split(completeLines)
 	for lines.Scan() {
 		var rec BestShare
-		if json.Unmarshal(lines.Bytes(), &rec) != nil || rec.Worker == "" || !(rec.Difficulty > 0) || rec.Difficulty >= math.Inf(1) {
+		if json.Unmarshal(lines.Bytes(), &rec) != nil || rec.Worker == "" || rec.Time.IsZero() || !(rec.Difficulty > 0) || rec.Difficulty >= math.Inf(1) {
 			continue
 		}
-		s.keepBest(rec)
+		s.rankLocked(rec)
 	}
 	err = lines.Err()
 	f.Close()
 	if err != nil {
 		// Statistics are not worth refusing to mine over. Keep the file for
 		// a person to look at and start the list again.
-		s.bestOf = map[string]BestShare{}
+		s.best = nil
 		aside := path + ".damaged-" + time.Now().UTC().Format("20060102T150405Z")
 		if rerr := os.Rename(path, aside); rerr != nil {
 			return fmt.Errorf("%s is damaged and could not be moved out of the way: %w", path, rerr)
@@ -882,9 +868,9 @@ func (s *Store) loadBestShares() error {
 	return nil
 }
 
-// writeBestShares appends best shares that have not reached disk yet. It
-// takes the disk lock, so flush, which already holds that lock, calls
-// persistBestShares directly.
+// writeBestShares appends the shares that made the best-share list and have
+// not reached disk yet. It takes the disk lock, so flush, which already holds
+// that lock, calls persistBestShares directly.
 func (s *Store) writeBestShares() {
 	s.io.Lock()
 	defer s.io.Unlock()

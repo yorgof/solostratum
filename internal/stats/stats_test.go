@@ -824,24 +824,41 @@ func bestLines(t *testing.T, dir string) []BestShare {
 	return out
 }
 
-func TestBestSharesKeepsOneRowPerWorkerAndDisplacedLines(t *testing.T) {
+func TestBestSharesAreTheHighestSharesOfAnyWorker(t *testing.T) {
 	dir := t.TempDir()
 	s := open(t, dir)
-	when := at(t, "2026-10-03T12:00:00Z")
-	for i := range 12 {
-		s.Accepted(fmt.Sprintf("rig%02d", i), when.Add(time.Duration(i)*time.Second), 1, float64(100+i))
+	if got := s.BestShares(); len(got) != 0 {
+		t.Fatalf("a new store lists %+v", got)
 	}
-	// A later, easier share is not a new best. An equal one is not either.
-	s.Accepted("rig11", when.Add(time.Minute), 1, 50)
-	s.Accepted("rig11", when.Add(time.Minute), 1, 111)
-	// Beating its own best updates the row and keeps the old line.
-	s.Accepted("rig11", when.Add(2*time.Minute), 1, 500)
-	// Tied with the tenth place: it does not take a seat.
-	s.Accepted("outsider", when.Add(3*time.Minute), 1, 102)
-
+	when := at(t, "2026-10-03T12:00:00Z")
+	// The first ten shares fill the list whatever their difficulty, and one
+	// worker can hold every place.
+	for i := range 12 {
+		s.Accepted("rig", when.Add(time.Duration(i)*time.Second), 1, float64(100+i))
+	}
 	got := s.BestShares()
-	if len(got) != bestShown || got[0].Worker != "rig11" || got[0].Difficulty != 500 || !got[0].Time.Equal(when.Add(2*time.Minute)) || got[9].Worker != "rig02" {
-		t.Fatalf("board: %+v", got)
+	if len(got) != bestShown || got[0].Difficulty != 111 || got[9].Difficulty != 102 {
+		t.Fatalf("list after twelve shares: %+v", got)
+	}
+	for _, b := range got {
+		if b.Worker != "rig" {
+			t.Fatalf("list after twelve shares: %+v", got)
+		}
+	}
+	// An easier share does not take a place, and neither does one tied with
+	// the tenth: the earlier share keeps it.
+	s.Accepted("other", when.Add(time.Minute), 1, 50)
+	s.Accepted("other", when.Add(time.Minute), 1, 102)
+	if got := s.BestShares(); got[9].Worker != "rig" || got[9].Difficulty != 102 {
+		t.Fatalf("a share that is not higher than the tenth took a place: %+v", got)
+	}
+	// A harder share from another worker goes to the top and pushes out the
+	// lowest.
+	s.Accepted("other", when.Add(2*time.Minute), 1, 500)
+	got = s.BestShares()
+	if len(got) != bestShown || got[0].Worker != "other" || got[0].Difficulty != 500 ||
+		!got[0].Time.Equal(when.Add(2*time.Minute)) || got[1].Worker != "rig" || got[9].Difficulty != 103 {
+		t.Fatalf("list after a harder share: %+v", got)
 	}
 	s.Flush(when.Add(time.Hour))
 
@@ -850,21 +867,21 @@ func TestBestSharesKeepsOneRowPerWorkerAndDisplacedLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	first, _, _ := strings.Cut(string(raw), "\n")
-	if want := `{"t":"2026-10-03T12:00:00Z","worker":"rig00","bestShare":100}`; first != want {
+	if want := `{"t":"2026-10-03T12:00:00Z","worker":"rig","bestShare":100}`; first != want {
 		t.Errorf("first line:\n  %s\nwant:\n  %s", first, want)
 	}
 	lines := bestLines(t, dir)
-	// Twelve workers entered while the board filled, plus rig11's improvement.
+	// Twelve shares entered one after the other, then the share of 500.
 	if len(lines) != 13 {
 		t.Fatalf("file has %d lines, want 13: %+v", len(lines), lines)
 	}
 	var kept bool
 	for _, line := range lines {
-		if line.Worker == "rig00" && line.Difficulty == 100 {
+		if line.Worker == "rig" && line.Difficulty == 100 {
 			kept = true
 		}
-		if line.Worker == "outsider" {
-			t.Errorf("a share tied with tenth place was stored: %+v", line)
+		if line.Worker == "other" && line.Difficulty != 500 {
+			t.Errorf("a share that did not make the list was stored: %+v", line)
 		}
 	}
 	if !kept {
@@ -877,13 +894,37 @@ func TestBestSharesKeepsOneRowPerWorkerAndDisplacedLines(t *testing.T) {
 		t.Fatalf("reloaded %+v, want %+v", reloaded, got)
 	}
 	for i := range got {
-		if reloaded[i].Worker != got[i].Worker || reloaded[i].Difficulty != got[i].Difficulty || !reloaded[i].Time.Equal(got[i].Time) {
+		if !sameShare(reloaded[i], got[i]) {
 			t.Fatalf("reloaded[%d] = %+v, want %+v", i, reloaded[i], got[i])
 		}
 	}
-	// Lifetime totals still remember a best that never made this list.
-	if again.totals["outsider"].BestShare != 102 {
-		t.Fatalf("outsider totals: %+v", again.totals["outsider"])
+	// The list does not change what is kept per worker.
+	if again.totals["other"].BestShare != 500 || again.totals["rig"].BestShare != 111 {
+		t.Fatalf("totals: other %+v, rig %+v", again.totals["other"], again.totals["rig"])
+	}
+}
+
+func TestBestSharesIgnoreImpossibleSharesAndRepeatedLines(t *testing.T) {
+	dir := t.TempDir()
+	when := at(t, "2026-10-03T12:00:00Z")
+	line, err := json.Marshal(BestShare{when, "rig", 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same line twice, and one without a time.
+	file := string(line) + "\n" + string(line) + "\n" + `{"worker":"rig","bestShare":9}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, bestFile), []byte(file), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := open(t, dir)
+	if got := s.BestShares(); len(got) != 1 || got[0].Difficulty != 7 {
+		t.Fatalf("loaded %+v, want the one share of 7", got)
+	}
+	for _, diff := range []float64{math.Inf(1), math.NaN(), 0, -1} {
+		s.Accepted("rig", when.Add(time.Second), 1, diff)
+	}
+	if got := s.BestShares(); len(got) != 1 || len(s.bestPend) != 0 {
+		t.Fatalf("an impossible share was listed: %+v, pending %+v", got, s.bestPend)
 	}
 }
 
@@ -948,6 +989,7 @@ func TestUnwrittenBestSharesAreBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	when := at(t, "2026-10-03T12:00:00Z")
+	// Every share is harder than the one before, so every one makes the list.
 	n := maxBestPending + 10
 	for i := 1; i <= n; i++ {
 		s.Accepted("rig", when.Add(time.Duration(i)*time.Second), 1, float64(i))
@@ -955,11 +997,22 @@ func TestUnwrittenBestSharesAreBounded(t *testing.T) {
 	if len(s.bestPend) != maxBestPending {
 		t.Fatalf("pending %d, want %d", len(s.bestPend), maxBestPending)
 	}
-	if got := s.BestShares(); len(got) != 1 || got[0].Difficulty != float64(n) {
-		t.Fatalf("board: %+v", got)
+	got := s.BestShares()
+	if len(got) != bestShown || got[0].Difficulty != float64(n) {
+		t.Fatalf("list: %+v", got)
 	}
-	if last := s.bestPend[len(s.bestPend)-1]; last.Difficulty != float64(n) {
-		t.Fatalf("pending dropped the current best: %+v", last)
+	// What was dropped is the oldest; the shares on the list are all kept.
+	for _, b := range got {
+		var queued bool
+		for _, rec := range s.bestPend {
+			queued = queued || sameShare(rec, b)
+		}
+		if !queued {
+			t.Fatalf("pending dropped a share that is on the list: %+v", b)
+		}
+	}
+	if first := s.bestPend[0]; first.Difficulty != 11 {
+		t.Fatalf("pending starts at %+v, want the share of 11", first)
 	}
 }
 

@@ -171,7 +171,7 @@
   <div class="scroll" id="best-box">
     <table id="best-shares" class="stack">
       <thead><tr>
-        <th class="num">#</th><th>Worker</th><th class="num">Best share</th><th>When</th>
+        <th class="num">#</th><th>Worker</th><th class="num">Share</th><th>When</th>
       </tr></thead>
       <tbody></tbody>
     </table>
@@ -378,8 +378,9 @@ function render(r) {
   $("blocks").style.display = blocks.length ? "" : "none";
   $("no-blocks").style.display = blocks.length ? "none" : "";
 
-  // All-time best share of each worker, highest first. The range buttons
-  // do not apply: a share that falls out of the ten stays on disk only.
+  // The ten highest shares ever accepted, from any worker, highest first. A
+  // worker can appear more than once. The range buttons do not apply: a share
+  // that falls out of the ten stays on disk only.
   const best = r.bestShares || [];
   const bestBody = $("best-shares").tBodies[0];
   bestBody.replaceChildren();
