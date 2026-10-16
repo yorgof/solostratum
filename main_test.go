@@ -1,16 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,6 +48,14 @@ func settingsFile(t *testing.T, nodeURL string, overrides map[string]string) str
 // poll stays in flight until shutdown, exercising cancellation and draining.
 func startupNode(t *testing.T, chain string) (*httptest.Server, <-chan struct{}) {
 	t.Helper()
+	return startupNodeSubmitting(t, chain, nil)
+}
+
+// startupNodeSubmitting is startupNode for a node that also takes blocks:
+// onSubmit is called with each block it is given, after a pause that stands
+// for the time a real node needs to validate one.
+func startupNodeSubmitting(t *testing.T, chain string, onSubmit func(blockHex string)) (*httptest.Server, <-chan struct{}) {
+	t.Helper()
 	polling := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -77,6 +88,15 @@ func startupNode(t *testing.T, chain string) (*httptest.Server, <-chan struct{})
 				result = rpc.BlockTemplate{Version: 0x20000000, PreviousBlockHash: strings.Repeat("01", 32),
 					Bits: "207fffff", Height: 100, CurTime: time.Now().Unix(), CoinbaseValue: 5000000000, LongPollID: "tip-1"}
 			}
+		case "submitblock":
+			if onSubmit == nil || len(req.Params) != 1 {
+				t.Error("unexpected submitblock")
+				return
+			}
+			var blockHex string
+			json.Unmarshal(req.Params[0], &blockHex)
+			time.Sleep(200 * time.Millisecond)
+			onSubmit(blockHex)
 		default:
 			t.Errorf("unexpected RPC method %q", req.Method)
 		}
@@ -134,7 +154,6 @@ func TestStartupFailures(t *testing.T) {
 		{"wrong payout network", "main", "", "", "not usable on the node's network"},
 		{"invalid config", "regtest", "unexpected", "value", "problem in settings file"},
 		{"unusable block storage", "regtest", "blocks_dir", "file", "cannot use blocks_dir"},
-		{"unusable history storage", "regtest", "stats_dir", "file", "cannot use stats_dir"},
 		{"invalid miner port", "regtest", "stratum_listen", "127.0.0.1:65536", "cannot listen for miners"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -304,4 +323,196 @@ func TestCommandFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+// syncBuffer collects log output from several goroutines.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// captureLog returns what the program logs until the test ends.
+func captureLog(t *testing.T) *syncBuffer {
+	t.Helper()
+	out := &syncBuffer{}
+	log.SetOutput(out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return out
+}
+
+// Statistics and the status page are not worth stopping the mining for: a
+// problem with either is logged and the program starts without it.
+func TestStatisticsAndStatusPageAreOptional(t *testing.T) {
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	for _, tc := range []struct {
+		name      string
+		overrides map[string]string
+		warning   string
+	}{
+		{"unusable stats_dir", map[string]string{"stats_dir": "file"}, "WARNING: cannot use stats_dir"},
+		{"status port taken", map[string]string{"status_listen": taken.Addr().String()}, "WARNING: cannot serve the status page"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLog(t)
+			node, polling := startupNode(t, "regtest")
+			path := settingsFile(t, node.URL, tc.overrides)
+			if err := os.WriteFile(filepath.Join(filepath.Dir(path), "file"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- run(ctx, path, false) }()
+			select {
+			case <-polling: // the node connection is up: mining has started
+				cancel()
+			case err := <-done:
+				t.Fatalf("stopped instead of mining: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("services did not start")
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("shutdown did not finish")
+			}
+			if out := logs.String(); !strings.Contains(out, tc.warning) || !strings.Contains(out, "Mining is not affected") {
+				t.Fatalf("no warning in the log:\n%s", out)
+			}
+		})
+	}
+
+	// -check does not mine, so there a folder that cannot be used is reported.
+	node, _ := startupNode(t, "regtest")
+	path := settingsFile(t, node.URL, map[string]string{"stats_dir": "file"})
+	if err := os.WriteFile(filepath.Join(filepath.Dir(path), "file"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), path, true); err == nil || !strings.Contains(err.Error(), "cannot use stats_dir") {
+		t.Fatalf("-check with an unusable stats_dir: %v", err)
+	}
+}
+
+// A block left over from the last run is resumed the moment the block store
+// opens. If the start then fails, for whatever reason, the program must not
+// quit before the node has answered.
+func TestFoundBlockIsDeliveredEvenWhenStartupFails(t *testing.T) {
+	var mu sync.Mutex
+	var submitted []string
+	node, _ := startupNodeSubmitting(t, "regtest", func(blockHex string) {
+		mu.Lock()
+		defer mu.Unlock()
+		submitted = append(submitted, blockHex)
+	})
+	blocksDir := t.TempDir()
+	name := "block-101-" + time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + strings.Repeat("ab", 32)
+	if err := os.WriteFile(filepath.Join(blocksDir, name+".hex"), []byte("00\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	path := settingsFile(t, node.URL, map[string]string{"blocks_dir": blocksDir, "stratum_listen": taken.Addr().String()})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := run(ctx, path, false); err == nil || !strings.Contains(err.Error(), "cannot listen for miners") {
+		t.Fatalf("run: %v, want a failure to listen", err)
+	}
+	// run has returned: the node must already have answered.
+	mu.Lock()
+	got := append([]string(nil), submitted...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "00" {
+		t.Fatalf("the node was given %q, want the one leftover block", got)
+	}
+	result, err := os.ReadFile(filepath.Join(blocksDir, name+".result"))
+	if err != nil || strings.TrimSpace(string(result)) != "accepted" {
+		t.Fatalf("result file %q, %v: run quit before the delivery finished", result, err)
+	}
+}
+
+func TestGuardedContainsAPanic(t *testing.T) {
+	logs := captureLog(t)
+	guarded("The thing", func() { panic("boom") })
+	if out := logs.String(); !strings.Contains(out, "The thing failed (boom)") || !strings.Contains(out, "Mining is not affected") {
+		t.Fatalf("log:\n%s", out)
+	}
+	ran := false
+	guarded("The other thing", func() { ran = true })
+	if !ran {
+		t.Fatal("f was not run")
+	}
+}
+
+func TestSaveStatistics(t *testing.T) {
+	t.Run("writes after the writer has finished", func(t *testing.T) {
+		writer := make(chan struct{})
+		flushed := make(chan struct{})
+		returned := make(chan struct{})
+		go func() {
+			saveStatistics(writer, func() { close(flushed) }, 5*time.Second)
+			close(returned)
+		}()
+		select {
+		case <-flushed:
+			t.Fatal("written before the writer's own last write")
+		case <-time.After(50 * time.Millisecond):
+		}
+		close(writer)
+		for _, ch := range []chan struct{}{flushed, returned} {
+			select {
+			case <-ch:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the last write did not happen")
+			}
+		}
+	})
+	t.Run("gives up on a stuck disk", func(t *testing.T) {
+		logs := captureLog(t)
+		writer := make(chan struct{})
+		close(writer)
+		stuck := make(chan struct{})
+		t.Cleanup(func() { close(stuck) })
+		returned := make(chan struct{})
+		go func() {
+			saveStatistics(writer, func() { <-stuck }, 100*time.Millisecond)
+			close(returned)
+		}()
+		select {
+		case <-returned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a stuck disk held up the end of the program")
+		}
+		if out := logs.String(); !strings.Contains(out, "could not be saved within") {
+			t.Fatalf("log:\n%s", out)
+		}
+	})
+	t.Run("survives a panic", func(t *testing.T) {
+		captureLog(t)
+		writer := make(chan struct{})
+		close(writer)
+		saveStatistics(writer, func() { panic("boom") }, 5*time.Second)
+	})
 }

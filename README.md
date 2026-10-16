@@ -138,15 +138,20 @@ All settings live in `solostratum.conf`, next to the program. Use
 | `node_cookie_file` | –                 | Alternative to the login for a local node. |
 | `payout_address`   | –                 | Where block rewards go. Any address type. |
 | `stratum_listen`   | `0.0.0.0:3333`    | Where miners connect. |
-| `status_listen`    | `0.0.0.0:3334`    | Status page. Empty turns it off; `127.0.0.1:3334` makes it local only. |
+| `status_listen`    | `0.0.0.0:3334`    | Status page. Empty turns it off; `127.0.0.1:3334` makes it local only. If the port cannot be opened, there is no page during that run. |
 | `coinbase_tag`     | `/solostratum/`   | Short text written into blocks you find. |
 | `start_difficulty` | `1024`            | Share difficulty for a new miner. Adjusts automatically. |
 | `min_difficulty`   | `0.001`           | Lowest share difficulty. |
 | `blocks_dir`       | `blocks`          | Folder for found blocks. |
-| `stats_dir`        | `stats`           | Folder for the mining history. Empty keeps no history and shows no charts. |
+| `stats_dir`        | `stats`           | Folder for the mining history. Empty keeps no history and shows no charts. If the folder cannot be used, no history is kept during that run. |
 
 A typo in a setting name is reported with its line number instead of being
 silently ignored.
+
+The status page and the history never come before mining. If either cannot
+start, solostratum logs a warning and mines without it; a failure in either
+while running is logged and does not touch the miners or the blocks. Only
+`-check`, which does not mine, reports an unusable `stats_dir` as an error.
 
 ### A different payout address per miner
 

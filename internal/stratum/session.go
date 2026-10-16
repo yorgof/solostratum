@@ -355,11 +355,14 @@ func (s *session) handleAuthorize(req *request, params []json.RawMessage) {
 		note = "paying to its own address " + payout
 	}
 	log.Printf("Miner connected: %s from %s [%s], %s", user, s.remote, client, note)
-	if s.srv.stats != nil {
-		s.srv.stats.Connected(user, time.Now())
-	}
 	if ready {
 		s.sendCurrentJob()
+	}
+	// Recorded after the first job is sent, so the statistics never delay it.
+	// The session handles one message at a time, so this still comes before
+	// any share the miner submits.
+	if s.srv.stats != nil {
+		s.srv.stats.Connected(user, time.Now())
 	}
 }
 
@@ -524,11 +527,12 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 		worker := s.worker
 		s.mu.Unlock()
 		s.srv.rejected.Add(1)
-		// A miner that has not logged in yet has no name to record it under.
+		s.reply(req.ID, nil, code, msg)
+		// Recorded after the answer: the statistics never delay a miner. A
+		// miner that has not logged in yet has no name to record it under.
 		if s.srv.stats != nil && worker != "" {
 			s.srv.stats.Rejected(worker, time.Now())
 		}
-		s.reply(req.ID, nil, code, msg)
 	}
 
 	s.mu.Lock()
@@ -660,15 +664,17 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	s.mu.Unlock()
 	s.srv.accepted.Add(1)
 	s.srv.noteBest(shareDiff)
-	if s.srv.stats != nil {
-		s.srv.stats.Accepted(worker, now, credit, shareDiff)
-	}
 	s.reply(req.ID, true, 0, "")
 
 	if changed {
 		s.mu.Lock()
 		s.announceDifficultyLocked()
 		s.mu.Unlock()
+	}
+	// Recorded last: the miner has its answer and any new difficulty before
+	// the statistics are touched, so they can never delay it.
+	if s.srv.stats != nil {
+		s.srv.stats.Accepted(worker, now, credit, shareDiff)
 	}
 }
 

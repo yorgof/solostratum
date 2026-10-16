@@ -1044,3 +1044,62 @@ func TestBestShareIsWrittenPromptly(t *testing.T) {
 	s.Accepted("rig", when, 1, 43)
 	waitFor(`"bestShare":43`)
 }
+
+// Miners keep recording while the totals are copied and written. Nothing may
+// be lost or counted twice, and the race detector must stay quiet.
+func TestFlushWhileMinersRecord(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:00:00Z")
+	const miners, shares = 4, 2000
+	var wg sync.WaitGroup
+	for m := range miners {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker := fmt.Sprintf("rig%d", m)
+			for i := range shares {
+				s.Accepted(worker, when.Add(time.Duration(i)*time.Millisecond), 2, float64(i+1))
+				s.Rejected(worker, when)
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+loop:
+	for {
+		select {
+		case <-done:
+			break loop
+		default:
+			s.flush(when.Add(time.Hour), false)
+		}
+	}
+	s.Flush(when.Add(time.Hour))
+
+	raw, err := os.ReadFile(filepath.Join(dir, totalsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var totals map[string]Totals
+	if err := json.Unmarshal(raw, &totals); err != nil {
+		t.Fatal(err)
+	}
+	var accepted, rejected uint64
+	var work float64
+	for _, tot := range totals {
+		accepted += tot.Accepted
+		rejected += tot.Rejected
+		work += tot.Work
+	}
+	if len(totals) != miners || accepted != miners*shares || rejected != miners*shares || work != 2*miners*shares {
+		t.Fatalf("totals: %d workers, %d accepted, %d rejected, work %v", len(totals), accepted, rejected, work)
+	}
+	var lines uint64
+	for _, sample := range history(t, dir, "2026-10") {
+		lines += sample.Accepted
+	}
+	if lines != miners*shares {
+		t.Fatalf("history holds %d accepted shares, want %d", lines, miners*shares)
+	}
+}

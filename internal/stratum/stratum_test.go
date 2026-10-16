@@ -11,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,13 +164,23 @@ type harness struct {
 
 func newHarness(t *testing.T, startDiff float64, job *work.Job) *harness {
 	t.Helper()
+	return newHarnessWithRecorder(t, startDiff, job, nil)
+}
+
+// newHarnessWithRecorder reports to rec instead of the harness's own fake
+// recorder when rec is not nil.
+func newHarnessWithRecorder(t *testing.T, startDiff float64, job *work.Job, rec Recorder) *harness {
+	t.Helper()
 	h := &harness{t: t, jobs: &fakeJobs{}, sink: &fakeSink{ch: make(chan foundBlock, 16)}, stats: &fakeRecorder{}}
 	h.jobs.add(job)
 	h.srv = NewServer(Options{
 		Network: regtest, DefaultAddress: defaultAddress, DefaultScript: defaultScript,
 		StartDifficulty: startDiff, MinDifficulty: startDiff / 100,
 	}, h.jobs, h.sink)
-	h.srv.SetRecorder(h.stats)
+	if rec == nil {
+		rec = h.stats
+	}
+	h.srv.SetRecorder(rec)
 	if err := h.srv.Listen("127.0.0.1:0"); err != nil {
 		t.Fatal(err)
 	}
@@ -1064,4 +1075,112 @@ func TestShutdownWaitsForBlockHandoffAndDisconnect(t *testing.T) {
 	if len(srv.Status().Miners) != 0 {
 		t.Fatal("a miner is still registered after shutdown")
 	}
+}
+
+// panicRecorder panics when it is told about the event named by panicOn.
+type panicRecorder struct {
+	panicOn string
+	calls   atomic.Int32
+}
+
+func (p *panicRecorder) event(name string) {
+	p.calls.Add(1)
+	if name == p.panicOn {
+		panic("statistics bug on " + name)
+	}
+}
+
+func (p *panicRecorder) Connected(string, time.Time)                  { p.event("connected") }
+func (p *panicRecorder) Disconnected(string, time.Time)               { p.event("disconnected") }
+func (p *panicRecorder) Accepted(string, time.Time, float64, float64) { p.event("accepted") }
+func (p *panicRecorder) Rejected(string, time.Time)                   { p.event("rejected") }
+
+// A bug in the statistics must never reach the miners: a panic would end
+// the whole program, and with it any block being delivered.
+func TestStatisticsPanicNeverReachesMiners(t *testing.T) {
+	for _, event := range []string{"connected", "accepted", "rejected", "disconnected"} {
+		t.Run(event, func(t *testing.T) {
+			rec := &panicRecorder{panicOn: event}
+			h := newHarnessWithRecorder(t, lowDifficulty, makeJob(t, "1", diff1Bits, 0x20000000, 3, true), rec)
+			m := h.dial(axesim.Options{})
+			job := firstJob(t, m)
+			share := mustMine(t, m, job, lowDifficulty)
+			if res := mustSubmit(t, m, share); !res.Accepted {
+				t.Fatalf("share rejected after a statistics failure: %+v", res)
+			}
+			if res := mustSubmit(t, m, share); res.Accepted || res.Code != errDuplicate {
+				t.Fatalf("duplicate share: %+v", res)
+			}
+			m.Close()
+			deadline := time.Now().Add(5 * time.Second)
+			for len(h.srv.Status().Miners) != 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("the miner was never unregistered")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			// The failure switched the recording off: nothing after the
+			// event that panicked reached the statistics.
+			guard := h.srv.stats.(*guardedRecorder)
+			if !guard.off.Load() {
+				t.Fatal("the recording was not switched off after the panic")
+			}
+			want := map[string]int32{"connected": 1, "accepted": 2, "rejected": 3, "disconnected": 4}[event]
+			if got := rec.calls.Load(); got != want {
+				t.Fatalf("%d calls reached the statistics, want %d (all up to the panic, none after)", got, want)
+			}
+		})
+	}
+}
+
+// gatedRecorder holds each event until the test lets it go.
+type gatedRecorder struct {
+	entered chan string
+	release chan struct{}
+}
+
+func (g *gatedRecorder) event(name string) {
+	g.entered <- name
+	<-g.release
+}
+
+func (g *gatedRecorder) Connected(string, time.Time)                  { g.event("connected") }
+func (g *gatedRecorder) Disconnected(string, time.Time)               { g.event("disconnected") }
+func (g *gatedRecorder) Accepted(string, time.Time, float64, float64) { g.event("accepted") }
+func (g *gatedRecorder) Rejected(string, time.Time)                   { g.event("rejected") }
+
+// A stalled statistics store may hold up the next message from that miner, but
+// never the answer to the message that was being handled, nor the first job.
+func TestStatisticsNeverDelayTheMinersAnswer(t *testing.T) {
+	rec := &gatedRecorder{entered: make(chan string, 16), release: make(chan struct{})}
+	h := newHarnessWithRecorder(t, lowDifficulty, makeJob(t, "1", diff1Bits, 0x20000000, 3, true), rec)
+	// Registered after the harness, so it runs first and frees the session.
+	t.Cleanup(func() { close(rec.release) })
+	expect := func(want string) {
+		t.Helper()
+		select {
+		case got := <-rec.entered:
+			if got != want {
+				t.Fatalf("statistics were told %q, want %q", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("statistics were never told %q", want)
+		}
+		rec.release <- struct{}{}
+	}
+
+	m := h.dial(axesim.Options{})
+	job := firstJob(t, m) // arrives while the statistics are still stalled on "connected"
+	expect("connected")
+
+	share := mustMine(t, m, job, lowDifficulty)
+	if res := mustSubmit(t, m, share); !res.Accepted { // answered while stalled on "accepted"
+		t.Fatalf("share: %+v", res)
+	}
+	expect("accepted")
+
+	if res := mustSubmit(t, m, share); res.Accepted || res.Code != errDuplicate { // answered while stalled on "rejected"
+		t.Fatalf("duplicate share: %+v", res)
+	}
+	expect("rejected")
 }

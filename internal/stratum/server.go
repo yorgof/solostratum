@@ -80,8 +80,15 @@ func NewServer(opts Options, jobs Jobs, blocks BlockSink) *Server {
 func (s *Server) SetJobs(jobs Jobs) { s.jobs = jobs }
 
 // SetRecorder makes the server report every connection and share to stats.
-// It must be called before Serve.
-func (s *Server) SetRecorder(stats Recorder) { s.stats = stats }
+// It must be called before Serve. A panic in stats is contained: it switches
+// the recording off and never reaches the miners.
+func (s *Server) SetRecorder(stats Recorder) {
+	if stats == nil {
+		s.stats = nil
+		return
+	}
+	s.stats = &guardedRecorder{rec: stats}
+}
 
 // Listen opens the listening socket.
 func (s *Server) Listen(addr string) error {

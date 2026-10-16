@@ -606,15 +606,27 @@ func (s *Store) flush(now time.Time, final bool) {
 			delete(s.pending, key)
 		}
 	}
-	var totals []byte
+	// Only a copy of the totals is taken under the lock. Encoding them takes
+	// milliseconds with many workers, and no miner should wait for that.
+	var snapshot map[string]Totals
 	if s.changed {
-		var err error
-		if totals, err = json.MarshalIndent(s.totals, "", "  "); err != nil {
-			log.Printf("WARNING: could not encode the worker totals: %v", err)
+		snapshot = make(map[string]Totals, len(s.totals))
+		for worker, t := range s.totals {
+			snapshot[worker] = *t
 		}
-		s.changed = totals == nil // retry an encoding failure too
+		s.changed = false
 	}
 	s.mu.Unlock()
+	var totals []byte
+	if snapshot != nil {
+		var err error
+		if totals, err = json.MarshalIndent(snapshot, "", "  "); err != nil {
+			log.Printf("WARNING: could not encode the worker totals: %v", err)
+			s.mu.Lock()
+			s.changed = true // try again at the next interval
+			s.mu.Unlock()
+		}
+	}
 
 	unwritten, err := s.appendHistory(samples)
 	if err != nil {
@@ -633,10 +645,11 @@ func (s *Store) flush(now time.Time, final bool) {
 			s.pending[key] = &retained
 		}
 	}
-	if dropped := s.trimPendingLocked(); dropped > 0 {
+	dropped := s.trimPendingLocked()
+	s.mu.Unlock()
+	if dropped > 0 {
 		log.Printf("WARNING: the mining history could not be written for so long that its oldest %d samples have been dropped. The lifetime totals are not affected.", dropped)
 	}
-	s.mu.Unlock()
 	if totals != nil {
 		if err := s.replaceFile(totalsFile, totals); err != nil {
 			log.Printf("WARNING: could not write the worker totals: %v", err)
