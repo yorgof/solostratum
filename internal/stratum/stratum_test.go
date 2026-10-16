@@ -83,9 +83,8 @@ type foundBlock struct {
 
 type fakeSink struct{ ch chan foundBlock }
 
-func (f *fakeSink) Found(height int64, hash string, block []byte, worker string) error {
+func (f *fakeSink) Found(height int64, hash string, block []byte, worker string) {
 	f.ch <- foundBlock{height, hash, block, worker}
-	return nil
 }
 
 // recorded is one call to the Recorder.
@@ -420,8 +419,7 @@ func TestBlockFound(t *testing.T) {
 }
 
 // A job that no longer pays shares can still deliver a block. An ordinary
-// share on that job is stale, and so is a block whose time is outside the
-// consensus window.
+// share on that job is stale.
 func TestStaleJobStillSubmitsABlock(t *testing.T) {
 	serverJob := makeJob(t, "a", regtestBits, 0x20000000, 1, true)
 	serverJob.Retire(time.Now())
@@ -472,36 +470,29 @@ func jobFromServer(t *testing.T, job *work.Job) *axesim.Job {
 	}
 }
 
-func TestBlockTimeWindowIsWiderThanTheShareWindow(t *testing.T) {
+// A header that meets the network target is handed to the node whatever its
+// time: only the node can judge the time against its own clock.
+func TestBlockIsSubmittedWhateverItsTime(t *testing.T) {
 	serverJob := makeJob(t, "a", regtestBits, 0x20000000, 0, true)
 	h := newHarness(t, 1024, serverJob)
 	m := h.dial(axesim.Options{User: "rig1"})
 	notified := firstJob(t, m)
 
-	rolled := *notified
-	rolled.NTime = serverJob.CurTime + maxNTimeRoll + 1
-	share := mustMine(t, m, &rolled, rolled.NetworkDifficulty())
-	if res := mustSubmit(t, m, share); !res.Accepted {
-		t.Fatalf("block with a rolled time was rejected: %+v", res)
-	}
-	select {
-	case <-h.sink.ch:
-	case <-time.After(5 * time.Second):
-		t.Fatal("rolled-time block was not submitted")
-	}
-
-	tooOld := *notified
-	tooOld.NTime = serverJob.MinTime - 1
-	oldShare := mustMine(t, m, &tooOld, tooOld.NetworkDifficulty())
-	if res := mustSubmit(t, m, oldShare); res.Accepted || res.Message != "Time out of range" {
-		t.Fatalf("block before mintime: %+v", res)
-	}
-
-	tooNew := *notified
-	tooNew.NTime = math.MaxUint32
-	future := mustMine(t, m, &tooNew, tooNew.NetworkDifficulty())
-	if res := mustSubmit(t, m, future); res.Accepted || res.Message != "Time out of range" {
-		t.Fatalf("block past the future limit: %+v", res)
+	for _, ntime := range []uint32{serverJob.CurTime + maxNTimeRoll + 1, serverJob.MinTime - 1, math.MaxUint32} {
+		job := *notified
+		job.NTime = ntime
+		share := mustMine(t, m, &job, job.NetworkDifficulty())
+		if res := mustSubmit(t, m, share); !res.Accepted {
+			t.Fatalf("block with time %d was rejected: %+v", ntime, res)
+		}
+		select {
+		case found := <-h.sink.ch:
+			if found.hash != axesim.DisplayHash(share.Hash) {
+				t.Errorf("hash %s, miner computed %s", found.hash, axesim.DisplayHash(share.Hash))
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("block with time %d was not submitted", ntime)
+		}
 	}
 }
 
@@ -1008,10 +999,9 @@ func TestRateMeter(t *testing.T) {
 
 type blockingSink struct{ entered, release chan struct{} }
 
-func (s *blockingSink) Found(int64, string, []byte, string) error {
+func (s *blockingSink) Found(int64, string, []byte, string) {
 	close(s.entered)
 	<-s.release
-	return nil
 }
 
 func TestShutdownWaitsForBlockHandoffAndDisconnect(t *testing.T) {
@@ -1047,29 +1037,13 @@ func TestShutdownWaitsForBlockHandoffAndDisconnect(t *testing.T) {
 	}
 	t.Cleanup(m.Close)
 	share := mustMine(t, m, firstJob(t, m), job.NetDiff)
-	// The share is not acknowledged until the block has been recorded.
-	errCh := make(chan error, 1)
-	go func() {
-		res, err := m.Submit(share)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		if !res.Accepted {
-			errCh <- fmt.Errorf("share rejected: %+v", res)
-			return
-		}
-		errCh <- nil
-	}()
+	// The block is handed off before the miner gets its answer, so the
+	// answer only comes once the handoff below is released.
+	go m.Submit(share)
 	select {
 	case <-sink.entered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("block handoff did not start")
-	}
-	select {
-	case err := <-errCh:
-		t.Fatalf("share was answered before the block was recorded: %v", err)
-	case <-time.After(50 * time.Millisecond):
 	}
 	cancel()
 	select {

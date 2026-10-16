@@ -214,8 +214,8 @@ func TestRejectedAndDuplicate(t *testing.T) {
 		t.Errorf("status %q", recs[0].Status)
 	}
 
-	// A decode failure will not change on retry.
-	node = &fakeNode{rpcErr: &rpc.Error{Code: rpc.CodeDeserialization, Message: "Block decode failed"}}
+	// An error from the node itself (not the network) is final.
+	node = &fakeNode{rpcErr: &rpc.Error{Code: -22, Message: "Block decode failed"}}
 	s, _, _ = open(t, node)
 	s.Found(100, "aa", []byte{1}, "")
 	s.Wait()
@@ -224,38 +224,56 @@ func TestRejectedAndDuplicate(t *testing.T) {
 	}
 }
 
-func TestInconclusiveAndDiskErrorsAreRetried(t *testing.T) {
+// "inconclusive" means the node stored the block without making it the tip.
+// A second submission would answer "duplicate", which must not turn a lost
+// race into an accepted block.
+func TestInconclusiveIsFinal(t *testing.T) {
+	node := &fakeNode{answers: []submitAnswer{{reason: "inconclusive"}, {reason: "duplicate"}}}
+	s, _, accepted := open(t, node)
+	s.Found(100, "aa", []byte{1}, "rig")
+	s.Wait()
+	if node.calls != 1 || accepted.Load() != 0 || s.Records()[0].Status != "rejected: inconclusive" {
+		t.Fatalf("calls %d, accepted %d, status %q", node.calls, accepted.Load(), s.Records()[0].Status)
+	}
+}
+
+func TestNodeErrors(t *testing.T) {
 	cases := []struct {
-		name    string
-		answers []submitAnswer
+		name   string
+		err    error
+		calls  int
+		status string
 	}{
-		{"inconclusive", []submitAnswer{{reason: "inconclusive"}, {reason: "duplicate"}}},
-		{"duplicate-inconclusive", []submitAnswer{{reason: "duplicate-inconclusive"}, {reason: ""}}},
-		{"disk full", []submitAnswer{{err: &rpc.Error{Code: -25, Message: "Disk space is too low!"}}, {reason: ""}}},
+		// A malformed block or request will not change on retry.
+		{"decode", &rpc.Error{Code: rpc.CodeDeserialization, Message: "Block does not start with a coinbase"}, 1, "rejected: Block does not start with a coinbase"},
+		{"parameter", &rpc.Error{Code: rpc.CodeInvalidParameter, Message: "bad parameter"}, 1, "rejected: bad parameter"},
+		{"method", &rpc.Error{Code: rpc.CodeMethodNotFound, Message: "Method not found"}, 1, "rejected: Method not found"},
+		// Anything else may be passing, and giving up would lose the block.
+		{"warmup", &rpc.Error{Code: rpc.CodeInWarmup, Message: "Loading block index..."}, 2, "accepted"},
+		{"unexpected", &rpc.Error{Code: -1, Message: "Unexpected error"}, 2, "accepted"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			node := &fakeNode{answers: c.answers}
-			s, _, accepted := open(t, node)
-			if err := s.Found(100, "aa", []byte{1}, "rig"); err != nil {
-				t.Fatal(err)
-			}
+			node := &fakeNode{answers: []submitAnswer{{err: c.err}, {reason: ""}}}
+			s, _, _ := open(t, node)
+			s.Found(100, "aa", []byte{1}, "rig")
 			s.Wait()
-			if node.calls != 2 || accepted.Load() != 1 || s.Records()[0].Status != "accepted" {
-				t.Fatalf("calls %d, accepted %d, status %q", node.calls, accepted.Load(), s.Records()[0].Status)
+			if node.calls != c.calls || s.Records()[0].Status != c.status {
+				t.Fatalf("calls %d, status %q", node.calls, s.Records()[0].Status)
 			}
 		})
 	}
 }
 
-func TestUncertainResultsAreResumed(t *testing.T) {
+// Only a block whose delivery was interrupted is submitted again at start.
+// A recorded answer, or giving up after the retry window, is final.
+func TestOnlyInterruptedBlocksAreResumed(t *testing.T) {
 	dir := t.TempDir()
 	recent := time.Now().UTC().Add(-time.Minute)
-	old := time.Now().UTC().Add(-48 * time.Hour)
-	write := func(when time.Time, height int, hash, status, body string) {
+	write := func(height int, hash, status string) {
 		t.Helper()
-		base := fmt.Sprintf("block-%d-%s-%s", height, when.Format(timeLayout), hash)
-		if err := os.WriteFile(filepath.Join(dir, base+".hex"), []byte(body+"\n"), 0o644); err != nil {
+		base := fmt.Sprintf("block-%d-%s-%s", height, recent.Format(timeLayout), hash)
+		if err := os.WriteFile(filepath.Join(dir, base+".hex"), []byte(hash+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if status != "" {
@@ -264,10 +282,9 @@ func TestUncertainResultsAreResumed(t *testing.T) {
 			}
 		}
 	}
-	write(recent, 100, "aa", "rejected: inconclusive", "aa")
-	write(recent, 101, "bb", "not submitted: connection refused", "bb")
-	write(recent, 102, "cc", "rejected: high-hash", "cc")
-	write(old, 103, "dd", "rejected: inconclusive", "dd")
+	write(100, "aa", "")
+	write(101, "bb", "rejected: inconclusive")
+	write(102, "cc", "not submitted: connection refused")
 
 	node := &fakeNode{}
 	s, err := Open(dir, node, nil)
@@ -275,15 +292,12 @@ func TestUncertainResultsAreResumed(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Wait()
-	if node.calls != 2 {
-		t.Fatalf("node contacted %d times, want the two recent uncertain blocks", node.calls)
-	}
 	got := map[string]string{}
 	for _, r := range s.Records() {
 		got[r.Hash] = r.Status
 	}
-	if got["aa"] != "accepted" || got["bb"] != "accepted" || got["cc"] != "rejected: high-hash" || got["dd"] != "rejected: inconclusive" {
-		t.Fatalf("statuses: %v", got)
+	if node.calls != 1 || got["aa"] != "accepted" || got["bb"] != "rejected: inconclusive" || got["cc"] != "not submitted: connection refused" {
+		t.Fatalf("calls %d, statuses %v", node.calls, got)
 	}
 }
 
@@ -371,9 +385,7 @@ func TestBlockIsDeliveredWhenSavingFails(t *testing.T) {
 	if err := os.WriteFile(dir, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Found(100, "aa", []byte{1, 2}, "rig"); err == nil {
-		t.Fatal("a failed save was reported as durable")
-	}
+	s.Found(100, "aa", []byte{1, 2}, "rig")
 	s.Wait()
 	records := s.Records()
 	if node.calls != 1 || accepted.Load() != 1 || len(records) != 1 || records[0].Status != "accepted" || records[0].File != "" {

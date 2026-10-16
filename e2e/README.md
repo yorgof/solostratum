@@ -42,7 +42,7 @@ Each scenario runs once per Bitcoin Core version.
 | `UsernameOverride` | A miner's username can redirect its reward; invalid, mistyped or wrong-network addresses fall back to the default. A miner that leaves is listed as offline. |
 | `ManyTransactions` | A block with 300 transactions (deep merkle tree, multi-byte transaction count) is accepted. |
 | `ConsecutiveBlocksAndFiles` | Several blocks in a row are accepted, each saved to its own file whose content is byte-for-byte the block Core stored. The mining history feeds the charts and is on disk after shutdown. |
-| `NewBlockFromNetwork` | When someone else finds a block, miners get new work within seconds and ordinary work on the old tip is refused. |
+| `NewBlockFromNetwork` | When someone else finds a block, miners get new work within seconds and ordinary work on the old tip is refused. A block solved on the old tip is still submitted and recorded as not accepted. |
 | `FirmwareCode` | A header assembled by the Bitaxe firmware's own C code yields an accepted block. |
 | `Cpuminer` | An unrelated, long-established Stratum miner produces accepted blocks. |
 | `NodeOutage` | A block found while the node is down is kept and delivered when it returns; during a long outage miners are disconnected and can reconnect afterwards. |

@@ -60,6 +60,14 @@ const (
 	CodeInWarmup        = -28 // node is still starting
 	CodeInIBD           = -10 // node is still downloading the chain
 	CodeDeserialization = -22 // the block or the request could not be decoded
+
+	// The request itself is malformed, so sending it again cannot help.
+	CodeTypeError        = -3
+	CodeInvalidParameter = -8
+	CodeParseError       = -32700
+	CodeInvalidRequest   = -32600
+	CodeMethodNotFound   = -32601
+	CodeInvalidParams    = -32602
 )
 
 // HTTPError is a failure at the HTTP level, such as a rejected login.

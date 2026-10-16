@@ -30,10 +30,10 @@ const (
 	// tip, and slow miners rely on that; 240 jobs cover two hours without
 	// a new block.
 	keepJobs = 240
-	// MaxFutureBlockTime is how far ahead of the node Bitcoin still accepts
-	// a block timestamp. A job that no longer pays ordinary shares is kept
-	// for this long so a header the miner already solved can still be rebuilt.
-	MaxFutureBlockTime = 2 * time.Hour
+	// retiredJobGrace is how long a job that no longer pays ordinary shares
+	// is kept, so a block solved on it that is still on its way from the
+	// miner can be rebuilt. Miners switch to new work within seconds.
+	retiredJobGrace = time.Minute
 )
 
 // Node is the part of the RPC client the manager needs.
@@ -93,20 +93,23 @@ func (m *Manager) Current() *Job {
 	return m.current
 }
 
-// Get returns a job by id. Jobs that no longer pay shares are still returned
-// until they are past the block-retention window, so a solved block can be
-// rebuilt after the tip has moved on.
+// Get returns a job by id. A job that no longer pays shares is still
+// returned for retiredJobGrace, so a solved block can be rebuilt after the
+// tip has moved on.
 func (m *Manager) Get(id string) *Job {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pruneLocked(time.Now())
-	return m.jobs[id]
+	m.mu.RLock()
+	job := m.jobs[id]
+	m.mu.RUnlock()
+	if job == nil || job.expired(time.Now()) {
+		return nil
+	}
+	return job
 }
 
-// pruneLocked drops retired jobs that can no longer produce a valid block.
+// pruneLocked drops retired jobs past retiredJobGrace.
 func (m *Manager) pruneLocked(now time.Time) {
 	for id, job := range m.jobs {
-		if job.blockRebuildExpired(now) {
+		if job.expired(now) {
 			delete(m.jobs, id)
 		}
 	}
@@ -237,8 +240,9 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 	now := time.Now()
 	m.mu.Lock()
 	if newTip {
-		// Ordinary shares for the old tip are stale. A solved block is not:
-		// those jobs stay until pruneLocked drops them.
+		// Ordinary shares for the old tip are stale. A block solved on it
+		// may still be on its way: those jobs stay until pruneLocked drops
+		// them.
 		for _, id := range m.order {
 			if old := m.jobs[id]; old != nil {
 				old.Retire(now)

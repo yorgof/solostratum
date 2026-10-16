@@ -426,9 +426,25 @@ func TestRetiredJobsExpire(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := m.Current()
-	job.Retire(time.Now().Add(-MaxFutureBlockTime - time.Second))
+	job.Retire(time.Now().Add(-retiredJobGrace + time.Second))
+	if m.Get(job.ID) == nil {
+		t.Fatal("a job retired moments ago is no longer returned")
+	}
+	job.retiredAt.Store(time.Now().Add(-retiredJobGrace - time.Second).UnixNano())
 	if m.Get(job.ID) != nil {
-		t.Fatal("a retired job past the block window is still returned")
+		t.Fatal("a retired job past the grace period is still returned")
+	}
+
+	// The next job frees it.
+	node.templates = []*rpc.BlockTemplate{template(2, 101, 1040, 0)}
+	if err := m.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.RLock()
+	_, kept := m.jobs[job.ID]
+	m.mu.RUnlock()
+	if kept {
+		t.Fatal("an expired job is still held")
 	}
 }
 
