@@ -181,7 +181,7 @@ the internet. The same data is available as JSON at `/api/status`.
   A worker can appear more than once. The list is all-time: the buttons
   above the chart do not change it. It starts with the first ten shares and
   changes often at first, then less and less as only harder shares can enter
-  it. Shares that drop out of the ten stay on disk.
+  it. A share that drops out of the ten is forgotten.
 
 A miner named `bc1q....workername` is listed as `workername`; hover over
 the name to see all of it. On a narrow screen the tables turn into one
@@ -213,18 +213,21 @@ and `online` the seconds it was connected. Lines add up: after a restart
 the same worker and time can appear twice. A worker is recorded under its
 full Stratum username.
 
-- `best-shares.jsonl` has one line for every share that made the list of the
-  ten highest shares, from any worker:
+- `best-shares.json` holds the ten highest shares, from any worker, as shown
+  on the status page, one share to a line:
 
   ```json
-  {"t":"2026-10-03T12:04:10Z","worker":"bitaxe1","bestShare":182934.2}
+  [
+    {"t":"2026-10-03T12:04:10Z","worker":"bitaxe1","bestShare":182934.2},
+    {"t":"2026-10-02T21:40:55Z","worker":"bitaxe2","bestShare":96120.7}
+  ]
   ```
 
   `t` is when that share was accepted, in UTC, and `bestShare` its
-  difficulty. The status page shows the ten highest. Older lines stay in the
-  file. Shares accepted before this file existed are not in it: the list
-  begins with the first shares after the update. The line is written when
-  the share is accepted, and again on shutdown if a write was still waiting.
+  difficulty. The file is replaced whole when the list changes, at most once a
+  minute, and when solostratum stops, so a share that falls out of the ten is
+  gone from it. Shares accepted before this file existed are not in it: the
+  list begins with the first shares after the update.
 
 The monthly history and the worker totals are written every five minutes and
 when solostratum stops, so a power cut loses at most the last five minutes

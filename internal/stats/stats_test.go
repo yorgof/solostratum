@@ -806,22 +806,29 @@ func TestFailedTailRepairDoesNotAppend(t *testing.T) {
 	checkHistory(t, history(t, dir, "2026-10"), []Sample{sample})
 }
 
-func bestLines(t *testing.T, dir string) []BestShare {
+func savedBest(t *testing.T, dir string) []BestShare {
 	t.Helper()
-	f, err := os.Open(filepath.Join(dir, bestFile))
+	raw, err := os.ReadFile(filepath.Join(dir, bestFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
 	var out []BestShare
-	for sc := bufio.NewScanner(f); sc.Scan(); {
-		var rec BestShare
-		if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
-			t.Fatalf("best-share line %q: %v", sc.Text(), err)
-		}
-		out = append(out, rec)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("best-share file %q: %v", raw, err)
 	}
 	return out
+}
+
+func sameList(a, b []BestShare) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !sameShare(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func TestBestSharesAreTheHighestSharesOfAnyWorker(t *testing.T) {
@@ -862,41 +869,24 @@ func TestBestSharesAreTheHighestSharesOfAnyWorker(t *testing.T) {
 	}
 	s.Flush(when.Add(time.Hour))
 
+	// The file holds exactly the list. The shares that fell out of it are gone.
 	raw, err := os.ReadFile(filepath.Join(dir, bestFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, _, _ := strings.Cut(string(raw), "\n")
-	if want := `{"t":"2026-10-03T12:00:00Z","worker":"rig","bestShare":100}`; first != want {
-		t.Errorf("first line:\n  %s\nwant:\n  %s", first, want)
+	if want := "[\n  " + `{"t":"2026-10-03T12:02:00Z","worker":"other","bestShare":500},` + "\n  "; !strings.HasPrefix(string(raw), want) {
+		t.Errorf("file starts:\n%s\nwant it to start:\n%s", raw, want)
 	}
-	lines := bestLines(t, dir)
-	// Twelve shares entered one after the other, then the share of 500.
-	if len(lines) != 13 {
-		t.Fatalf("file has %d lines, want 13: %+v", len(lines), lines)
+	if saved := savedBest(t, dir); !sameList(saved, got) {
+		t.Fatalf("file %+v, want %+v", saved, got)
 	}
-	var kept bool
-	for _, line := range lines {
-		if line.Worker == "rig" && line.Difficulty == 100 {
-			kept = true
-		}
-		if line.Worker == "other" && line.Difficulty != 500 {
-			t.Errorf("a share that did not make the list was stored: %+v", line)
-		}
-	}
-	if !kept {
-		t.Fatal("the share that fell out of the ten is not in the file")
+	if strings.Contains(string(raw), `"bestShare":100}`) || strings.Contains(string(raw), `"bestShare":101}`) {
+		t.Errorf("a share that fell out of the ten is still in the file:\n%s", raw)
 	}
 
 	again := open(t, dir)
-	reloaded := again.BestShares()
-	if len(reloaded) != len(got) {
+	if reloaded := again.BestShares(); !sameList(reloaded, got) {
 		t.Fatalf("reloaded %+v, want %+v", reloaded, got)
-	}
-	for i := range got {
-		if !sameShare(reloaded[i], got[i]) {
-			t.Fatalf("reloaded[%d] = %+v, want %+v", i, reloaded[i], got[i])
-		}
 	}
 	// The list does not change what is kept per worker.
 	if again.totals["other"].BestShare != 500 || again.totals["rig"].BestShare != 111 {
@@ -904,15 +894,17 @@ func TestBestSharesAreTheHighestSharesOfAnyWorker(t *testing.T) {
 	}
 }
 
-func TestBestSharesIgnoreImpossibleSharesAndRepeatedLines(t *testing.T) {
+func TestBestSharesIgnoreImpossibleSharesAndRepeatedEntries(t *testing.T) {
 	dir := t.TempDir()
 	when := at(t, "2026-10-03T12:00:00Z")
-	line, err := json.Marshal(BestShare{when, "rig", 7})
+	entry, err := json.Marshal(BestShare{when, "rig", 7})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The same line twice, and one without a time.
-	file := string(line) + "\n" + string(line) + "\n" + `{"worker":"rig","bestShare":9}` + "\n"
+	// The same share twice, one without a time, one without a worker, one
+	// without a usable difficulty.
+	file := "[" + string(entry) + "," + string(entry) +
+		`,{"worker":"rig","bestShare":9},{"t":"2026-10-03T12:00:00Z","bestShare":9},{"t":"2026-10-03T12:00:00Z","worker":"rig","bestShare":-3}]`
 	if err := os.WriteFile(filepath.Join(dir, bestFile), []byte(file), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -923,134 +915,107 @@ func TestBestSharesIgnoreImpossibleSharesAndRepeatedLines(t *testing.T) {
 	for _, diff := range []float64{math.Inf(1), math.NaN(), 0, -1} {
 		s.Accepted("rig", when.Add(time.Second), 1, diff)
 	}
-	if got := s.BestShares(); len(got) != 1 || len(s.bestPend) != 0 {
-		t.Fatalf("an impossible share was listed: %+v, pending %+v", got, s.bestPend)
+	if got := s.BestShares(); len(got) != 1 || s.bestDirty {
+		t.Fatalf("an impossible share was listed: %+v (changed: %v)", got, s.bestDirty)
 	}
 }
 
-func TestBestShareFileSkipsDamageAndRepairsATornTail(t *testing.T) {
-	dir := t.TempDir()
+func TestBestShareFileThatCannotBeReadIsSetAside(t *testing.T) {
 	when := at(t, "2026-10-03T12:00:00Z")
-	good := BestShare{when, "rig", 5}
-	line, err := json.Marshal(good)
-	if err != nil {
-		t.Fatal(err)
+	for name, setup := range map[string]func(path string) error{
+		"not json": func(path string) error { return os.WriteFile(path, []byte("{\"t\":\"2026"), 0o644) },
+		"a folder": func(path string) error { return os.Mkdir(path, 0o755) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := setup(filepath.Join(dir, bestFile)); err != nil {
+				t.Fatal(err)
+			}
+			// Statistics are never a reason not to start.
+			s, err := Open(dir)
+			if err != nil {
+				t.Fatalf("Open failed over the best-share file: %v", err)
+			}
+			if len(s.BestShares()) != 0 {
+				t.Fatal("an unreadable best-share file was loaded")
+			}
+			var damaged bool
+			for _, f := range files(t, dir) {
+				damaged = damaged || strings.HasPrefix(f, bestFile+".damaged-")
+			}
+			if !damaged {
+				t.Fatalf("files %v, want the unreadable file renamed", files(t, dir))
+			}
+			s.Accepted("rig", when, 1, 5)
+			s.Flush(when)
+			if saved := savedBest(t, dir); len(saved) != 1 || saved[0].Difficulty != 5 {
+				t.Fatalf("recording after recovery: %+v", saved)
+			}
+		})
 	}
-	torn := append(append(line, '\n'), []byte(`{"t":"2026-10-03T12:00:01Z","worker":"nope"`)...)
-	torn = append(torn, "\nnot json\n"...)
-	if err := os.WriteFile(filepath.Join(dir, bestFile), torn, 0o644); err != nil {
-		t.Fatal(err)
-	}
+}
+
+func TestBestShareWriteFailureDoesNotStopTheRestAndIsRetried(t *testing.T) {
+	dir := t.TempDir()
 	s := open(t, dir)
-	if got := s.BestShares(); len(got) != 1 || got[0] != good {
-		t.Fatalf("loaded %+v, want %+v", got, good)
-	}
-	// The unfinished tail has no newline; the next append cuts it off.
+	when := at(t, "2026-10-03T12:00:00Z")
+	// A folder where the file belongs makes every attempt to replace it fail.
 	path := filepath.Join(dir, bestFile)
-	if err := os.WriteFile(path, append(append(line[:len(line):len(line)], '\n'), line[:len(line)/2]...), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	s = open(t, dir)
-	s.Accepted("other", when.Add(time.Minute), 1, 9)
-	s.Flush(when)
-	got := bestLines(t, dir)
-	next := BestShare{when.Add(time.Minute), "other", 9}
-	if len(got) != 2 || got[0] != good || got[1] != next {
-		t.Fatalf("repaired file: %+v", got)
-	}
-}
-
-func TestBestSharesRetryWithoutDuplicating(t *testing.T) {
-	dir := t.TempDir()
-	s := open(t, dir)
-	when := at(t, "2026-10-03T12:00:00Z")
-	if err := os.Mkdir(filepath.Join(dir, bestFile), 0o700); err != nil {
+	if err := os.Mkdir(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	s.Accepted("rig", when, 1, 5)
 	s.Flush(when)
-	if len(s.bestPend) != 1 || s.bestPend[0].Difficulty != 5 {
-		t.Fatalf("pending after a failed write: %+v", s.bestPend)
+	// The list is kept in memory, and the totals and the history were written
+	// all the same.
+	if got := s.BestShares(); len(got) != 1 || got[0].Difficulty != 5 {
+		t.Fatalf("list after a failed write: %+v", got)
 	}
-	if err := os.Remove(filepath.Join(dir, bestFile)); err != nil {
+	if !s.bestDirty {
+		t.Fatal("a failed write was not marked for another try")
+	}
+	checkHistory(t, history(t, dir, "2026-10"), []Sample{{Time: when, Worker: "rig", Counts: Counts{Accepted: 1, Work: 1, BestShare: 5}}})
+	if _, err := os.Stat(filepath.Join(dir, totalsFile)); err != nil {
+		t.Fatalf("the totals were not written: %v", err)
+	}
+	for _, f := range files(t, dir) {
+		if strings.HasSuffix(f, ".tmp") {
+			t.Fatalf("a failed write left %s behind", f)
+		}
+	}
+	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
 	s.Flush(when)
 	s.Flush(when)
-	if lines := bestLines(t, dir); len(lines) != 1 || lines[0].Difficulty != 5 || lines[0].Worker != "rig" {
-		t.Fatalf("file after retry: %+v", lines)
+	if saved := savedBest(t, dir); len(saved) != 1 || saved[0].Difficulty != 5 || saved[0].Worker != "rig" {
+		t.Fatalf("file after the retry: %+v", saved)
 	}
 }
 
-func TestUnwrittenBestSharesAreBounded(t *testing.T) {
-	dir := t.TempDir()
-	s := open(t, dir)
-	if err := os.Mkdir(filepath.Join(dir, bestFile), 0o700); err != nil {
-		t.Fatal(err)
+func TestBestSharesAreNotWrittenMoreOftenThanTheGap(t *testing.T) {
+	s := open(t, t.TempDir())
+	now := at(t, "2026-10-03T12:00:00Z")
+	if d := s.bestWriteDelay(now); d != 0 {
+		t.Fatalf("delay before the first write: %v", d)
 	}
-	when := at(t, "2026-10-03T12:00:00Z")
-	// Every share is harder than the one before, so every one makes the list.
-	n := maxBestPending + 10
-	for i := 1; i <= n; i++ {
-		s.Accepted("rig", when.Add(time.Duration(i)*time.Second), 1, float64(i))
-	}
-	if len(s.bestPend) != maxBestPending {
-		t.Fatalf("pending %d, want %d", len(s.bestPend), maxBestPending)
-	}
-	got := s.BestShares()
-	if len(got) != bestShown || got[0].Difficulty != float64(n) {
-		t.Fatalf("list: %+v", got)
-	}
-	// What was dropped is the oldest; the shares on the list are all kept.
-	for _, b := range got {
-		var queued bool
-		for _, rec := range s.bestPend {
-			queued = queued || sameShare(rec, b)
+	s.bestSaved = now
+	for _, c := range []struct{ after, want time.Duration }{
+		{0, time.Minute},
+		{10 * time.Second, 50 * time.Second},
+		{time.Minute, 0},
+		{time.Hour, 0},
+	} {
+		if d := s.bestWriteDelay(now.Add(c.after)); d != c.want {
+			t.Errorf("delay %v after a write: %v, want %v", c.after, d, c.want)
 		}
-		if !queued {
-			t.Fatalf("pending dropped a share that is on the list: %+v", b)
-		}
-	}
-	if first := s.bestPend[0]; first.Difficulty != 11 {
-		t.Fatalf("pending starts at %+v, want the share of 11", first)
-	}
-}
-
-func TestUnreadableBestShareFileIsSetAside(t *testing.T) {
-	dir := t.TempDir()
-	// A line the scanner cannot return. The file is kept, under a new name,
-	// and mining still starts.
-	huge := strings.Repeat("x", 70*1024) + "\n"
-	if err := os.WriteFile(filepath.Join(dir, bestFile), []byte(huge), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	s := open(t, dir)
-	if len(s.BestShares()) != 0 {
-		t.Fatal("an unreadable best-share file was loaded")
-	}
-	var damaged string
-	for _, name := range files(t, dir) {
-		if strings.HasPrefix(name, bestFile+".damaged-") {
-			damaged = name
-		}
-	}
-	if damaged == "" {
-		t.Fatalf("files %v, want the unreadable file renamed", files(t, dir))
-	}
-	if kept, err := os.ReadFile(filepath.Join(dir, damaged)); err != nil || string(kept) != huge {
-		t.Fatalf("damaged file was changed: %v", err)
-	}
-	when := at(t, "2026-10-03T12:00:00Z")
-	s.Accepted("rig", when, 1, 5)
-	s.Flush(when)
-	if lines := bestLines(t, dir); len(lines) != 1 || lines[0].Difficulty != 5 {
-		t.Fatalf("recording after recovery: %+v", lines)
 	}
 }
 
 func TestBestShareIsWrittenPromptly(t *testing.T) {
 	dir := t.TempDir()
 	s := open(t, dir)
+	s.bestGap = 200 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { s.Run(ctx); close(done) }()
@@ -1058,17 +1023,24 @@ func TestBestShareIsWrittenPromptly(t *testing.T) {
 		cancel()
 		<-done
 	})
+	waitFor := func(want string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			raw, err := os.ReadFile(filepath.Join(dir, bestFile))
+			if err == nil && strings.Contains(string(raw), want) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s was not written in time: %q, %v", want, raw, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 	when := time.Now().UTC().Truncate(time.Second)
 	s.Accepted("rig", when, 1, 42)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		raw, err := os.ReadFile(filepath.Join(dir, bestFile))
-		if err == nil && strings.Contains(string(raw), `"bestShare":42`) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("best share was not written promptly: %q, %v", raw, err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitFor(`"bestShare":42`)
+	// A change soon after the first is written too, after the gap.
+	s.Accepted("rig", when, 1, 43)
+	waitFor(`"bestShare":43`)
 }

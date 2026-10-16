@@ -379,8 +379,7 @@ function render(r) {
   $("no-blocks").style.display = blocks.length ? "none" : "";
 
   // The ten highest shares ever accepted, from any worker, highest first. A
-  // worker can appear more than once. The range buttons do not apply: a share
-  // that falls out of the ten stays on disk only.
+  // worker can appear more than once. The range buttons do not apply.
   const best = r.bestShares || [];
   const bestBody = $("best-shares").tBodies[0];
   bestBody.replaceChildren();

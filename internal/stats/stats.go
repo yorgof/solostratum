@@ -8,11 +8,9 @@
 //     interval in which that worker was connected. Lines are only ever
 //     appended. The one exception is an unfinished last line, as a power
 //     cut can leave behind: it is removed before the next line is added.
-//   - best-shares.jsonl has one line for every share that made the list of
-//     the ten highest shares this program has accepted, from any worker.
-//     Lines are only appended, so a share that later falls out of the ten
-//     stays in the file. An unfinished last line is removed before the
-//     next line is added, as with the history.
+//   - best-shares.json has the ten highest shares this program has
+//     accepted, from any worker. It is replaced as a whole when the list
+//     changes, so a share that falls out of the ten is gone.
 //
 // A history line counts what happened in the interval that starts at "t".
 // Lines add up: after a restart the same worker and interval can appear
@@ -59,17 +57,17 @@ const (
 	maxPending = 5 * maxWorkers
 	// bestShown is how many shares the best-share list holds.
 	bestShown = 10
-	// maxBestPending limits best-share lines held in memory while the disk
-	// refuses them. Lines of shares still on the list are kept ahead of the
-	// others. Only a handful of shares make the list in a day, so this is
-	// never reached unless something is wrong.
-	maxBestPending = 1000
+	// bestWriteGap is the shortest time between two writes of the best-share
+	// file. The file only has to survive a restart, so a burst of changes,
+	// as when the list fills up, is written once. The first change after a
+	// quiet time is still written at once.
+	bestWriteGap = time.Minute
 	// recent is how far back a Series looks for workers. It is the longest
 	// period worth charting, so a worker keeps its place in every chart.
 	recent = 30 * 24 * time.Hour
 
 	totalsFile = "workers.json"
-	bestFile   = "best-shares.jsonl"
+	bestFile   = "best-shares.json"
 )
 
 // Counts are the numbers kept per worker, for its lifetime and for each
@@ -113,8 +111,8 @@ type Sample struct {
 	Counts
 }
 
-// BestShare is one line of the best-share file: a share that made the list
-// of the highest shares, and when it was accepted.
+// BestShare is one share on the list of the highest shares, and one entry of
+// the best-share file: the worker that found it and when it was accepted.
 type BestShare struct {
 	Time       time.Time `json:"t"`
 	Worker     string    `json:"worker"`
@@ -182,10 +180,11 @@ type Store struct {
 	live    map[string]*presence
 	full    bool // the maxWorkers warning has been logged
 
-	best           []BestShare   // the highest shares accepted, highest first
-	bestPend       []BestShare   // shares that made the list, not yet written
-	bestWake       chan struct{} // a share is waiting to be written
-	bestDropLogged bool          // the pending-cap warning has been logged
+	best      []BestShare   // the highest shares accepted, highest first
+	bestDirty bool          // the list differs from the file on disk
+	bestSaved time.Time     // when the file was last written
+	bestGap   time.Duration // bestWriteGap; tests shorten it
+	bestWake  chan struct{} // the list has changed and wants writing
 }
 
 // Open prepares the statistics folder, verifies it is writable and loads
@@ -204,12 +203,13 @@ func Open(dir string) (*Store, error) {
 	s := &Store{
 		dir: dir, cache: map[seriesKey]cachedSeries{},
 		totals: map[string]*Totals{}, pending: map[sampleKey]*Sample{}, live: map[string]*presence{},
-		bestWake: make(chan struct{}, 1),
+		bestGap: bestWriteGap, bestWake: make(chan struct{}, 1),
 	}
+	s.loadBestShares()
 	path := filepath.Join(dir, totalsFile)
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return s.finishOpen()
+		return s, nil
 	}
 	if err != nil {
 		return nil, err
@@ -228,14 +228,6 @@ func Open(dir string) (*Store, error) {
 		if t == nil {
 			delete(s.totals, worker)
 		}
-	}
-	return s.finishOpen()
-}
-
-// finishOpen reads the best-share file. Totals are already loaded.
-func (s *Store) finishOpen() (*Store, error) {
-	if err := s.loadBestShares(); err != nil {
-		return nil, err
 	}
 	return s, nil
 }
@@ -348,8 +340,7 @@ func (s *Store) countAllOnlineLocked(until time.Time) {
 
 // BestShares returns the highest shares this program has accepted, at most
 // ten, the highest first. They come from any workers, so one worker can
-// appear several times. Shares that have since fallen out of the ten stay in
-// the file.
+// appear several times. A share that falls out of the ten is forgotten.
 func (s *Store) BestShares() []BestShare {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -359,14 +350,13 @@ func (s *Store) BestShares() []BestShare {
 }
 
 // noteBestLocked puts an accepted share on the list of the highest shares
-// when it belongs there, and queues its line for the file.
+// when it belongs there, and asks for the file to be written.
 func (s *Store) noteBestLocked(worker string, at time.Time, diff float64) {
 	rec := BestShare{Time: at.UTC().Truncate(time.Second), Worker: worker, Difficulty: diff}
 	if !s.rankLocked(rec) {
 		return
 	}
-	s.bestPend = append(s.bestPend, rec)
-	s.noteBestTrimLocked()
+	s.bestDirty = true
 	select {
 	case s.bestWake <- struct{}{}:
 	default:
@@ -402,43 +392,6 @@ func ranksBefore(a, b BestShare) bool {
 
 func sameShare(a, b BestShare) bool {
 	return a.Difficulty == b.Difficulty && a.Time.Equal(b.Time) && a.Worker == b.Worker
-}
-
-// onBestListLocked reports whether rec is one of the highest shares now.
-func (s *Store) onBestListLocked(rec BestShare) bool {
-	for _, b := range s.best {
-		if sameShare(b, rec) {
-			return true
-		}
-	}
-	return false
-}
-
-// noteBestTrimLocked drops lines of shares that are no longer on the list
-// once the disk has fallen too far behind. Shares still on it stay.
-func (s *Store) noteBestTrimLocked() {
-	if dropped := s.trimBestPendingLocked(); dropped > 0 && !s.bestDropLogged {
-		s.bestDropLogged = true
-		log.Printf("WARNING: the best-share list could not be written for so long that %d older shares have been dropped from the file. The ten shown are not affected.", dropped)
-	}
-}
-
-func (s *Store) trimBestPendingLocked() int {
-	excess := len(s.bestPend) - maxBestPending
-	if excess <= 0 {
-		return 0
-	}
-	kept := make([]BestShare, 0, len(s.bestPend))
-	dropped := 0
-	for _, rec := range s.bestPend {
-		if dropped < excess && !s.onBestListLocked(rec) {
-			dropped++
-			continue
-		}
-		kept = append(kept, rec)
-	}
-	s.bestPend = kept
-	return dropped
 }
 
 // Offline returns the workers that have mined here before and are not
@@ -603,38 +556,34 @@ func completeLines(data []byte, atEOF bool) (int, []byte, error) {
 }
 
 // Run writes the statistics to disk at the end of every interval until ctx
-// is cancelled, and once more on the way out. A share that makes the list of
-// the highest shares is written without waiting for the interval.
+// is cancelled, and once more on the way out. When the list of the highest
+// shares changes, its file is written soon, not at the end of the interval.
 func (s *Store) Run(ctx context.Context) {
+	checkpoint := time.NewTimer(untilNextInterval(time.Now()))
+	defer checkpoint.Stop()
+	// bestDue is set while a write of the best-share file waits for its turn.
+	var bestDue <-chan time.Time
 	for {
-		now := time.Now()
-		// The checkpoint for the interval that is open now.
-		deadline := now.Truncate(Interval).Add(Interval)
-		timer := time.NewTimer(deadline.Sub(now))
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			s.flush(time.Now(), true)
 			return
-		case <-timer.C:
+		case <-checkpoint.C:
 			s.flush(time.Now(), false)
+			checkpoint.Reset(untilNextInterval(time.Now()))
 		case <-s.bestWake:
-			// Stop's true result is not "the interval is still open": on
-			// Go 1.23 it also means a tick that already fired was discarded.
-			// A share arriving as the interval ends must not skip that
-			// checkpoint. Do not receive from timer.C after Stop; that
-			// receive can block.
-			timer.Stop()
-			if !time.Now().Before(deadline) {
-				s.flush(time.Now(), false)
-				continue
+			if bestDue == nil {
+				bestDue = time.After(s.bestWriteDelay(time.Now()))
 			}
+		case <-bestDue:
+			bestDue = nil
 			s.writeBestShares()
-			if !time.Now().Before(deadline) {
-				s.flush(time.Now(), false)
-			}
 		}
 	}
+}
+
+func untilNextInterval(now time.Time) time.Duration {
+	return now.Truncate(Interval).Add(Interval).Sub(now)
 }
 
 // Flush writes everything recorded so far, including the interval still in
@@ -689,14 +638,14 @@ func (s *Store) flush(now time.Time, final bool) {
 	}
 	s.mu.Unlock()
 	if totals != nil {
-		if err := s.replaceTotals(totals); err != nil {
+		if err := s.replaceFile(totalsFile, totals); err != nil {
 			log.Printf("WARNING: could not write the worker totals: %v", err)
 			s.mu.Lock()
 			s.changed = true // try again at the next interval
 			s.mu.Unlock()
 		}
 	}
-	s.persistBestShares()
+	s.saveBestShares()
 }
 
 // trimPendingLocked forgets the oldest unwritten samples beyond maxPending
@@ -808,11 +757,11 @@ func appendHistoryBatch(f historyAppender, data []byte) (int, error) {
 	return bytes.Count(data[:complete], []byte{'\n'}), err
 }
 
-// replaceTotals swaps in a new totals file. The new contents are forced
-// onto the disk first, so a power cut leaves either the old file or the new
-// one, never half of one.
-func (s *Store) replaceTotals(data []byte) error {
-	path := filepath.Join(s.dir, totalsFile)
+// replaceFile swaps in a new version of a file in the statistics folder. The
+// new contents are forced onto the disk first, so a power cut leaves either
+// the old file or the new one, never half of one.
+func (s *Store) replaceFile(name string, data []byte) error {
+	path := filepath.Join(s.dir, name)
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -834,98 +783,92 @@ func (s *Store) replaceTotals(data []byte) error {
 	return err
 }
 
-func (s *Store) loadBestShares() error {
+// loadBestShares reads the saved list of the highest shares. It cannot fail:
+// a list that is missing or unreadable is not worth refusing to mine over, so
+// the damaged file is kept for a person to look at and the list starts empty.
+func (s *Store) loadBestShares() {
 	path := filepath.Join(s.dir, bestFile)
-	f, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+		return
+	}
+	var saved []BestShare
+	if err == nil {
+		err = json.Unmarshal(raw, &saved)
 	}
 	if err != nil {
-		return err
+		aside := path + ".damaged-" + time.Now().UTC().Format("20060102T150405Z")
+		if rerr := os.Rename(path, aside); rerr != nil {
+			log.Printf("WARNING: could not read %s (%v) and could not move it aside (%v). The best-share list starts again from empty.", path, err, rerr)
+			return
+		}
+		log.Printf("WARNING: could not read %s (%v). It has been renamed to %s and the best-share list starts again from empty.", path, err, filepath.Base(aside))
+		return
 	}
-	lines := bufio.NewScanner(f)
-	lines.Split(completeLines)
-	for lines.Scan() {
-		var rec BestShare
-		if json.Unmarshal(lines.Bytes(), &rec) != nil || rec.Worker == "" || rec.Time.IsZero() || !(rec.Difficulty > 0) || rec.Difficulty >= math.Inf(1) {
+	for _, rec := range saved {
+		if rec.Worker == "" || rec.Time.IsZero() || !(rec.Difficulty > 0) || rec.Difficulty >= math.Inf(1) {
 			continue
 		}
 		s.rankLocked(rec)
 	}
-	err = lines.Err()
-	f.Close()
-	if err != nil {
-		// Statistics are not worth refusing to mine over. Keep the file for
-		// a person to look at and start the list again.
-		s.best = nil
-		aside := path + ".damaged-" + time.Now().UTC().Format("20060102T150405Z")
-		if rerr := os.Rename(path, aside); rerr != nil {
-			return fmt.Errorf("%s is damaged and could not be moved out of the way: %w", path, rerr)
-		}
-		log.Printf("WARNING: %s was damaged and has been renamed to %s. The best-share list starts again from empty.", path, filepath.Base(aside))
-		return nil
-	}
-	return nil
 }
 
-// writeBestShares appends the shares that made the best-share list and have
-// not reached disk yet. It takes the disk lock, so flush, which already holds
-// that lock, calls persistBestShares directly.
+// bestWriteDelay is how long a write of the best-share file has to wait so
+// that the file is not written more often than bestGap.
+func (s *Store) bestWriteDelay(now time.Time) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return max(s.bestGap-now.Sub(s.bestSaved), 0)
+}
+
+// writeBestShares saves the list of the highest shares if it has changed. It
+// takes the disk lock, so flush, which already holds that lock, calls
+// saveBestShares directly.
 func (s *Store) writeBestShares() {
 	s.io.Lock()
 	defer s.io.Unlock()
-	s.persistBestShares()
+	s.saveBestShares()
 }
 
-// persistBestShares appends bestPend. The caller holds the disk lock.
-// Lines that do not reach disk stay pending and are tried again later; a
-// failed disk must not be retried in a tight loop.
-func (s *Store) persistBestShares() {
+// saveBestShares replaces the best-share file with the list as it is now. The
+// caller holds the disk lock. When the write fails the list stays marked as
+// changed, so the next checkpoint tries again; nothing is queued.
+func (s *Store) saveBestShares() {
 	s.mu.Lock()
-	pending := s.bestPend
-	s.bestPend = nil
-	s.mu.Unlock()
-	if len(pending) == 0 {
+	if !s.bestDirty {
+		s.mu.Unlock()
 		return
 	}
-	unwritten, err := s.appendBest(pending)
+	s.bestDirty = false
+	s.bestSaved = time.Now()
+	list := make([]BestShare, len(s.best))
+	copy(list, s.best)
+	s.mu.Unlock()
+
+	err := s.replaceFile(bestFile, encodeBestShares(list))
 	if err != nil {
 		log.Printf("WARNING: could not write the best shares: %v", err)
+		s.mu.Lock()
+		s.bestDirty = true
+		s.mu.Unlock()
 	}
-	if len(unwritten) == 0 {
-		return
-	}
-	s.mu.Lock()
-	s.bestPend = append(unwritten, s.bestPend...)
-	s.noteBestTrimLocked()
-	s.mu.Unlock()
 }
 
-func (s *Store) appendBest(recs []BestShare) ([]BestShare, error) {
-	var lines bytes.Buffer
-	for _, rec := range recs {
+// encodeBestShares writes a JSON array with one share on each line.
+func encodeBestShares(list []BestShare) []byte {
+	var out bytes.Buffer
+	out.WriteString("[")
+	for i, rec := range list {
 		line, err := json.Marshal(rec)
 		if err != nil {
-			return recs, err
+			continue // cannot happen: impossible difficulties never reach the list
 		}
-		lines.Write(line)
-		lines.WriteByte('\n')
-	}
-	f, err := os.OpenFile(filepath.Join(s.dir, bestFile), os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		return recs, err
-	}
-	n, err := appendHistoryBatch(f, lines.Bytes())
-	if n > 0 {
-		if serr := f.Sync(); serr != nil && err == nil {
-			log.Printf("WARNING: the best shares were written but could not be forced to disk: %v", serr)
+		if i > 0 {
+			out.WriteString(",")
 		}
+		out.WriteString("\n  ")
+		out.Write(line)
 	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if n > len(recs) {
-		n = len(recs)
-	}
-	return recs[n:], err
+	out.WriteString("\n]")
+	return out.Bytes()
 }
