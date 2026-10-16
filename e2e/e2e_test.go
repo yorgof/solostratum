@@ -722,9 +722,24 @@ func testNewBlockFromNetwork(t *testing.T, image string) {
 	b := startBridge(t, n, n.newAddress("bech32"))
 	m := b.dial("bitaxe")
 	old := waitJobOnTip(t, m, n, 0)
-	oldShare, ok := m.Mine(old, old.NetworkDifficulty(), 1_000_000)
-	if !ok {
-		t.Fatal("no share found")
+	// Regtest accepts about half of all hashes as blocks. Keep searching
+	// until the share is ordinary work: a header that meets the network
+	// target is still submitted after the tip moves.
+	var oldShare axesim.Share
+	foundOrdinary := false
+	for range 40 {
+		share, ok := m.Mine(old, old.NetworkDifficulty()/1000, 100_000)
+		if !ok {
+			continue
+		}
+		if axesim.HashDifficulty(share.Hash) < old.NetworkDifficulty() {
+			oldShare = share
+			foundOrdinary = true
+			break
+		}
+	}
+	if !foundOrdinary {
+		t.Fatal("no ordinary share found")
 	}
 
 	begin := time.Now()

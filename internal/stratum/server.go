@@ -25,8 +25,10 @@ type Jobs interface {
 }
 
 // BlockSink receives solved blocks. It is implemented by blocks.Store.
+// Found reports an error when the block could not be stored durably; the
+// caller then withholds the share acknowledgement so the miner sends it again.
 type BlockSink interface {
-	Found(height int64, hash string, block []byte, worker string)
+	Found(height int64, hash string, block []byte, worker string) error
 }
 
 // Recorder receives every connection and share for the long-term

@@ -581,12 +581,6 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 		reject(errJobNotFound, "Job not found (stale)")
 		return
 	}
-	// The block time may only move forward a little. Moving it further
-	// gains nothing, since new work arrives every few seconds.
-	if ntime < job.CurTime || ntime > job.CurTime+maxNTimeRoll {
-		reject(errOther, "Time out of range")
-		return
-	}
 
 	// BIP310 says the submitted bits replace the masked bits of the job's
 	// version. Some firmware sends the XOR against the job's version
@@ -611,6 +605,23 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	shareDiff := btc.DifficultyFromTarget(hashInt)
 	isBlock := hashInt.Cmp(job.Target) <= 0
 
+	// Ordinary shares use a short time window: new work arrives every few
+	// seconds, so rolling further gains nothing. A header that meets the
+	// network target is a block even on a stale job or with a wider roll,
+	// and dropping it would throw the block away.
+	if isBlock {
+		if ntime < job.MinTime || ntime > maxBlockNTime(job, time.Now()) {
+			reject(errOther, "Time out of range")
+			return
+		}
+	} else if !job.AcceptsShares() {
+		reject(errJobNotFound, "Job not found (stale)")
+		return
+	} else if ntime < job.CurTime || ntime > job.CurTime+maxNTimeRoll {
+		reject(errOther, "Time out of range")
+		return
+	}
+
 	s.mu.Lock()
 	assigned, known := s.jobDiff[jobID]
 	if !known {
@@ -626,6 +637,15 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	if !job.MarkShare(s.extranonce1[:], extranonce2, ntime, nonce, version) {
 		reject(errDuplicate, "Duplicate share")
 		return
+	}
+	if isBlock {
+		log.Printf("*** BLOCK FOUND by %s: height %d, hash %s ***", worker, job.Height, hash)
+		if err := s.srv.blocks.Found(job.Height, hash.String(), job.Block(header, coinbase), worker); err != nil {
+			job.UnmarkShare(s.extranonce1[:], extranonce2, ntime, nonce, version)
+			log.Printf("Could not record block %s: %v", hash, err)
+			reject(errOther, "Could not save block")
+			return
+		}
 	}
 
 	// Credit the share at the difficulty the miner was actually working at.
@@ -651,15 +671,28 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	}
 	s.reply(req.ID, true, 0, "")
 
-	if isBlock {
-		log.Printf("*** BLOCK FOUND by %s: height %d, hash %s ***", worker, job.Height, hash)
-		s.srv.blocks.Found(job.Height, hash.String(), job.Block(header, coinbase), worker)
-	}
 	if changed {
 		s.mu.Lock()
 		s.announceDifficultyLocked()
 		s.mu.Unlock()
 	}
+}
+
+// maxBlockNTime is the latest timestamp Bitcoin could still accept for a
+// block from this job: two hours ahead of the later of our clock and the
+// clock the template was built with.
+func maxBlockNTime(job *work.Job, now time.Time) uint32 {
+	limit := now.Add(work.MaxFutureBlockTime).Unix()
+	if ahead := int64(job.CurTime) + int64(work.MaxFutureBlockTime/time.Second); ahead > limit {
+		limit = ahead
+	}
+	if limit > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	if limit < 0 {
+		return 0
+	}
+	return uint32(limit)
 }
 
 func (s *session) status(now time.Time) (MinerStatus, bool) {

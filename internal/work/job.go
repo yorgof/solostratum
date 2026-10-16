@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yorgof/solostratum/internal/btc"
@@ -64,8 +65,10 @@ type Job struct {
 	witnessCommitment []byte // output script, nil before segwit activation
 	txData            [][]byte
 
-	mu     sync.Mutex
-	shares map[shareKey]struct{}
+	mu        sync.Mutex
+	shares    map[shareKey]struct{}
+	shareable atomic.Bool  // false once ordinary shares are stale
+	retiredAt atomic.Int64 // unix nano, set when shareable becomes false
 }
 
 type shareKey struct {
@@ -138,6 +141,7 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 		txData:    make([][]byte, len(t.Transactions)),
 		CleanJobs: false,
 	}
+	j.shareable.Store(true)
 
 	txids := make([]btc.Hash, len(t.Transactions))
 	hashes := make([]btc.Hash, len(t.Transactions))
@@ -282,12 +286,35 @@ func (j *Job) Block(header [80]byte, coinbase []byte) []byte {
 	return b
 }
 
-// MarkShare records a share and reports whether it was new. Miners must not
-// be credited twice for the same work.
-func (j *Job) MarkShare(extranonce1, extranonce2 []byte, ntime, nonce, version uint32) bool {
+// Retire stops ordinary share acceptance. The job is kept so a header that
+// already meets the network target can still be rebuilt into a block.
+func (j *Job) Retire(now time.Time) {
+	if j.shareable.CompareAndSwap(true, false) {
+		j.retiredAt.Store(now.UnixNano())
+	}
+}
+
+// AcceptsShares reports whether a non-block share for this job is still paid.
+func (j *Job) AcceptsShares() bool { return j.shareable.Load() }
+
+// blockRebuildExpired reports whether a retired job is past the window in
+// which a solved block can still be submitted.
+func (j *Job) blockRebuildExpired(now time.Time) bool {
+	retired := j.retiredAt.Load()
+	return retired != 0 && now.Sub(time.Unix(0, retired)) > MaxFutureBlockTime
+}
+
+func shareKeyOf(extranonce1, extranonce2 []byte, ntime, nonce, version uint32) shareKey {
 	k := shareKey{ntime: ntime, nonce: nonce, version: version}
 	copy(k.extranonce1[:], extranonce1)
 	copy(k.extranonce2[:], extranonce2)
+	return k
+}
+
+// MarkShare records a share and reports whether it was new. Miners must not
+// be credited twice for the same work.
+func (j *Job) MarkShare(extranonce1, extranonce2 []byte, ntime, nonce, version uint32) bool {
+	k := shareKeyOf(extranonce1, extranonce2, ntime, nonce, version)
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if _, dup := j.shares[k]; dup {
@@ -295,6 +322,15 @@ func (j *Job) MarkShare(extranonce1, extranonce2 []byte, ntime, nonce, version u
 	}
 	j.shares[k] = struct{}{}
 	return true
+}
+
+// UnmarkShare forgets a share so the miner can send it again. Used when a
+// solved block could not be recorded and the acknowledgement was withheld.
+func (j *Job) UnmarkShare(extranonce1, extranonce2 []byte, ntime, nonce, version uint32) {
+	k := shareKeyOf(extranonce1, extranonce2, ntime, nonce, version)
+	j.mu.Lock()
+	delete(j.shares, k)
+	j.mu.Unlock()
 }
 
 // StratumPrevHash returns the previous block hash in the word-swapped form

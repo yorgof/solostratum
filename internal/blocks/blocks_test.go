@@ -17,6 +17,11 @@ import (
 	"github.com/yorgof/solostratum/internal/rpc"
 )
 
+type submitAnswer struct {
+	reason string
+	err    error
+}
+
 type fakeNode struct {
 	mu       sync.Mutex
 	failures int    // transport failures before answering
@@ -24,6 +29,7 @@ type fakeNode struct {
 	rpcErr   error
 	calls    int
 	onCall   func()
+	answers  []submitAnswer // if set, each call returns the next one and then repeats the last
 }
 
 func (f *fakeNode) SubmitBlock(ctx context.Context, block []byte) (string, error) {
@@ -35,6 +41,13 @@ func (f *fakeNode) SubmitBlock(ctx context.Context, block []byte) (string, error
 	}
 	if f.calls <= f.failures {
 		return "", errors.New("dial tcp: connection refused")
+	}
+	if len(f.answers) > 0 {
+		i := f.calls - f.failures - 1
+		if i >= len(f.answers) {
+			i = len(f.answers) - 1
+		}
+		return f.answers[i].reason, f.answers[i].err
 	}
 	return f.reason, f.rpcErr
 }
@@ -201,13 +214,76 @@ func TestRejectedAndDuplicate(t *testing.T) {
 		t.Errorf("status %q", recs[0].Status)
 	}
 
-	// An error from the node itself (not the network) is final.
-	node = &fakeNode{rpcErr: &rpc.Error{Code: -22, Message: "Block decode failed"}}
+	// A decode failure will not change on retry.
+	node = &fakeNode{rpcErr: &rpc.Error{Code: rpc.CodeDeserialization, Message: "Block decode failed"}}
 	s, _, _ = open(t, node)
 	s.Found(100, "aa", []byte{1}, "")
 	s.Wait()
 	if recs := s.Records(); recs[0].Status != "rejected: Block decode failed" || node.calls != 1 {
 		t.Errorf("status %q, %d calls", recs[0].Status, node.calls)
+	}
+}
+
+func TestInconclusiveAndDiskErrorsAreRetried(t *testing.T) {
+	cases := []struct {
+		name    string
+		answers []submitAnswer
+	}{
+		{"inconclusive", []submitAnswer{{reason: "inconclusive"}, {reason: "duplicate"}}},
+		{"duplicate-inconclusive", []submitAnswer{{reason: "duplicate-inconclusive"}, {reason: ""}}},
+		{"disk full", []submitAnswer{{err: &rpc.Error{Code: -25, Message: "Disk space is too low!"}}, {reason: ""}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			node := &fakeNode{answers: c.answers}
+			s, _, accepted := open(t, node)
+			if err := s.Found(100, "aa", []byte{1}, "rig"); err != nil {
+				t.Fatal(err)
+			}
+			s.Wait()
+			if node.calls != 2 || accepted.Load() != 1 || s.Records()[0].Status != "accepted" {
+				t.Fatalf("calls %d, accepted %d, status %q", node.calls, accepted.Load(), s.Records()[0].Status)
+			}
+		})
+	}
+}
+
+func TestUncertainResultsAreResumed(t *testing.T) {
+	dir := t.TempDir()
+	recent := time.Now().UTC().Add(-time.Minute)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	write := func(when time.Time, height int, hash, status, body string) {
+		t.Helper()
+		base := fmt.Sprintf("block-%d-%s-%s", height, when.Format(timeLayout), hash)
+		if err := os.WriteFile(filepath.Join(dir, base+".hex"), []byte(body+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if status != "" {
+			if err := os.WriteFile(filepath.Join(dir, base+".result"), []byte(status+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	write(recent, 100, "aa", "rejected: inconclusive", "aa")
+	write(recent, 101, "bb", "not submitted: connection refused", "bb")
+	write(recent, 102, "cc", "rejected: high-hash", "cc")
+	write(old, 103, "dd", "rejected: inconclusive", "dd")
+
+	node := &fakeNode{}
+	s, err := Open(dir, node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Wait()
+	if node.calls != 2 {
+		t.Fatalf("node contacted %d times, want the two recent uncertain blocks", node.calls)
+	}
+	got := map[string]string{}
+	for _, r := range s.Records() {
+		got[r.Hash] = r.Status
+	}
+	if got["aa"] != "accepted" || got["bb"] != "accepted" || got["cc"] != "rejected: high-hash" || got["dd"] != "rejected: inconclusive" {
+		t.Fatalf("statuses: %v", got)
 	}
 }
 
@@ -295,7 +371,9 @@ func TestBlockIsDeliveredWhenSavingFails(t *testing.T) {
 	if err := os.WriteFile(dir, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s.Found(100, "aa", []byte{1, 2}, "rig")
+	if err := s.Found(100, "aa", []byte{1, 2}, "rig"); err == nil {
+		t.Fatal("a failed save was reported as durable")
+	}
 	s.Wait()
 	records := s.Records()
 	if node.calls != 1 || accepted.Load() != 1 || len(records) != 1 || records[0].Status != "accepted" || records[0].File != "" {

@@ -94,9 +94,10 @@ func Open(dir string, node Submitter, onAccepted func()) (*Store, error) {
 	}
 	sort.Slice(loaded, func(i, j int) bool { return loaded[i].Time.Before(loaded[j].Time) })
 	for _, r := range loaded {
-		// A block without a result file was still being delivered when the
-		// program stopped. If it is recent enough to matter, try again.
-		if r.Status == statusUnknown && time.Since(r.Time) < s.retryFor {
+		// A block without a definite result was still being delivered, or the
+		// node had not shown it to be invalid. If it is recent enough to
+		// matter, try again.
+		if resumable(r.Status) && time.Since(r.Time) < s.retryFor {
 			if raw, err := os.ReadFile(filepath.Join(dir, r.File)); err == nil {
 				if block, err := hex.DecodeString(strings.TrimSpace(string(raw))); err == nil {
 					log.Printf("Resuming delivery of block %s found before the last shutdown.", r.Hash)
@@ -143,32 +144,31 @@ func (s *Store) Records() []Record {
 }
 
 // Found saves a solved block to its own file and then submits it. The file
-// is written before the node is contacted, so the block can be submitted by
-// hand ("bitcoin-cli submitblock <contents>") if everything else fails.
-// Forcing the file onto the physical disk can be slow on SD cards, so that
-// part runs alongside the submission rather than delaying it.
-func (s *Store) Found(height int64, hash string, block []byte, worker string) {
+// is written and flushed before this returns, so a miner is not told the
+// share was accepted until a crash would still leave the block on disk.
+// The file is written before the node is contacted, so the block can be
+// submitted by hand ("bitcoin-cli submitblock <contents>") if everything
+// else fails. An error means the durable copy could not be made; the block
+// is still submitted from memory.
+func (s *Store) Found(height int64, hash string, block []byte, worker string) error {
 	now := time.Now().UTC()
 	base, file, err := s.save(height, hash, block, now)
 	if err != nil {
-		// Still try to submit: the block only exists in memory now.
 		log.Printf("WARNING: could not save the found block to disk: %v", err)
+	} else if syncErr := file.Sync(); syncErr != nil {
+		file.Close()
+		log.Printf("WARNING: could not flush the block file to disk: %v", syncErr)
+		err = syncErr
 	} else {
+		file.Close()
 		log.Printf("Block saved to %s", filepath.Join(s.dir, base+".hex"))
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			if err := file.Sync(); err != nil {
-				log.Printf("WARNING: could not flush the block file to disk: %v", err)
-			}
-			file.Close()
-		}()
 	}
 	rec := Record{Time: now, Height: height, Hash: hash, Status: "submitting", Worker: worker}
 	if base != "" {
 		rec.File = base + ".hex"
 	}
 	s.track(rec, base, block)
+	return err
 }
 
 // track adds a record and delivers its block in the background.
@@ -260,24 +260,56 @@ func (s *Store) submit(hash string, block []byte) string {
 			// which happens when a retry follows a lost answer.
 			log.Printf("BLOCK ACCEPTED by the node: %s", hash)
 			return "accepted"
-		case err == nil:
+		case err == nil && !retryableReason(reason):
 			log.Printf("Block %s was REJECTED by the node: %s", hash, reason)
 			return "rejected: " + reason
-		}
-		var rpcErr *rpc.Error
-		if errors.As(err, &rpcErr) && rpcErr.Code != rpc.CodeInWarmup {
+		case err != nil && permanentSubmitError(err):
+			// A decode failure will not change on retry. Consensus rejects
+			// arrive as result strings, not as this error.
 			log.Printf("Block %s could not be submitted: %s", hash, rpc.Explain(err))
+			var rpcErr *rpc.Error
+			errors.As(err, &rpcErr)
 			return "rejected: " + rpcErr.Message
 		}
-		lastErr = err
-		if ctx.Err() != nil {
-			return giveUp(attempt, rpc.Explain(err))
+		if err != nil {
+			lastErr = err
+			log.Printf("Could not reach the node to submit block %s (attempt %d): %s. Retrying.", hash, attempt, rpc.Explain(err))
+		} else {
+			// "inconclusive" means the node did not show the block to be
+			// invalid. A later call commonly returns "duplicate" once the
+			// block is in the index.
+			lastErr = errors.New(reason)
+			log.Printf("Block %s was not confirmed by the node (%s, attempt %d). Retrying.", hash, reason, attempt)
 		}
-		log.Printf("Could not reach the node to submit block %s (attempt %d): %s. Retrying.", hash, attempt, rpc.Explain(err))
+		if ctx.Err() != nil {
+			return giveUp(attempt, rpc.Explain(lastErr))
+		}
 		select {
 		case <-ctx.Done():
-			return giveUp(attempt, rpc.Explain(err))
+			return giveUp(attempt, rpc.Explain(lastErr))
 		case <-time.After(s.retryEvery):
 		}
 	}
+}
+
+// resumable reports whether a saved status is not a definite answer from
+// the node, so a restart should submit the block again.
+func resumable(status string) bool {
+	switch status {
+	case statusUnknown, "rejected: inconclusive", "rejected: duplicate-inconclusive":
+		return true
+	default:
+		return strings.HasPrefix(status, "not submitted:")
+	}
+}
+
+// retryableReason reports result strings that do not mean the block is invalid.
+func retryableReason(reason string) bool {
+	return reason == "inconclusive" || reason == "duplicate-inconclusive"
+}
+
+// permanentSubmitError reports a node error that will not change on retry.
+func permanentSubmitError(err error) bool {
+	var rpcErr *rpc.Error
+	return errors.As(err, &rpcErr) && rpcErr.Code == rpc.CodeDeserialization
 }
