@@ -896,8 +896,8 @@ func TestBestShareFileSkipsDamageAndRepairsATornTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	torn := append(append(line, '\n'), []byte(`{"t":"2026-10-03T12:00:01Z","worker":"nope"`)...)
-	torn = append(torn, '\n', []byte(`not json`)...)
-	if err := os.WriteFile(filepath.Join(dir, bestFile), append(torn, '\n'), 0o644); err != nil {
+	torn = append(torn, "\nnot json\n"...)
+	if err := os.WriteFile(filepath.Join(dir, bestFile), torn, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	s := open(t, dir)
@@ -906,13 +906,13 @@ func TestBestShareFileSkipsDamageAndRepairsATornTail(t *testing.T) {
 	}
 	// The unfinished tail has no newline; the next append cuts it off.
 	path := filepath.Join(dir, bestFile)
-	if err := os.WriteFile(path, append(line, '\n', line[:len(line)/2]...), 0o644); err != nil {
+	if err := os.WriteFile(path, append(append(line[:len(line):len(line)], '\n'), line[:len(line)/2]...), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	s = open(t, dir)
 	s.Accepted("other", when.Add(time.Minute), 1, 9)
 	s.Flush(when)
-	got = bestLines(t, dir)
+	got := bestLines(t, dir)
 	next := BestShare{when.Add(time.Minute), "other", 9}
 	if len(got) != 2 || got[0] != good || got[1] != next {
 		t.Fatalf("repaired file: %+v", got)

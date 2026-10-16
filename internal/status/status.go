@@ -21,13 +21,13 @@ var page []byte
 
 // Report is the JSON document behind the page.
 type Report struct {
-	Version       string          `json:"version"`
-	Now           time.Time       `json:"now"`
-	PayoutAddress string          `json:"payoutAddress"`
-	StratumPort   string          `json:"stratumPort"`
-	Node          work.NodeState  `json:"node"`
-	Pool          stratum.Status  `json:"pool"`
-	Blocks        []blocks.Record `json:"blocks"`
+	Version       string            `json:"version"`
+	Now           time.Time         `json:"now"`
+	PayoutAddress string            `json:"payoutAddress"`
+	StratumPort   string            `json:"stratumPort"`
+	Node          work.NodeState    `json:"node"`
+	Pool          stratum.Status    `json:"pool"`
+	Blocks        []blocks.Record   `json:"blocks"`
 	Offline       []stats.Worker    `json:"offline"` // known workers that are not connected
 	History       bool              `json:"history"` // whether /api/history is available
 	BestShares    []stats.BestShare `json:"bestShares"`

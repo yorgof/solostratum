@@ -180,10 +180,10 @@ type Store struct {
 	live    map[string]*presence
 	full    bool // the maxWorkers warning has been logged
 
-	bestOf        map[string]BestShare // highest recorded best per worker
-	bestPend      []BestShare          // recorded bests not yet written
-	bestWake      chan struct{}        // a new best is waiting to be written
-	bestDropLogged bool                // the pending-cap warning has been logged
+	bestOf         map[string]BestShare // highest recorded best per worker
+	bestPend       []BestShare          // recorded bests not yet written
+	bestWake       chan struct{}        // a new best is waiting to be written
+	bestDropLogged bool                 // the pending-cap warning has been logged
 }
 
 // Open prepares the statistics folder, verifies it is writable and loads
