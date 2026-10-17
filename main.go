@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,6 +23,7 @@ import (
 	"github.com/yorgof/solostratum/internal/blocks"
 	"github.com/yorgof/solostratum/internal/btc"
 	"github.com/yorgof/solostratum/internal/config"
+	"github.com/yorgof/solostratum/internal/guard"
 	"github.com/yorgof/solostratum/internal/rpc"
 	"github.com/yorgof/solostratum/internal/stats"
 	"github.com/yorgof/solostratum/internal/status"
@@ -35,6 +35,17 @@ import (
 var version = "dev"
 
 func main() {
+	// An output that goes away, such as a closed terminal or a log collector
+	// that has stopped, must not end the program: Go exits on a write to a
+	// closed standard output or error unless SIGPIPE is ignored. The write
+	// then just fails.
+	signal.Ignore(syscall.SIGPIPE)
+	// Logging must never hold up the program, whatever happens to its output
+	// (see guard.LogOutput).
+	logOutput = guard.NewLogOutput(os.Stderr)
+	log.SetOutput(logOutput)
+	defer logOutput.Close(logCloseTimeout)
+
 	configPath := flag.String("config", "", "path to the settings file (default: "+config.FileName+" next to the program)")
 	check := flag.Bool("check", false, "check the settings and the node, then exit")
 	healthcheck := flag.Bool("healthcheck", false, "ask the running solostratum whether it is healthy, then exit (used by Docker)")
@@ -67,8 +78,23 @@ func main() {
 // restoreSignals stops intercepting Ctrl-C and SIGTERM.
 var restoreSignals = func() {}
 
+// logOutput takes everything the program logs. main sets it up.
+var logOutput *guard.LogOutput
+
+// logCloseTimeout is how long the end of the program waits for the log
+// output to take the last messages.
+const logCloseTimeout = 2 * time.Second
+
 func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "\nERROR: "+format+"\n", args...)
+	msg := fmt.Sprintf("\nERROR: "+format+"\n", args...)
+	if logOutput == nil {
+		fmt.Fprint(os.Stderr, msg)
+		os.Exit(1)
+	}
+	// After the messages logged before it, and without waiting forever for
+	// an output that takes nothing.
+	logOutput.Write([]byte(msg))
+	logOutput.Close(logCloseTimeout)
 	os.Exit(1)
 }
 
@@ -133,11 +159,13 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	// does not mine, treats a folder it cannot use as an error.
 	var history *stats.Store
 	if cfg.StatsDir != "" {
-		opened, err := stats.Open(cfg.StatsDir)
+		opened, err := openStatistics(ctx, func() (*stats.Store, error) { return stats.Open(cfg.StatsDir) }, statsOpenTimeout)
 		switch {
 		case err == nil:
 			history = opened
 			server.SetRecorder(history)
+		case ctx.Err() != nil:
+			return fmt.Errorf("stopped while waiting for stats_dir %s", cfg.StatsDir)
 		case checkOnly:
 			return fmt.Errorf("cannot use stats_dir %s: %v\n  (change stats_dir in the settings file, or leave it empty to keep no history)", cfg.StatsDir, err)
 		default:
@@ -150,6 +178,9 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	}
 	log.Printf("Self-test passed: the node accepts the blocks this program builds.")
 	if checkOnly {
+		if logOutput != nil {
+			logOutput.Flush(logCloseTimeout) // the log comes first
+		}
 		fmt.Println("Everything looks good.")
 		return nil
 	}
@@ -179,14 +210,14 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 		writerDone = make(chan struct{})
 		go func() {
 			defer close(writerDone)
-			guarded("The statistics writer", func() { history.Run(ctx) })
+			guarded("the statistics writer", func() { history.Run(ctx) })
 		}()
 	}
 	if statusListener != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			guarded("The status page", func() {
+			guarded("the status page", func() {
 				src := status.Sources{
 					Version: version, PayoutAddress: cfg.PayoutAddress, StratumPort: stratumPort,
 					Node: manager.State, Pool: server.Status, Blocks: store.Records,
@@ -209,12 +240,14 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	log.Printf("Shutting down.")
 	// Give the default signal behaviour back at once, so a second Ctrl-C
 	// ends the program even if a miner's last share or a disk write hangs.
-	// A found block is on disk by then, and a recent one is delivered
-	// again at the next start.
+	// A found block that is saved by then and was not answered is delivered
+	// again at the next start, if that comes soon enough.
 	restoreSignals()
 	wg.Wait()
 	if history != nil {
-		saveStatistics(writerDone, func() { history.Flush(time.Now()) }, statsSaveTimeout)
+		// After the writer's own last write, and after the last shares and
+		// disconnections the miners reported while the server drained.
+		saveStatistics(statsSaveTimeout, func() { history.Flush(time.Now()) }, writerDone, server.StatisticsDone())
 	}
 	return nil // finishDeliveries runs now
 }
@@ -225,7 +258,7 @@ func finishDeliveries(store *blocks.Store, dir string) {
 	// A second Ctrl-C must end the program, whatever the first one did.
 	restoreSignals()
 	if n := store.Pending(); n > 0 {
-		log.Printf("Still delivering %d found block(s) to the node. They are saved in %s. Press Ctrl-C to quit anyway.", n, dir)
+		log.Printf("Still delivering %d found block(s) to the node. Press Ctrl-C to quit anyway: a block saved in %s is delivered again if solostratum starts again within 30 minutes of finding it.", n, dir)
 	}
 	store.Wait()
 }
@@ -235,40 +268,69 @@ func finishDeliveries(store *blocks.Store, dir string) {
 // program, so a disk that has hung costs the last minutes of them instead.
 const statsSaveTimeout = 5 * time.Second
 
-// saveStatistics runs the last write of the statistics, after the writer's own
-// last write, for at most timeout. Miners recorded their last shares and their
-// disconnection while the server drained, after the writer's final write, so
-// that write alone is not enough.
-func saveStatistics(writerDone <-chan struct{}, flush func(), timeout time.Duration) {
-	saved := make(chan struct{})
+// statsOpenTimeout is how long the start waits for the statistics folder. A
+// folder that does not answer, such as one on a mount that has hung, must not
+// keep the miners waiting.
+const statsOpenTimeout = 10 * time.Second
+
+// openStatistics runs open, which opens the statistics, for at most timeout or
+// until ctx ends. A result that comes later is ignored.
+func openStatistics(ctx context.Context, open func() (*stats.Store, error), timeout time.Duration) (*stats.Store, error) {
+	type result struct {
+		store *stats.Store
+		err   error
+	}
+	done := make(chan result, 1)
 	go func() {
-		defer close(saved)
-		guarded("The last write of the statistics", func() {
-			<-writerDone
+		var r result
+		if failed := guard.Run("opening the statistics", func() { r.store, r.err = open() }); failed != nil {
+			r.err = failed
+		}
+		done <- r
+	}()
+	select {
+	case r := <-done:
+		return r.store, r.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("the folder did not answer within %s", timeout)
+	case <-ctx.Done():
+		return nil, errors.New("stopped while waiting for the folder")
+	}
+}
+
+// saveStatistics runs flush, the last write of the statistics, once every
+// channel in after is closed, and gives all of it at most timeout.
+func saveStatistics(timeout time.Duration, flush func(), after ...<-chan struct{}) {
+	saved := make(chan error, 1)
+	go func() {
+		saved <- guard.Run("saving the statistics", func() {
+			for _, ch := range after {
+				<-ch
+			}
 			flush()
 		})
 	}()
 	select {
-	case <-saved:
+	case err := <-saved:
+		if err != nil {
+			log.Printf("WARNING: the statistics could not be saved (%v). The last minutes of them are lost. Mining and found blocks are not affected.", err)
+		}
 	case <-time.After(timeout):
 		log.Printf("WARNING: the statistics could not be saved within %s. Is the disk stuck? The last minutes of them are lost. Mining and found blocks are not affected.", timeout)
 	}
 }
 
-// guarded runs f, which mining does not depend on, so that a panic in it is
-// logged and ends only f. Left alone, a panic in any goroutine ends the whole
-// program: every miner, and any block that is being delivered.
-func guarded(name string, f func()) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("WARNING: %s failed (%v) and has stopped. Mining is not affected.\n%s", name, r, debug.Stack())
-		}
-	}()
-	f()
+// guarded runs f, a part of the program that mining does not depend on. A
+// panic in it is logged and stops f only.
+func guarded(what string, f func()) {
+	if guard.Run(what, f) != nil {
+		log.Printf("WARNING: %s has stopped until solostratum is restarted. Mining is not affected.", what)
+	}
 }
 
 // runHealthcheck asks the solostratum instance that uses the same settings
-// file, through its status page, whether it has current work from the node.
+// file, through /api/health on its status page, whether it has current work
+// from the node.
 func runHealthcheck(configPath string) error {
 	if configPath == "" {
 		configPath = config.DefaultPath()
@@ -285,17 +347,17 @@ func runHealthcheck(configPath string) error {
 		host = "127.0.0.1"
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("http://" + net.JoinHostPort(host, port) + "/api/status")
+	resp, err := client.Get("http://" + net.JoinHostPort(host, port) + "/api/health")
 	if err != nil {
 		return fmt.Errorf("solostratum is not answering: %v", err)
 	}
 	defer resp.Body.Close()
-	var report status.Report
-	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
+	var health status.Health
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
 		return fmt.Errorf("unreadable status answer: %v", err)
 	}
-	if !report.Node.Connected {
-		return fmt.Errorf("node problem: %s", report.Node.Error)
+	if !health.Node.Connected {
+		return fmt.Errorf("node problem: %s", health.Node.Error)
 	}
 	return nil
 }

@@ -33,6 +33,16 @@ type Report struct {
 	BestShares    []stats.BestShare `json:"bestShares"`
 }
 
+// Health is the answer of /api/health, which the Docker health check reads:
+// the node's state and the number of miners, both taken from the core of the
+// program. It never waits for the statistics, so statistics that have stopped
+// answering cannot make a working solostratum look unhealthy, while a miner
+// server that is stuck still can.
+type Health struct {
+	Node   work.NodeState `json:"node"`
+	Miners int            `json:"miners"` // connected and logged in
+}
+
 // Sources are the functions the page reads its data from.
 type Sources struct {
 	Version       string
@@ -97,6 +107,12 @@ func Handler(src Sources) http.Handler {
 			Node: src.Node(), Pool: src.Pool(), Blocks: found, Offline: offline, History: src.History != nil,
 			BestShares: best,
 		})
+	})
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		if !readOnly(w, r) {
+			return
+		}
+		writeJSON(w, Health{Node: src.Node(), Miners: len(src.Pool().Miners)})
 	})
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
 		if !readOnly(w, r) {

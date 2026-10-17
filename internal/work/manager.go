@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yorgof/solostratum/internal/btc"
+	"github.com/yorgof/solostratum/internal/guard"
 	"github.com/yorgof/solostratum/internal/rpc"
 )
 
@@ -61,6 +62,9 @@ type Manager struct {
 	tag   string
 	chain string
 
+	// mu is held with defer: a panic while updating the work is recovered
+	// (see update), and must not leave it held, since every miner, the
+	// broadcast of new work and the health check need it.
 	mu       sync.RWMutex
 	current  *Job
 	jobs     map[string]*Job
@@ -98,12 +102,11 @@ func (m *Manager) Current() *Job {
 // tip has moved on.
 func (m *Manager) Get(id string) *Job {
 	m.mu.RLock()
-	job := m.jobs[id]
-	m.mu.RUnlock()
-	if job == nil || job.expired(time.Now()) {
-		return nil
+	defer m.mu.RUnlock()
+	if job := m.jobs[id]; job != nil && !job.expired(time.Now()) {
+		return job
 	}
-	return job
+	return nil
 }
 
 // pruneLocked drops retired jobs past retiredJobGrace.
@@ -141,9 +144,7 @@ func (m *Manager) Fetch(ctx context.Context) error {
 }
 
 func (m *Manager) fetch(ctx context.Context, longPollID string) error {
-	m.mu.RLock()
-	gen := m.tipGen
-	m.mu.RUnlock()
+	gen := m.generation()
 	t, err := m.node.GetBlockTemplate(ctx, longPollID, longPollWait)
 	if err != nil {
 		// The regular poll is the authority on node health; a failed long
@@ -161,16 +162,28 @@ func isTimeout(err error) bool {
 	return errors.As(err, &t) && t.Timeout() || errors.Is(err, context.DeadlineExceeded)
 }
 
+// generation returns the number of tip changes published so far.
+func (m *Manager) generation() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.tipGen
+}
+
 // setOK records that the node delivered a usable template.
 func (m *Manager) setOK() {
-	m.mu.Lock()
-	recovered := m.lastErr != ""
-	m.lastErr = ""
-	m.lastOK = time.Now()
-	m.mu.Unlock()
-	if recovered {
+	if m.clearError() {
 		log.Printf("Node connection restored.")
 	}
+}
+
+// clearError forgets the node's problem, notes that the node has delivered,
+// and reports whether there was a problem.
+func (m *Manager) clearError() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	had := m.lastErr != ""
+	m.lastErr, m.lastOK = "", time.Now()
+	return had
 }
 
 // Healthy reports whether the node has delivered usable work recently. When
@@ -183,13 +196,19 @@ func (m *Manager) Healthy() bool {
 
 func (m *Manager) setError(err error) {
 	msg := rpc.Explain(err)
-	m.mu.Lock()
-	changed := m.lastErr != msg
-	m.lastErr = msg
-	m.mu.Unlock()
-	if changed {
+	if m.replaceError(msg) {
 		log.Printf("Node problem: %s. Retrying; miners keep their current work.", msg)
 	}
+}
+
+// replaceError records msg as the node's problem and reports whether it is a
+// new one.
+func (m *Manager) replaceError(msg string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	changed := m.lastErr != msg
+	m.lastErr = msg
+	return changed
 }
 
 // publish turns a template into the current job unless it is stale. gen is
@@ -203,13 +222,7 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 		m.setError(err)
 		return err
 	}
-	m.mu.Lock()
-	cur := m.current
-	raced := gen != m.tipGen
-	m.nextID++
-	seq := m.nextID
-	m.mu.Unlock()
-
+	cur, raced, seq := m.next(gen)
 	newTip := cur == nil || cur.PrevHash != prev
 	if newTip && raced {
 		// The tip changed while this request was under way, so this answer
@@ -221,9 +234,7 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 	if !newTip && (uint32(t.CurTime) < cur.CurTime || time.Since(cur.Created) < time.Second) {
 		// An older answer overtaken by a newer one, or the long poll and
 		// the regular poll answering together.
-		m.mu.Lock()
-		m.longPoll = t.LongPollID
-		m.mu.Unlock()
+		m.setLongPoll(t.LongPollID)
 		m.setOK()
 		return nil
 	}
@@ -236,10 +247,37 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 	job.Seq = seq
 	m.setOK()
 	job.CleanJobs = newTip
+	m.install(job, t.LongPollID, time.Now())
 
-	now := time.Now()
-	m.mu.Lock()
 	if newTip {
+		log.Printf("New block to mine: height %d, %d transactions, reward %s BTC, network difficulty %s",
+			job.Height, job.TxCount, formatBTC(job.Value), formatDiff(job.NetDiff))
+	}
+	m.onJob(job)
+	return nil
+}
+
+// next returns the current job, whether the tip has changed since generation
+// gen, and the sequence number for a new job.
+func (m *Manager) next(gen uint64) (cur *Job, raced bool, seq uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextID++
+	return m.current, gen != m.tipGen, m.nextID
+}
+
+func (m *Manager) setLongPoll(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.longPoll = id
+}
+
+// install makes job the current job, with longPoll the node's long-poll id
+// for it, and drops the jobs that are no longer kept.
+func (m *Manager) install(job *Job, longPoll string, now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if job.CleanJobs {
 		// Ordinary shares for the old tip are stale. A block solved on it
 		// may still be on its way: those jobs stay until pruneLocked drops
 		// them.
@@ -260,18 +298,10 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 	}
 	m.pruneLocked(now)
 	m.current = job
-	m.longPoll = t.LongPollID
-	if newTip {
+	m.longPoll = longPoll
+	if job.CleanJobs {
 		m.tipGen++
 	}
-	m.mu.Unlock()
-
-	if newTip {
-		log.Printf("New block to mine: height %d, %d transactions, reward %s BTC, network difficulty %s",
-			job.Height, job.TxCount, formatBTC(job.Value), formatDiff(job.NetDiff))
-	}
-	m.onJob(job)
-	return nil
 }
 
 // Run keeps jobs current until ctx is cancelled.
@@ -291,45 +321,69 @@ func (m *Manager) Run(ctx context.Context) {
 			wg.Wait()
 			return
 		case <-m.refreshC:
-			m.Fetch(ctx)
+			m.update(func() { m.Fetch(ctx) })
 		case <-ticker.C:
-			cur := m.Current()
-			if cur == nil || time.Since(cur.Created) >= refreshInterval {
-				m.Fetch(ctx)
-				continue
-			}
-			info, err := m.node.GetBlockchainInfo(ctx)
-			if err != nil {
-				if ctx.Err() == nil {
-					m.setError(err)
-				}
-				continue
-			}
-			// Fetch right away on a new tip, and after a failure so that
-			// recovery is noticed without waiting for the next refresh.
-			tip, err := btc.HashFromDisplayHex(info.BestBlockHash)
-			if (err == nil && tip != cur.PrevHash) || m.State().Error != "" {
-				m.Fetch(ctx)
-			}
+			m.update(func() { m.poll(ctx) })
 		}
 	}
 }
 
+// update runs one pass of Run. A panic in it is a bug, and counts as a failed
+// update: it is logged and reported like a node problem, and the next pass
+// tries again. Miners keep their current work meanwhile, and are disconnected
+// if no update succeeds within nodeTimeout, as when the node is down.
+func (m *Manager) update(f func()) {
+	if err := guard.Run("updating the work", f); err != nil {
+		m.setError(err)
+	}
+}
+
+// poll checks the chain tip, and fetches a new template when the job is due
+// for a refresh, the tip has moved or the last update failed.
+func (m *Manager) poll(ctx context.Context) {
+	cur := m.Current()
+	if cur == nil || time.Since(cur.Created) >= refreshInterval {
+		m.Fetch(ctx)
+		return
+	}
+	info, err := m.node.GetBlockchainInfo(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			m.setError(err)
+		}
+		return
+	}
+	// Fetch right away on a new tip, and after a failure so that recovery is
+	// noticed without waiting for the next refresh.
+	tip, err := btc.HashFromDisplayHex(info.BestBlockHash)
+	if (err == nil && tip != cur.PrevHash) || m.State().Error != "" {
+		m.Fetch(ctx)
+	}
+}
+
 // longPollLoop waits on the node's long poll, which answers the moment a new
-// block arrives.
+// block arrives. A panic in one long poll counts as a failed one.
 func (m *Manager) longPollLoop(ctx context.Context) {
 	for ctx.Err() == nil {
-		m.mu.RLock()
-		id := m.longPoll
-		m.mu.RUnlock()
+		id := m.longPollID()
 		if id == "" {
 			sleep(ctx, time.Second)
 			continue
 		}
-		if err := m.fetch(ctx, id); err != nil && !isTimeout(err) {
+		var err error
+		if failed := guard.Run("waiting for a new block", func() { err = m.fetch(ctx, id) }); failed != nil {
+			err = failed
+		}
+		if err != nil && !isTimeout(err) {
 			sleep(ctx, 5*time.Second) // the regular poll reports the problem
 		}
 	}
+}
+
+func (m *Manager) longPollID() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.longPoll
 }
 
 func sleep(ctx context.Context, d time.Duration) {

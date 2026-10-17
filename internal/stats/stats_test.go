@@ -1103,3 +1103,56 @@ loop:
 		t.Fatalf("history holds %d accepted shares, want %d", lines, miners*shares)
 	}
 }
+
+// A panic in the statistics, whether recovered by the statistics' own queue,
+// by the guard around the writer or by the status page's web server, must
+// not leave them locked: the recording, the status page and the last write
+// still need both of their locks.
+func TestPanicDoesNotLeaveTheStatisticsLocked(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name string
+		bug  func(s *Store) // breaks the store; called with s.mu held
+		call func(s *Store) // then panics
+	}{
+		{"writing", func(s *Store) { s.live["rig"] = nil }, func(s *Store) { s.Flush(now) }},
+		{"charting", func(s *Store) { s.live["rig"] = nil }, func(s *Store) { s.Series(now, 24*time.Hour, 15*time.Minute) }},
+		{"an accepted share", func(s *Store) { s.totals = nil }, func(s *Store) { s.Accepted("new", now, 1, 1) }},
+		{"a rejected share", func(s *Store) { s.totals = nil }, func(s *Store) { s.Rejected("new", now) }},
+		{"a connection", func(s *Store) { s.totals = nil }, func(s *Store) { s.Connected("new", now) }},
+		{"a disconnection", func(s *Store) { s.totals = nil }, func(s *Store) { s.Disconnected("rig", now.Add(10*time.Minute)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := open(t, t.TempDir())
+			s.Connected("rig", now)
+			s.mu.Lock()
+			tc.bug(s)
+			s.mu.Unlock()
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Fatal("the broken state did not cause a panic")
+					}
+				}()
+				tc.call(s)
+			}()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				s.mu.Lock()
+				s.totals, s.live = map[string]*Totals{}, map[string]*presence{}
+				s.mu.Unlock()
+				s.Accepted("rig", now, 1, 1)
+				s.BestShares()
+				s.Offline()
+				s.Series(now, 24*time.Hour, 15*time.Minute)
+				s.Flush(now)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the panic left the statistics locked")
+			}
+		})
+	}
+}

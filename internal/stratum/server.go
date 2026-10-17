@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yorgof/solostratum/internal/btc"
+	"github.com/yorgof/solostratum/internal/guard"
 	"github.com/yorgof/solostratum/internal/work"
 )
 
@@ -48,11 +49,17 @@ type Options struct {
 }
 
 // Server accepts miner connections and hands out work.
+//
+// Each piece of work runs through guard.Run: a panic while serving one
+// miner, or while sending it a job, ends that miner's connection only, and a
+// panic while accepting a connection or checking the node is logged and the
+// server carries on.
 type Server struct {
-	opts   Options
-	jobs   Jobs
-	blocks BlockSink
-	stats  Recorder // nil when no statistics are kept
+	opts     Options
+	jobs     Jobs
+	blocks   BlockSink
+	recorder Recorder        // nil when no statistics are kept
+	stats    *queuedRecorder // passes every call on to recorder; set by Serve
 
 	mu       sync.Mutex
 	sessions map[[work.Extranonce1Size]byte]*session
@@ -79,15 +86,21 @@ func NewServer(opts Options, jobs Jobs, blocks BlockSink) *Server {
 // SetJobs sets the job source. It must be called before Serve.
 func (s *Server) SetJobs(jobs Jobs) { s.jobs = jobs }
 
-// SetRecorder makes the server report every connection and share to stats.
-// It must be called before Serve. A panic in stats is contained: it switches
-// the recording off and never reaches the miners.
-func (s *Server) SetRecorder(stats Recorder) {
-	if stats == nil {
-		s.stats = nil
-		return
+// SetRecorder makes the server report every connection and share to rec.
+// It must be called before Serve. The reports reach rec through a queue (see
+// queuedRecorder), so whatever rec does, it never holds up a miner.
+func (s *Server) SetRecorder(rec Recorder) { s.recorder = rec }
+
+// StatisticsDone is closed once every connection and share has been passed
+// on to the Recorder, after Serve has returned. Statistics that have stopped
+// answering never close it, so wait for it with a time limit.
+func (s *Server) StatisticsDone() <-chan struct{} {
+	if s.stats == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
 	}
-	s.stats = &guardedRecorder{rec: stats}
+	return s.stats.queue.Done()
 }
 
 // Listen opens the listening socket.
@@ -110,8 +123,14 @@ func (s *Server) Addr() net.Addr {
 }
 
 // Serve accepts connections until ctx is cancelled, then closes the miners
-// and waits for their in-flight shares and block handoffs to finish.
+// and waits for their in-flight shares and block handoffs to finish. It does
+// not wait for the statistics: see StatisticsDone.
 func (s *Server) Serve(ctx context.Context) error {
+	if s.recorder != nil {
+		s.stats = newQueuedRecorder(s.recorder, statsQueueSize)
+		// Closed last, once no miner is left to report anything.
+		defer s.stats.queue.Close()
+	}
 	var sessions sync.WaitGroup
 	defer sessions.Wait()
 	// Close after the accept loop ends so even a connection accepted at
@@ -137,22 +156,30 @@ func (s *Server) Serve(ctx context.Context) error {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		if !s.jobs.Healthy() {
-			conn.Close() // lets the miner move on to its fallback pool
-			continue
-		}
-		sess := s.register(conn)
-		if sess == nil {
+		if guard.Run("accepting a miner", func() { s.admit(conn, &sessions) }) != nil {
 			conn.Close()
-			continue
 		}
-		sessions.Add(1)
-		go func() {
-			defer sessions.Done()
-			sess.run()
-			s.unregister(sess)
-		}()
 	}
+}
+
+// admit starts serving a new connection, unless the node is unreachable or
+// the server is full.
+func (s *Server) admit(conn net.Conn, sessions *sync.WaitGroup) {
+	if !s.jobs.Healthy() {
+		conn.Close() // lets the miner move on to its fallback pool
+		return
+	}
+	sess := s.register(conn)
+	if sess == nil {
+		conn.Close()
+		return
+	}
+	sessions.Add(1)
+	go func() {
+		defer sessions.Done()
+		sess.run()
+		s.unregister(sess)
+	}()
 }
 
 // watchNode disconnects miners while the node is unreachable. Mining on a
@@ -166,14 +193,22 @@ func (s *Server) watchNode(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if s.jobs.Healthy() {
-				continue
-			}
-			if n := s.closeAll(); n > 0 {
-				log.Printf("The node is unreachable: disconnected %d miner(s) so they can use their fallback pool. They can reconnect once the node is back.", n)
-			}
+			s.checkNode()
 		}
 	}
+}
+
+// checkNode is one pass of watchNode. A panic in it is logged, and the next
+// pass tries again.
+func (s *Server) checkNode() {
+	guard.Run("checking the node", func() {
+		if s.jobs.Healthy() {
+			return
+		}
+		if n := s.closeAll(); n > 0 {
+			log.Printf("The node is unreachable: disconnected %d miner(s) so they can use their fallback pool. They can reconnect once the node is back.", n)
+		}
+	})
 }
 
 func (s *Server) register(conn net.Conn) *session {
@@ -221,10 +256,15 @@ func (s *Server) snapshotSessions() []*session {
 	return out
 }
 
-// Broadcast sends a new job to every miner.
+// Broadcast sends a new job to every miner. A panic while sending it to one
+// miner ends that miner's connection only: the others still get the job, and
+// the manager, which calls Broadcast, carries on with an accurate view of the
+// node.
 func (s *Server) Broadcast(job *work.Job) {
 	for _, sess := range s.snapshotSessions() {
-		sess.sendJob(job, job.CleanJobs)
+		if guard.Run("sending new work to a miner", func() { sess.sendJob(job, job.CleanJobs) }) != nil {
+			sess.fail()
+		}
 	}
 }
 

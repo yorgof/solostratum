@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -277,5 +280,74 @@ func TestServeCancellationAndListenerFailure(t *testing.T) {
 		}
 		cancel()
 		l.Close()
+	}
+}
+
+// A bug in a data source fails the one request that hit it, and the page
+// goes on serving. The web server recovers the panic, so it never reaches
+// the rest of the program.
+func TestPanicInADataSourceFailsOnlyThatRequest(t *testing.T) {
+	log.SetOutput(io.Discard) // the web server logs the panic
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	var broken atomic.Bool
+	srv := serve(t, nil, func(src *Sources) {
+		src.BestShares = func() []stats.BestShare {
+			if broken.Load() {
+				panic("bug in the best shares")
+			}
+			return nil
+		}
+	})
+	broken.Store(true)
+	if resp, err := http.Get(srv.URL + "/api/status"); err == nil {
+		resp.Body.Close()
+		t.Fatalf("the request that hit the bug was answered with %d", resp.StatusCode)
+	}
+	broken.Store(false)
+	resp, err := http.Get(srv.URL + "/api/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d after the bug", resp.StatusCode)
+	}
+}
+
+// The health check reads /api/health, which answers from the node's state
+// and the miners alone: statistics that have stopped answering hold up
+// /api/status, never the health check.
+func TestHealthNeverWaitsForTheStatistics(t *testing.T) {
+	stuck := make(chan struct{})
+	srv := serve(t, nil, func(src *Sources) {
+		src.Offline = func() []stats.Worker { <-stuck; return nil }
+		src.BestShares = func() []stats.BestShare { <-stuck; return nil }
+	})
+	t.Cleanup(func() { close(stuck) }) // before the server's own cleanup, which waits for requests
+	client := &http.Client{Timeout: 5 * time.Second}
+	go func() {
+		if resp, err := client.Get(srv.URL + "/api/status"); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	resp, err := client.Get(srv.URL + "/api/health")
+	if err != nil {
+		t.Fatalf("the health check waited for the statistics: %v", err)
+	}
+	defer resp.Body.Close()
+	var health Health
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatal(err)
+	}
+	if !health.Node.Connected || health.Node.Chain != "main" || health.Miners != 1 {
+		t.Fatalf("health answer %+v", health)
+	}
+	for _, method := range []string{"POST", "DELETE"} {
+		req, _ := http.NewRequest(method, srv.URL+"/api/health", nil)
+		if resp, err := client.Do(req); err != nil || resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("%s /api/health: %v, %v", method, resp, err)
+		} else {
+			resp.Body.Close()
+		}
 	}
 }

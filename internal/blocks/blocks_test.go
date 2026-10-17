@@ -1,10 +1,13 @@
 package blocks
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -73,23 +76,10 @@ func hexFiles(t *testing.T, dir string) []string {
 	return names
 }
 
-func TestBlockIsSavedBeforeSubmitting(t *testing.T) {
+func TestBlockIsSubmittedAndSaved(t *testing.T) {
 	node := &fakeNode{}
 	s, dir, accepted := open(t, node)
 	block := []byte{0xde, 0xad, 0xbe, 0xef}
-	node.onCall = func() {
-		// At the moment the node is contacted the file must already hold
-		// the complete block.
-		files := hexFiles(t, dir)
-		if len(files) != 1 {
-			t.Errorf("%d block files exist when submitting, want 1", len(files))
-			return
-		}
-		raw, _ := os.ReadFile(files[0])
-		if strings.TrimSpace(string(raw)) != hex.EncodeToString(block) {
-			t.Errorf("file content %q is not the block", raw)
-		}
-	}
 	s.Found(840000, "00000000aabb", block, "rig1")
 	s.Wait()
 
@@ -100,9 +90,16 @@ func TestBlockIsSavedBeforeSubmitting(t *testing.T) {
 	if accepted.Load() != 1 {
 		t.Errorf("accepted callback ran %d times", accepted.Load())
 	}
-	name := filepath.Base(hexFiles(t, dir)[0])
-	if !strings.HasPrefix(name, "block-840000-") || !strings.HasSuffix(name, "-00000000aabb.hex") {
-		t.Errorf("unexpected file name %s", name)
+	files := hexFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("%d block files, want 1", len(files))
+	}
+	if raw, _ := os.ReadFile(files[0]); strings.TrimSpace(string(raw)) != hex.EncodeToString(block) {
+		t.Errorf("file content %q is not the block", raw)
+	}
+	name := filepath.Base(files[0])
+	if !strings.HasPrefix(name, "block-840000-") || !strings.HasSuffix(name, "-00000000aabb.hex") || recs[0].File != name {
+		t.Errorf("file name %s, recorded as %q", name, recs[0].File)
 	}
 	result, err := os.ReadFile(filepath.Join(dir, strings.TrimSuffix(name, ".hex")+".result"))
 	if err != nil || strings.TrimSpace(string(result)) != "accepted" {
@@ -147,16 +144,14 @@ func TestEveryBlockGetsItsOwnFile(t *testing.T) {
 func TestSameNameIsNeverOverwritten(t *testing.T) {
 	s, dir, _ := open(t, &fakeNode{})
 	now := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
-	first, f1, err := s.save(1, "abcd", []byte{1}, now)
+	first, err := s.save(1, "abcd", []byte{1}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f1.Close()
-	second, f2, err := s.save(1, "abcd", []byte{2}, now)
+	second, err := s.save(1, "abcd", []byte{2}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f2.Close()
 	if first == second {
 		t.Fatal("two blocks were saved under the same name")
 	}
@@ -553,4 +548,363 @@ func TestGivingUpWhileQueuedKeepsTheLastError(t *testing.T) {
 	if !strings.Contains(status, "connection refused") || strings.Contains(status, "behind") {
 		t.Fatalf("status %q does not name the node's unreachability", status)
 	}
+}
+
+// syncBuffer collects log output from several goroutines.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func captureLog(t *testing.T) *syncBuffer {
+	t.Helper()
+	out := &syncBuffer{}
+	log.SetOutput(out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return out
+}
+
+// A bug hit while submitting is retried like a connection that failed, and
+// leaves the submission slot free for the next block.
+func TestPanicWhileSubmittingIsRetried(t *testing.T) {
+	logs := captureLog(t)
+	var calls atomic.Int64
+	node := submitFunc(func(context.Context, []byte) (string, error) {
+		if calls.Add(1) <= maxSubmissions {
+			panic("bug in the RPC client")
+		}
+		return "", nil
+	})
+	s, err := Open(t.TempDir(), node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.retryEvery = time.Millisecond
+	for i := range 2 {
+		s.Found(int64(100+i), fmt.Sprintf("%064x", i), []byte{byte(i)}, "rig")
+	}
+	s.Wait()
+	for _, r := range s.Records() {
+		if r.Status != "accepted" {
+			t.Fatalf("block %s: %q", r.Hash, r.Status)
+		}
+	}
+	if n := calls.Load(); n != maxSubmissions+2 {
+		t.Fatalf("%d attempts, want %d", n, maxSubmissions+2)
+	}
+	if out := logs.String(); !strings.Contains(out, "ERROR: submitting a found block failed: bug in the RPC client") ||
+		!strings.Contains(out, "internal error: bug in the RPC client. Retrying.") {
+		t.Fatalf("log:\n%s", out)
+	}
+}
+
+// A bug hit while saving costs the file, never the block: it is submitted
+// from memory, as when the disk refuses it.
+func TestPanicWhileSavingStillSubmits(t *testing.T) {
+	logs := captureLog(t)
+	node := &fakeNode{}
+	s, dir, accepted := open(t, node)
+	s.create = func(string) (*os.File, error) { panic("bug in the disk code") }
+	s.Found(100, "aa", []byte{1, 2}, "rig")
+	s.Wait()
+	records := s.Records()
+	if node.calls != 1 || accepted.Load() != 1 || len(records) != 1 || records[0].Status != "accepted" || records[0].File != "" {
+		t.Fatalf("calls %d, accepted %d, records %+v", node.calls, accepted.Load(), records)
+	}
+	if len(hexFiles(t, dir)) != 0 {
+		t.Fatal("a block file was written")
+	}
+	if out := logs.String(); !strings.Contains(out, "ERROR: saving a found block failed: bug in the disk code") {
+		t.Fatalf("log:\n%s", out)
+	}
+}
+
+// A block that could be neither saved nor delivered exists nowhere else, so
+// it is logged in full, ready to be submitted by hand.
+func TestBlockNeitherSavedNorDeliveredIsLogged(t *testing.T) {
+	logs := captureLog(t)
+	node := &fakeNode{failures: 1 << 30}
+	s, _, _ := open(t, node)
+	s.retryFor = 20 * time.Millisecond
+	s.create = func(string) (*os.File, error) { return nil, errors.New("disk full") }
+	s.Found(100, "aa", []byte{0xc0, 0xff, 0xee}, "rig")
+	s.Wait()
+	if status := s.Records()[0].Status; !strings.HasPrefix(status, "not submitted") {
+		t.Fatalf("status %q", status)
+	}
+	if out := logs.String(); !strings.Contains(out, "Block aa was neither saved nor delivered. To submit it by hand, run: bitcoin-cli submitblock c0ffee") {
+		t.Fatalf("log:\n%s", out)
+	}
+}
+
+// A bug hit after the node accepted the block changes nothing about the
+// block: it stays accepted, with its result file.
+func TestPanicAfterAcceptanceKeepsTheAnswer(t *testing.T) {
+	logs := captureLog(t)
+	node := &fakeNode{}
+	dir := filepath.Join(t.TempDir(), "blocks")
+	s, err := Open(dir, node, func() { panic("bug in the new work") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Found(100, "aa", []byte{1}, "rig")
+	s.Wait()
+	if status := s.Records()[0].Status; status != "accepted" {
+		t.Fatalf("status %q", status)
+	}
+	result, err := os.ReadFile(strings.TrimSuffix(hexFiles(t, dir)[0], ".hex") + ".result")
+	if err != nil || strings.TrimSpace(string(result)) != "accepted" {
+		t.Fatalf("result file %q, %v", result, err)
+	}
+	if out := logs.String(); !strings.Contains(out, "ERROR: delivering a found block failed: bug in the new work") {
+		t.Fatalf("log:\n%s", out)
+	}
+}
+
+// panicError hits a bug as soon as it is described.
+type panicError struct{}
+
+func (panicError) Error() string { panic("bug in describing an error") }
+
+// A bug hit anywhere in an attempt, not only in the call to the node, is a
+// failed attempt: it is retried within the same budget.
+func TestPanicAnywhereInAnAttemptIsRetried(t *testing.T) {
+	logs := captureLog(t)
+	node := &fakeNode{answers: []submitAnswer{{err: panicError{}}, {reason: ""}}}
+	s, dir, accepted := open(t, node)
+	s.Found(100, "aa", []byte{1}, "rig")
+	s.Wait()
+	if node.calls != 2 || accepted.Load() != 1 || s.Records()[0].Status != "accepted" {
+		t.Fatalf("calls %d, accepted %d, records %+v", node.calls, accepted.Load(), s.Records())
+	}
+	if result, err := os.ReadFile(strings.TrimSuffix(hexFiles(t, dir)[0], ".hex") + ".result"); err != nil || strings.TrimSpace(string(result)) != "accepted" {
+		t.Fatalf("result file %q, %v", result, err)
+	}
+	if out := logs.String(); !strings.Contains(out, "ERROR: submitting a found block failed: bug in describing an error") {
+		t.Fatalf("log:\n%s", out)
+	}
+}
+
+// panicOnLog is a log output that hits a bug on a line containing text, to
+// put a bug at a chosen place in the delivery.
+type panicOnLog struct {
+	text string
+	out  syncBuffer
+}
+
+func (p *panicOnLog) Write(b []byte) (int, error) {
+	if bytes.Contains(b, []byte(p.text)) {
+		panic("bug while logging")
+	}
+	return p.out.Write(b)
+}
+
+// A bug hit between two attempts, before the node has answered, ends the
+// delivery as not submitted and leaves the block without a result file, so
+// that the next start delivers it.
+func TestPanicBeforeTheAnswerLeavesTheBlockForTheNextStart(t *testing.T) {
+	out := &panicOnLog{text: "Retrying."}
+	log.SetOutput(out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	s, dir, accepted := open(t, &fakeNode{failures: 1})
+	s.Found(100, "aa", []byte{1}, "rig")
+	s.Wait()
+	within(t, "the file's goroutine to finish", s.files.Wait)
+	rec := s.Records()[0]
+	if rec.Status != "not submitted: internal error: bug while logging" || rec.File == "" || accepted.Load() != 0 {
+		t.Fatalf("record %+v, accepted %d", rec, accepted.Load())
+	}
+	if _, err := os.Stat(filepath.Join(dir, strings.TrimSuffix(rec.File, ".hex")+".result")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a result file was written: %v", err)
+	}
+	if strings.Contains(out.out.String(), "neither saved nor delivered") {
+		t.Fatalf("a saved block was reported as not saved:\n%s", out.out.String())
+	}
+
+	node := &fakeNode{}
+	again, err := Open(dir, node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again.Wait()
+	if node.calls != 1 || again.Records()[0].Status != "accepted" {
+		t.Fatalf("after a restart: %d calls, records %+v", node.calls, again.Records())
+	}
+}
+
+// within fails the test unless f returns. It is for calls that must never
+// wait: a broken version of them blocks forever.
+func within(t *testing.T, what string, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { defer close(done); f() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s blocked", what)
+	}
+}
+
+// A disk that never answers cannot hold a found block back: Found returns at
+// once, the node gets the block straight away, and the delivery finishes
+// without waiting for the file, so no result file is written.
+func TestStuckDiskDoesNotHoldUpTheBlock(t *testing.T) {
+	logs := captureLog(t)
+	submitted := make(chan struct{}, 1)
+	node := submitFunc(func(context.Context, []byte) (string, error) {
+		submitted <- struct{}{}
+		return "", nil
+	})
+	dir := t.TempDir()
+	s, err := Open(dir, node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.saveWait = 50 * time.Millisecond
+	stuck := make(chan struct{})
+	s.create = func(string) (*os.File, error) {
+		<-stuck
+		return nil, errors.New("the disk gave up")
+	}
+	within(t, "handing over a block", func() { s.Found(100, "aa", []byte{1}, "rig") })
+	select {
+	case <-submitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the node never got the block")
+	}
+	within(t, "finishing the delivery", s.Wait)
+	if rec := s.Records()[0]; rec.Status != "accepted" || rec.File != "" {
+		t.Fatalf("record %+v", rec)
+	}
+	if results, _ := filepath.Glob(filepath.Join(dir, "*.result")); len(results) != 0 {
+		t.Fatalf("result files %v", results)
+	}
+	if out := logs.String(); !strings.Contains(out, "WARNING: the disk has not finished with block aa within 50ms") {
+		t.Fatalf("log:\n%s", out)
+	}
+	close(stuck)
+	within(t, "the file's goroutine to finish", s.files.Wait)
+}
+
+// A slow disk does not delay a found block either. The node's answer is
+// written next to the file once the file is there.
+func TestSlowDiskDoesNotDelayTheBlock(t *testing.T) {
+	captureLog(t)
+	submitted := make(chan struct{}, 1)
+	node := submitFunc(func(context.Context, []byte) (string, error) {
+		submitted <- struct{}{}
+		return "", nil
+	})
+	dir := t.TempDir()
+	s, err := Open(dir, node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	create := s.create
+	s.create = func(path string) (*os.File, error) {
+		<-release
+		return create(path)
+	}
+	s.Found(100, "aa", []byte{1}, "rig")
+	select {
+	case <-submitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the block waited for the disk")
+	}
+	close(release)
+	within(t, "finishing the delivery", s.Wait)
+	rec := s.Records()[0]
+	if rec.Status != "accepted" || rec.File == "" {
+		t.Fatalf("record %+v", rec)
+	}
+	if result, err := os.ReadFile(filepath.Join(dir, strings.TrimSuffix(rec.File, ".hex")+".result")); err != nil || strings.TrimSpace(string(result)) != "accepted" {
+		t.Fatalf("result file %q, %v", result, err)
+	}
+}
+
+// A file that the disk finishes only well after the node's answer still gets
+// that answer next to it. Otherwise the next start would deliver the block
+// again, and a block that lost its race, answered "inconclusive", would come
+// back from the node as "duplicate" and be counted as accepted.
+func TestLateFileStillGetsTheAnswer(t *testing.T) {
+	captureLog(t)
+	node := &fakeNode{answers: []submitAnswer{{reason: "inconclusive"}, {reason: "duplicate"}}}
+	s, dir, _ := open(t, node)
+	s.saveWait = 10 * time.Millisecond
+	release := make(chan struct{})
+	create := s.create
+	s.create = func(path string) (*os.File, error) {
+		<-release
+		return create(path)
+	}
+	s.Found(100, "aa", []byte{1}, "rig")
+	within(t, "finishing the delivery", s.Wait)
+	if rec := s.Records()[0]; rec.Status != "rejected: inconclusive" || rec.File != "" {
+		t.Fatalf("record before the file is saved: %+v", rec)
+	}
+	close(release)
+	within(t, "the file's goroutine to finish", s.files.Wait)
+	rec := s.Records()[0]
+	if rec.File == "" {
+		t.Fatal("the late file was not recorded")
+	}
+	if result, err := os.ReadFile(filepath.Join(dir, strings.TrimSuffix(rec.File, ".hex")+".result")); err != nil || strings.TrimSpace(string(result)) != "rejected: inconclusive" {
+		t.Fatalf("result file %q, %v", result, err)
+	}
+
+	again, err := Open(dir, node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again.Wait()
+	if node.calls != 1 || again.Records()[0].Status != "rejected: inconclusive" {
+		t.Fatalf("after a restart: %d calls, records %+v", node.calls, again.Records())
+	}
+}
+
+// New work after an accepted block is asked for at once, whatever the disk
+// does.
+func TestNewWorkIsAskedForBeforeTheDiskIsDone(t *testing.T) {
+	captureLog(t)
+	refreshed := make(chan struct{}, 1)
+	s, err := Open(t.TempDir(), &fakeNode{}, func() { refreshed <- struct{}{} })
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.saveWait = time.Minute // what a delivery that waited for the disk first would wait
+	release := make(chan struct{})
+	create := s.create
+	s.create = func(path string) (*os.File, error) {
+		<-release
+		return create(path)
+	}
+	s.Found(100, "aa", []byte{1}, "rig")
+	select {
+	case <-refreshed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("asking for new work waited for the disk")
+	}
+	// The block has its answer: it is no longer counted as being delivered,
+	// though the disk is still busy with it.
+	for deadline := time.Now().Add(5 * time.Second); s.Pending() != 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("a block with its answer is still counted as being delivered")
+		}
+	}
+	close(release)
+	within(t, "finishing the delivery", s.Wait)
+	within(t, "the file's goroutine to finish", s.files.Wait)
 }

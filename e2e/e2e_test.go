@@ -638,17 +638,20 @@ func testConsecutiveBlocks(t *testing.T, image string) {
 		t.Fatalf("chain grew by %d blocks, want %d", got-start, count)
 	}
 
-	eventually(t, 10*time.Second, "all result files", func() bool {
+	// A block is saved while it is sent, so its file and the node's answer
+	// next to it can come a moment after the answer itself.
+	eventually(t, 10*time.Second, "all blocks accepted, saved, with their result files", func() bool {
 		st := b.status()
 		if len(st.Blocks) != count {
 			return false
 		}
 		for _, blk := range st.Blocks {
-			if blk.Status != "accepted" {
+			if blk.Status != "accepted" || blk.File == "" {
 				return false
 			}
 		}
-		return true
+		results, _ := filepath.Glob(filepath.Join(b.dir, "blocks", "*.result"))
+		return len(results) == count
 	})
 	files := b.blockFiles()
 	if len(files) != count {

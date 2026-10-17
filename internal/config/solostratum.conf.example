@@ -43,7 +43,8 @@ payout_address =
 # start_difficulty = 1024
 # min_difficulty = 0.001
 
-# Folder where every block you find is saved before it is sent to the node.
+# Folder where every block you find is saved, at the same time as it is sent
+# to the node.
 # blocks_dir = blocks
 
 # Folder for the permanent mining history: each worker's lifetime totals,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -12,13 +13,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/yorgof/solostratum/internal/config"
+	"github.com/yorgof/solostratum/internal/guard"
 	"github.com/yorgof/solostratum/internal/rpc"
+	"github.com/yorgof/solostratum/internal/stats"
 	"github.com/yorgof/solostratum/internal/work"
 )
 
@@ -187,7 +191,7 @@ func TestHealthcheck(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/api/status" {
+				if r.URL.Path != "/api/health" {
 					t.Errorf("unexpected path %q", r.URL.Path)
 				}
 				w.Write([]byte(tc.body))
@@ -303,6 +307,7 @@ func TestCommandFlags(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			args, flags, stdout, signals := os.Args, flag.CommandLine, os.Stdout, restoreSignals
+			logWriter, logFlags := log.Writer(), log.Flags()
 			r, w, err := os.Pipe()
 			if err != nil {
 				t.Fatal(err)
@@ -311,6 +316,8 @@ func TestCommandFlags(t *testing.T) {
 			defer w.Close()
 			t.Cleanup(func() {
 				os.Args, flag.CommandLine, os.Stdout, restoreSignals = args, flags, stdout, signals
+				log.SetOutput(logWriter)
+				log.SetFlags(logFlags)
 			})
 			os.Args = append([]string{"solostratum"}, tc.args...)
 			flag.CommandLine = flag.NewFlagSet("solostratum", flag.ContinueOnError)
@@ -320,6 +327,10 @@ func TestCommandFlags(t *testing.T) {
 			output, err := io.ReadAll(r)
 			if err != nil || strings.TrimSpace(string(output)) != tc.want {
 				t.Fatalf("output %q, error %v, want %q", output, err, tc.want)
+			}
+			// Nothing the program logs may hold it up (see guard.LogOutput).
+			if _, ok := log.Writer().(*guard.LogOutput); !ok {
+				t.Fatalf("main logs to %T, not through guard.LogOutput", log.Writer())
 			}
 		})
 	}
@@ -455,32 +466,35 @@ func TestFoundBlockIsDeliveredEvenWhenStartupFails(t *testing.T) {
 
 func TestGuardedContainsAPanic(t *testing.T) {
 	logs := captureLog(t)
-	guarded("The thing", func() { panic("boom") })
-	if out := logs.String(); !strings.Contains(out, "The thing failed (boom)") || !strings.Contains(out, "Mining is not affected") {
+	guarded("the thing", func() { panic("boom") })
+	if out := logs.String(); !strings.Contains(out, "ERROR: the thing failed: boom") ||
+		!strings.Contains(out, "WARNING: the thing has stopped until solostratum is restarted. Mining is not affected.") {
 		t.Fatalf("log:\n%s", out)
 	}
 	ran := false
-	guarded("The other thing", func() { ran = true })
+	guarded("the other thing", func() { ran = true })
 	if !ran {
 		t.Fatal("f was not run")
 	}
 }
 
 func TestSaveStatistics(t *testing.T) {
-	t.Run("writes after the writer has finished", func(t *testing.T) {
-		writer := make(chan struct{})
+	t.Run("writes after the writer and the miners' last reports", func(t *testing.T) {
+		writer, reports := make(chan struct{}), make(chan struct{})
 		flushed := make(chan struct{})
 		returned := make(chan struct{})
 		go func() {
-			saveStatistics(writer, func() { close(flushed) }, 5*time.Second)
+			saveStatistics(5*time.Second, func() { close(flushed) }, writer, reports)
 			close(returned)
 		}()
-		select {
-		case <-flushed:
-			t.Fatal("written before the writer's own last write")
-		case <-time.After(50 * time.Millisecond):
+		for _, ch := range []chan struct{}{writer, reports} {
+			select {
+			case <-flushed:
+				t.Fatal("written too early")
+			case <-time.After(50 * time.Millisecond):
+			}
+			close(ch)
 		}
-		close(writer)
 		for _, ch := range []chan struct{}{flushed, returned} {
 			select {
 			case <-ch:
@@ -491,13 +505,11 @@ func TestSaveStatistics(t *testing.T) {
 	})
 	t.Run("gives up on a stuck disk", func(t *testing.T) {
 		logs := captureLog(t)
-		writer := make(chan struct{})
-		close(writer)
 		stuck := make(chan struct{})
 		t.Cleanup(func() { close(stuck) })
 		returned := make(chan struct{})
 		go func() {
-			saveStatistics(writer, func() { <-stuck }, 100*time.Millisecond)
+			saveStatistics(100*time.Millisecond, func() { <-stuck })
 			close(returned)
 		}()
 		select {
@@ -509,10 +521,117 @@ func TestSaveStatistics(t *testing.T) {
 			t.Fatalf("log:\n%s", out)
 		}
 	})
-	t.Run("survives a panic", func(t *testing.T) {
-		captureLog(t)
-		writer := make(chan struct{})
-		close(writer)
-		saveStatistics(writer, func() { panic("boom") }, 5*time.Second)
+	t.Run("gives up on statistics that stopped answering", func(t *testing.T) {
+		logs := captureLog(t)
+		never := make(chan struct{})
+		returned := make(chan struct{})
+		go func() {
+			saveStatistics(100*time.Millisecond, func() {}, never)
+			close(returned)
+		}()
+		select {
+		case <-returned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("statistics that stopped answering held up the end of the program")
+		}
+		if out := logs.String(); !strings.Contains(out, "could not be saved within") {
+			t.Fatalf("log:\n%s", out)
+		}
 	})
+	t.Run("survives a panic", func(t *testing.T) {
+		logs := captureLog(t)
+		saveStatistics(5*time.Second, func() { panic("boom") })
+		if out := logs.String(); !strings.Contains(out, "WARNING: the statistics could not be saved (internal error: boom)") {
+			t.Fatalf("log:\n%s", out)
+		}
+	})
+}
+
+// The statistics folder is opened with a time limit. A folder that does not
+// answer, as on a mount that has hung, must not keep the miners waiting, nor
+// a stop request, and a bug in opening it makes it a folder that cannot be
+// used.
+func TestOpenStatisticsHasATimeLimit(t *testing.T) {
+	captureLog(t)
+	hung := make(chan struct{})
+	t.Cleanup(func() { close(hung) })
+	hang := func() (*stats.Store, error) {
+		<-hung
+		return nil, errors.New("too late")
+	}
+	call := func(ctx context.Context, open func() (*stats.Store, error)) (*stats.Store, error) {
+		t.Helper()
+		type result struct {
+			store *stats.Store
+			err   error
+		}
+		done := make(chan result, 1)
+		go func() {
+			store, err := openStatistics(ctx, open, 50*time.Millisecond)
+			done <- result{store, err}
+		}()
+		select {
+		case r := <-done:
+			return r.store, r.err
+		case <-time.After(5 * time.Second):
+			t.Fatal("opening the statistics did not return")
+			return nil, nil
+		}
+	}
+
+	if _, err := call(context.Background(), hang); err == nil || !strings.Contains(err.Error(), "did not answer within 50ms") {
+		t.Fatalf("a folder that hangs: %v", err)
+	}
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := call(stopped, hang); err == nil || !strings.Contains(err.Error(), "stopped while waiting") {
+		t.Fatalf("a stop request: %v", err)
+	}
+	if _, err := call(context.Background(), func() (*stats.Store, error) { panic("bug in opening") }); err == nil || !strings.Contains(err.Error(), "internal error: bug in opening") {
+		t.Fatalf("a bug: %v", err)
+	}
+	broken := errors.New("not a folder")
+	if _, err := call(context.Background(), func() (*stats.Store, error) { return nil, broken }); err != broken {
+		t.Fatalf("an unusable folder: %v", err)
+	}
+	if store, err := call(context.Background(), func() (*stats.Store, error) { return stats.Open(t.TempDir()) }); err != nil || store == nil {
+		t.Fatalf("a usable folder: %v, %v", store, err)
+	}
+}
+
+// -check prints its verdict after the log, which a goroutine of its own
+// writes. With a single thread for goroutines, that goroutine only runs when
+// main waits, so without waiting for the log the verdict would come first.
+func TestCheckPrintsItsVerdictAfterTheLog(t *testing.T) {
+	node, _ := startupNode(t, "regtest")
+	path := settingsFile(t, node.URL, nil)
+	args, flags, stdout, stderr, signals := os.Args, flag.CommandLine, os.Stdout, os.Stderr, restoreSignals
+	logWriter, logFlags := log.Writer(), log.Flags()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	procs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() {
+		runtime.GOMAXPROCS(procs)
+		os.Args, flag.CommandLine, os.Stdout, os.Stderr, restoreSignals = args, flags, stdout, stderr, signals
+		log.SetOutput(logWriter)
+		log.SetFlags(logFlags)
+	})
+	output := make(chan string, 1)
+	go func() {
+		all, _ := io.ReadAll(r)
+		output <- string(all)
+	}()
+	os.Args = []string{"solostratum", "-config", path, "-check"}
+	flag.CommandLine = flag.NewFlagSet("solostratum", flag.ContinueOnError)
+	os.Stdout, os.Stderr = w, w
+	main()
+	w.Close()
+	out := <-output
+	logged, verdict := strings.Index(out, "Self-test passed"), strings.Index(out, "Everything looks good.")
+	if logged < 0 || verdict < logged {
+		t.Fatalf("the verdict did not come after the log:\n%s", out)
+	}
 }

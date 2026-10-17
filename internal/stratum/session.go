@@ -13,10 +13,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/yorgof/solostratum/internal/btc"
+	"github.com/yorgof/solostratum/internal/guard"
 	"github.com/yorgof/solostratum/internal/work"
 )
 
@@ -67,7 +69,11 @@ type session struct {
 	out       chan []byte
 	closeOnce sync.Once
 	done      chan struct{}
+	failed    atomic.Bool // the connection was closed because of a bug
 
+	// mu is held with defer wherever its holder calls out of the session, to
+	// the job source or to send a message: a panic there must not leave it
+	// held, since the manager's Broadcast and the status page take it too.
 	mu           sync.Mutex
 	subscribed   bool
 	authorized   bool
@@ -122,11 +128,34 @@ func (s *session) close() {
 	})
 }
 
-// run serves the connection until it closes.
+// run serves the connection until it closes. A panic while serving it is a
+// bug; it ends this connection only, never the program or another miner.
 func (s *session) run() {
 	defer s.close()
-	go s.writeLoop()
+	go func() {
+		if guard.Run("writing to a miner", s.writeLoop) != nil {
+			s.fail()
+		}
+	}()
+	if guard.Run("serving a miner", s.serve) != nil {
+		s.fail()
+	}
 
+	s.mu.Lock()
+	authorized, worker := s.authorized, s.worker
+	s.mu.Unlock()
+	if s.failed.Load() {
+		log.Printf("Miner %s was disconnected after an internal error. The other miners are not affected.", s.label())
+	} else if authorized {
+		log.Printf("Miner disconnected: %s", s.label())
+	}
+	if authorized && s.srv.stats != nil {
+		s.srv.stats.Disconnected(worker, time.Now())
+	}
+}
+
+// serve handles the miner's messages until the connection closes.
+func (s *session) serve() {
 	reader := bufio.NewReaderSize(s.conn, maxLineLength)
 	for {
 		timeout := loginTimeout
@@ -139,7 +168,7 @@ func (s *session) run() {
 			if errors.Is(err, bufio.ErrBufferFull) {
 				log.Printf("Miner %s sent an over-long message; disconnecting.", s.label())
 			}
-			break
+			return
 		}
 		var req request
 		if err := json.Unmarshal(line, &req); err != nil {
@@ -154,16 +183,12 @@ func (s *session) run() {
 		}
 		s.handle(&req)
 	}
+}
 
-	s.mu.Lock()
-	authorized, worker := s.authorized, s.worker
-	s.mu.Unlock()
-	if authorized {
-		log.Printf("Miner disconnected: %s", s.label())
-		if s.srv.stats != nil {
-			s.srv.stats.Disconnected(worker, time.Now())
-		}
-	}
+// fail ends a connection whose handling has hit a bug.
+func (s *session) fail() {
+	s.failed.Store(true)
+	s.close()
 }
 
 func (s *session) ready() bool {
@@ -297,10 +322,11 @@ func (s *session) handleConfigure(req *request, params []json.RawMessage) {
 
 func (s *session) handleSubscribe(req *request, params []json.RawMessage) {
 	client, _ := stringParam(params, 0)
+	client = cleanString(client, 64)
 	id := hex.EncodeToString(s.extranonce1[:])
 	s.mu.Lock()
 	s.subscribed = true
-	s.client = cleanString(client, 64)
+	s.client = client
 	ready := s.authorized
 	s.mu.Unlock()
 
@@ -358,9 +384,9 @@ func (s *session) handleAuthorize(req *request, params []json.RawMessage) {
 	if ready {
 		s.sendCurrentJob()
 	}
-	// Recorded after the first job is sent, so the statistics never delay it.
-	// The session handles one message at a time, so this still comes before
-	// any share the miner submits.
+	// Reports to the statistics are only queued (see queuedRecorder), so they
+	// never delay a miner. The session handles one message at a time, so this
+	// one still comes before any share the miner submits.
 	if s.srv.stats != nil {
 		s.srv.stats.Connected(user, time.Now())
 	}
@@ -377,10 +403,18 @@ func (s *session) handleSuggestDifficulty(req *request, params []json.RawMessage
 	d = max(d, s.srv.opts.MinDifficulty)
 	s.reply(req.ID, true, 0, "")
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.diff, s.floor = d, d
 	s.windowStart, s.windowShares = time.Now(), 0
 	s.announceDifficultyLocked()
-	s.mu.Unlock()
+}
+
+// announceDifficulty is announceDifficultyLocked for a caller that does not
+// hold s.mu.
+func (s *session) announceDifficulty() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.announceDifficultyLocked()
 }
 
 // announceDifficultyLocked tells the miner its difficulty if it changed.
@@ -528,8 +562,7 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 		s.mu.Unlock()
 		s.srv.rejected.Add(1)
 		s.reply(req.ID, nil, code, msg)
-		// Recorded after the answer: the statistics never delay a miner. A
-		// miner that has not logged in yet has no name to record it under.
+		// A miner that has not logged in yet has no name to record it under.
 		if s.srv.stats != nil && worker != "" {
 			s.srv.stats.Rejected(worker, time.Now())
 		}
@@ -667,12 +700,8 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	s.reply(req.ID, true, 0, "")
 
 	if changed {
-		s.mu.Lock()
-		s.announceDifficultyLocked()
-		s.mu.Unlock()
+		s.announceDifficulty()
 	}
-	// Recorded last: the miner has its answer and any new difficulty before
-	// the statistics are touched, so they can never delay it.
 	if s.srv.stats != nil {
 		s.srv.stats.Accepted(worker, now, credit, shareDiff)
 	}

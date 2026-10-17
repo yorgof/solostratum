@@ -173,6 +173,9 @@ type Store struct {
 	io    sync.Mutex
 	cache map[seriesKey]cachedSeries
 
+	// mu is held with defer around everything under it that does more than
+	// copy or set fields, so that a panic cannot leave it held: the
+	// recording, the status page and the last write still need it.
 	mu      sync.Mutex
 	totals  map[string]*Totals
 	changed bool                  // totals differ from the file on disk
@@ -426,23 +429,7 @@ func (s *Store) Series(now time.Time, span, step time.Duration) (Series, error) 
 		return c.series, nil
 	}
 
-	s.mu.Lock()
-	s.countAllOnlineLocked(now)
-	since := end
-	var known []Worker
-	for worker, t := range s.totals {
-		if t.FirstSeen.Before(since) {
-			since = t.FirstSeen
-		}
-		if !t.LastSeen.Before(end.Add(-recent)) {
-			known = append(known, Worker{worker, *t})
-		}
-	}
-	samples := make([]Sample, 0, len(s.pending))
-	for _, sample := range s.pending {
-		samples = append(samples, *sample)
-	}
-	s.mu.Unlock()
+	since, known, samples := s.seriesInput(now, end)
 	sort.Slice(known, func(i, j int) bool {
 		if !known[i].FirstSeen.Equal(known[j].FirstSeen) {
 			return known[i].FirstSeen.Before(known[j].FirstSeen)
@@ -507,6 +494,28 @@ func (s *Store) Series(now time.Time, span, step time.Duration) (Series, error) 
 	}
 	s.cache[key] = cachedSeries{end, out}
 	return out, nil
+}
+
+// seriesInput copies what Series needs from memory: when the statistics
+// begin, the workers seen recently, and the history not yet written.
+func (s *Store) seriesInput(now, end time.Time) (since time.Time, known []Worker, samples []Sample) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.countAllOnlineLocked(now)
+	since = end
+	for worker, t := range s.totals {
+		if t.FirstSeen.Before(since) {
+			since = t.FirstSeen
+		}
+		if !t.LastSeen.Before(end.Add(-recent)) {
+			known = append(known, Worker{worker, *t})
+		}
+	}
+	samples = make([]Sample, 0, len(s.pending))
+	for _, sample := range s.pending {
+		samples = append(samples, *sample)
+	}
+	return since, known, samples
 }
 
 func historyFile(month time.Time) string {
@@ -596,27 +605,7 @@ func (s *Store) Flush(now time.Time) { s.flush(now, true) }
 func (s *Store) flush(now time.Time, final bool) {
 	s.io.Lock()
 	defer s.io.Unlock()
-	s.mu.Lock()
-	s.countAllOnlineLocked(now)
-	current := now.UTC().Truncate(Interval)
-	var samples []Sample
-	for key, sample := range s.pending {
-		if final || sample.Time.Before(current) {
-			samples = append(samples, *sample)
-			delete(s.pending, key)
-		}
-	}
-	// Only a copy of the totals is taken under the lock. Encoding them takes
-	// milliseconds with many workers, and no miner should wait for that.
-	var snapshot map[string]Totals
-	if s.changed {
-		snapshot = make(map[string]Totals, len(s.totals))
-		for worker, t := range s.totals {
-			snapshot[worker] = *t
-		}
-		s.changed = false
-	}
-	s.mu.Unlock()
+	samples, snapshot := s.takeDue(now, final)
 	var totals []byte
 	if snapshot != nil {
 		var err error
@@ -632,22 +621,7 @@ func (s *Store) flush(now time.Time, final bool) {
 	if err != nil {
 		log.Printf("WARNING: could not write the mining history: %v", err)
 	}
-	// Only complete lines have reached disk. Merge everything else back
-	// without adding it to lifetime totals a second time; a miner may have
-	// recorded more work in the same interval while the write was running.
-	s.mu.Lock()
-	for _, sample := range unwritten {
-		key := sampleKey{sample.Time.Unix(), sample.Worker}
-		if pending := s.pending[key]; pending != nil {
-			pending.add(sample.Counts)
-		} else {
-			retained := sample
-			s.pending[key] = &retained
-		}
-	}
-	dropped := s.trimPendingLocked()
-	s.mu.Unlock()
-	if dropped > 0 {
+	if dropped := s.putBack(unwritten); dropped > 0 {
 		log.Printf("WARNING: the mining history could not be written for so long that its oldest %d samples have been dropped. The lifetime totals are not affected.", dropped)
 	}
 	if totals != nil {
@@ -659,6 +633,51 @@ func (s *Store) flush(now time.Time, final bool) {
 		}
 	}
 	s.saveBestShares()
+}
+
+// takeDue removes from the pending history the samples that flush writes
+// now, and copies the totals if they have changed. Only copies are taken
+// under the lock: encoding the totals takes milliseconds with many workers,
+// and the recording of new shares should not wait for that.
+func (s *Store) takeDue(now time.Time, final bool) (samples []Sample, totals map[string]Totals) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.countAllOnlineLocked(now)
+	current := now.UTC().Truncate(Interval)
+	for key, sample := range s.pending {
+		if final || sample.Time.Before(current) {
+			samples = append(samples, *sample)
+			delete(s.pending, key)
+		}
+	}
+	if s.changed {
+		totals = make(map[string]Totals, len(s.totals))
+		for worker, t := range s.totals {
+			totals[worker] = *t
+		}
+		s.changed = false
+	}
+	return samples, totals
+}
+
+// putBack returns the samples that did not reach disk as complete lines to
+// the pending history, without adding them to the lifetime totals a second
+// time: a miner may have recorded more work in the same interval while the
+// write was running. It returns how many of the oldest samples it had to
+// drop.
+func (s *Store) putBack(unwritten []Sample) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sample := range unwritten {
+		key := sampleKey{sample.Time.Unix(), sample.Worker}
+		if pending := s.pending[key]; pending != nil {
+			pending.add(sample.Counts)
+		} else {
+			retained := sample
+			s.pending[key] = &retained
+		}
+	}
+	return s.trimPendingLocked()
 }
 
 // trimPendingLocked forgets the oldest unwritten samples beyond maxPending

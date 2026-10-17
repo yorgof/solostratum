@@ -10,7 +10,8 @@ your address. No pool, no account, no fees.
   remote.
 - Checks your settings and your node before it starts, and tells you in
   plain words what is wrong.
-- Every block found is saved to disk before it is sent to the node.
+- Every block found is sent to the node at once and saved to disk at the
+  same time, so a slow disk cannot hold it back.
 - A simple status page shows your miners, hashrate and best shares, with
   charts of the last day, week and month.
 - The history of every miner is kept for good, in plain text files.
@@ -150,8 +151,11 @@ silently ignored.
 
 The status page and the history never come before mining. If either cannot
 start, solostratum logs a warning and mines without it; a failure in either
-while running is logged and does not touch the miners or the blocks. Only
-`-check`, which does not mine, reports an unusable `stats_dir` as an error.
+while running is logged and does not touch the miners or the blocks. The
+miners hand their shares to the history through a queue, so even a history
+that has stopped answering cannot hold them up: it loses those shares
+instead, and says so in the log. Only `-check`, which does not mine, reports
+an unusable `stats_dir` as an error.
 
 ### A different payout address per miner
 
@@ -242,14 +246,16 @@ longer own from the offline list, stop solostratum and remove its entry from
 
 ## When you find a block
 
-1. The complete block is written to the `blocks` folder, in its own file
-   named after its height, the time and its hash, for example
-   `block-900000-20260102T030405.000000006Z-0000...beef.hex`. Files are
-   never overwritten.
-2. Only then is it sent to your node. If the node cannot be reached, it is
-   retried every two seconds for thirty minutes.
-3. The node's answer is written next to it in a `.result` file and shown on
-   the status page.
+1. The block is sent to your node at once. If the node cannot be reached,
+   it is retried every two seconds for thirty minutes.
+2. At the same time the complete block is written to the `blocks` folder,
+   in its own file named after its height, the time and its hash, for
+   example `block-900000-20260102T030405.000000006Z-0000...beef.hex`. Files
+   are never overwritten. The block is saved and sent side by side, so a
+   slow or stuck disk cannot hold it back.
+3. The node's answer is shown on the status page at once, and written next
+   to the file in a `.result` file as soon as the file is saved, even if the
+   disk is slow to finish it.
 
 If everything else fails you can submit the block by hand:
 
@@ -257,11 +263,21 @@ If everything else fails you can submit the block by hand:
 bitcoin-cli submitblock "$(cat blocks/block-....hex)"
 ```
 
+A block that could not be saved is still sent to the node. If it cannot be
+delivered either, it is written in full to the log, as a ready
+`bitcoin-cli submitblock` command.
+
 ## How it stays correct
 
 - **At every start** solostratum builds a complete block from the node's
   current template and asks the node to validate it (everything except the
   proof of work). If the node objects, mining does not start.
+- **A bug stays where it happens.** It is logged with the details needed to
+  fix it, and ends only the work that hit it: one miner's connection, one
+  attempt to submit a block (which is then retried), one update of the work,
+  one request to the status page, or the statistics, which then switch off.
+  Statistics that stop answering, or a terminal that stops reading, cost
+  some statistics or log lines, never a share or a found block.
 - **Unit tests** check the Bitcoin building blocks against real mainnet
   blocks and the official address test vectors. They also cover startup,
   protocol errors, node outages, shutdown, disk-write recovery, and the CPU
@@ -308,7 +324,10 @@ docker run -d --name solostratum --restart unless-stopped \
 
 Inside a container `127.0.0.1` is the container itself, so `node_url` must
 use the node's real address. The image has a health check: Docker reports
-the container as unhealthy when it has no current work from the node.
+the container as unhealthy when it has no current work from the node. It
+reads `/api/health` on the status page, which reports the node's state and
+the number of miners and never waits for the statistics, so a problem with
+them cannot make it fail.
 
 ## Good to know
 
@@ -320,6 +339,10 @@ the container as unhealthy when it has no current work from the node.
   what Bitaxe uses. Stratum v2 is not supported.
 - **No payout splitting.** Each block pays one address. This is a personal
   solo-mining server, not a pool.
+- **The log never holds anything up.** When nothing reads solostratum's
+  output, for example in a terminal paused with Ctrl-S or a Windows console
+  in which text is being selected, log messages are dropped and the gap is
+  marked, while mining goes on.
 - Work is refreshed every 30 seconds to pick up new transactions, and
   immediately when a new block arrives.
 
