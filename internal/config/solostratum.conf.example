@@ -31,8 +31,8 @@ payout_address =
 
 # Status web page: http://<this computer's IP>:3334
 # Use 127.0.0.1:3334 to make it reachable from this computer only, or leave
-# the value empty to turn the page off. If the port cannot be opened the page
-# is left off and mining goes on.
+# the value empty to turn the page off. If the port is taken, mining goes on
+# without the page, and the port is tried again every 30 seconds.
 # status_listen = 0.0.0.0:3334
 
 # Short text written into blocks you find (at most 32 characters).

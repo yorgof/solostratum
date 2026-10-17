@@ -10,6 +10,10 @@
 // off the statistics. A panic that nothing recovers ends the whole program,
 // with every miner and any block that is being delivered.
 //
+// Go runs work that may hang, such as anything that touches the disk, on a
+// goroutine of its own, so that the code that wants it can stop waiting for
+// it after a time limit.
+//
 // Queue lets code that must never wait, such as a miner's connection, hand
 // work to code that might: the statistics, and the log output.
 package guard
@@ -36,6 +40,17 @@ func Run(what string, f func()) (err error) {
 	return nil
 }
 
+// Go runs f through Run on a goroutine of its own, and returns a channel that
+// receives Run's result once f has returned. The channel has room for it, so
+// a caller that stops waiting, after a time limit, leaves nothing stuck
+// behind: f still finishes whenever it can. Whatever f sets is safe to read
+// once its result has been received, and not before.
+func Go(what string, f func()) <-chan error {
+	done := make(chan error, 1)
+	go func() { done <- Run(what, f) }()
+	return done
+}
+
 // Queue runs the functions posted to it one at a time, in the order they
 // were posted, on a goroutine of its own. It is meant for work the program
 // can do without. Post never waits: a function that does not fit is
@@ -43,9 +58,8 @@ func Run(what string, f func()) (err error) {
 // or an output nobody reads, costs some of the queued work, never the time
 // of the code that posts it.
 //
-// A panic in a queued function is logged and switches the queue off: the
-// functions after it are dropped, since whatever they work on may have been
-// left broken.
+// A panic in a queued function is logged, and costs that function only. Work
+// that a panic may leave broken switches itself off, as the statistics do.
 type Queue struct {
 	what  string
 	funcs chan func()
@@ -79,6 +93,9 @@ func (q *Queue) Post(f func()) bool {
 	}
 }
 
+// Waiting returns how many functions are queued and not yet started.
+func (q *Queue) Waiting() int { return len(q.funcs) }
+
 // Close refuses further functions. Those already queued still run.
 func (q *Queue) Close() {
 	q.mu.Lock()
@@ -90,20 +107,13 @@ func (q *Queue) Close() {
 }
 
 // Done is closed once the queue is closed and every function queued before
-// has run or been dropped. A queued function that never returns keeps it
-// open, so wait for it with a time limit.
+// has run. A queued function that never returns keeps it open, so wait for
+// it with a time limit.
 func (q *Queue) Done() <-chan struct{} { return q.done }
 
 func (q *Queue) run() {
 	defer close(q.done)
-	off := false
 	for f := range q.funcs {
-		if off {
-			continue
-		}
-		if Run(q.what, f) != nil {
-			off = true
-			log.Printf("WARNING: %s is switched off until solostratum is restarted. Mining is not affected.", q.what)
-		}
+		Run(q.what, f)
 	}
 }

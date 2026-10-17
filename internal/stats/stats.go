@@ -34,7 +34,10 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/yorgof/solostratum/internal/guard"
 )
 
 // Interval is the length of one history interval, and how often the files
@@ -188,6 +191,8 @@ type Store struct {
 	bestSaved time.Time     // when the file was last written
 	bestGap   time.Duration // bestWriteGap; tests shorten it
 	bestWake  chan struct{} // the list has changed and wants writing
+
+	off atomic.Bool // switched off after a bug (see change)
 }
 
 // Open prepares the statistics folder, verifies it is writable and loads
@@ -238,50 +243,77 @@ func Open(dir string) (*Store, error) {
 // Accepted records an accepted share. credit is the difficulty the share
 // counts for, shareDiff the difficulty its hash actually reached.
 func (s *Store) Accepted(worker string, at time.Time, credit, shareDiff float64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.recordLocked(worker, at, Counts{Accepted: 1, Work: credit, BestShare: shareDiff})
-	// The list of the highest shares covers every worker, including one
-	// whose name is no longer recorded. Infinity would sort above every
-	// real share.
-	if shareDiff > 0 && shareDiff < math.Inf(1) {
-		s.noteBestLocked(worker, at, shareDiff)
-	}
+	s.change(func() {
+		s.recordLocked(worker, at, Counts{Accepted: 1, Work: credit, BestShare: shareDiff})
+		// The list of the highest shares covers every worker, including one
+		// whose name is no longer recorded. Infinity would sort above every
+		// real share.
+		if shareDiff > 0 && shareDiff < math.Inf(1) {
+			s.noteBestLocked(worker, at, shareDiff)
+		}
+	})
 }
 
 // Rejected records a rejected share.
 func (s *Store) Rejected(worker string, at time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.recordLocked(worker, at, Counts{Rejected: 1})
+	s.change(func() { s.recordLocked(worker, at, Counts{Rejected: 1}) })
 }
 
 // Connected records that a miner has logged in as worker.
 func (s *Store) Connected(worker string, at time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.recordLocked(worker, at, Counts{Connections: 1}) {
-		return
-	}
-	p := s.live[worker]
-	if p == nil {
-		p = &presence{since: at.UTC().Truncate(time.Second)}
-		s.live[worker] = p
-	}
-	p.sessions++
+	s.change(func() {
+		if !s.recordLocked(worker, at, Counts{Connections: 1}) {
+			return
+		}
+		p := s.live[worker]
+		if p == nil {
+			p = &presence{since: at.UTC().Truncate(time.Second)}
+			s.live[worker] = p
+		}
+		p.sessions++
+	})
 }
 
 // Disconnected records that one of the worker's connections has ended.
 func (s *Store) Disconnected(worker string, at time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p := s.live[worker]
-	if p == nil {
+	s.change(func() {
+		p := s.live[worker]
+		if p == nil {
+			return
+		}
+		if p.sessions--; p.sessions == 0 {
+			s.countOnlineLocked(worker, p, at)
+			delete(s.live, worker)
+		}
+	})
+}
+
+// change makes one change to the statistics, with mu held. A panic in it is
+// logged, and switches the statistics off (see offUnlessFinished).
+func (s *Store) change(f func()) {
+	if s.off.Load() {
 		return
 	}
-	if p.sessions--; p.sessions == 0 {
-		s.countOnlineLocked(worker, p, at)
-		delete(s.live, worker)
+	guard.Run("recording the statistics", func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		finished := false
+		defer s.offUnlessFinished(&finished)
+		f()
+		finished = true
+	})
+}
+
+// offUnlessFinished is deferred, with finished set as its last step, by the
+// code that changes or writes the statistics. Code that does not finish has
+// hit a bug, and may have left them half changed: they are switched off
+// until solostratum is restarted, before that code lets go of its locks.
+// From then on nothing is recorded or written, rather than numbers that are
+// wrong for good, such as the online time of a worker whose disconnection
+// was never counted. The files keep what they had.
+func (s *Store) offUnlessFinished(finished *bool) {
+	if !*finished && !s.off.Swap(true) {
+		log.Printf("WARNING: the statistics are switched off until solostratum is restarted, and nothing more is written to %s. Mining is not affected.", s.dir)
 	}
 }
 
@@ -601,10 +633,16 @@ func untilNextInterval(now time.Time) time.Duration {
 func (s *Store) Flush(now time.Time) { s.flush(now, true) }
 
 // flush writes the totals and every interval that has ended. The interval
-// still in progress is kept in memory, unless final is set.
+// still in progress is kept in memory, unless final is set. Statistics that
+// are switched off are not written.
 func (s *Store) flush(now time.Time, final bool) {
 	s.io.Lock()
 	defer s.io.Unlock()
+	if s.off.Load() {
+		return
+	}
+	finished := false
+	defer s.offUnlessFinished(&finished)
 	samples, snapshot := s.takeDue(now, final)
 	var totals []byte
 	if snapshot != nil {
@@ -633,6 +671,7 @@ func (s *Store) flush(now time.Time, final bool) {
 		}
 	}
 	s.saveBestShares()
+	finished = true
 }
 
 // takeDue removes from the pending history the samples that flush writes
@@ -642,6 +681,9 @@ func (s *Store) flush(now time.Time, final bool) {
 func (s *Store) takeDue(now time.Time, final bool) (samples []Sample, totals map[string]Totals) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.off.Load() {
+		return nil, nil // a change has just failed (see offUnlessFinished)
+	}
 	s.countAllOnlineLocked(now)
 	current := now.UTC().Truncate(Interval)
 	for key, sample := range s.pending {
@@ -859,7 +901,10 @@ func (s *Store) bestWriteDelay(now time.Time) time.Duration {
 func (s *Store) writeBestShares() {
 	s.io.Lock()
 	defer s.io.Unlock()
+	finished := false
+	defer s.offUnlessFinished(&finished)
 	s.saveBestShares()
+	finished = true
 }
 
 // saveBestShares replaces the best-share file with the list as it is now. The
@@ -867,7 +912,7 @@ func (s *Store) writeBestShares() {
 // changed, so the next checkpoint tries again; nothing is queued.
 func (s *Store) saveBestShares() {
 	s.mu.Lock()
-	if !s.bestDirty {
+	if !s.bestDirty || s.off.Load() {
 		s.mu.Unlock()
 		return
 	}

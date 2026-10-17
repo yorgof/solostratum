@@ -1,18 +1,15 @@
 package work
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"log"
-	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/yorgof/solostratum/internal/logtest"
 	"github.com/yorgof/solostratum/internal/rpc"
 )
 
@@ -164,36 +161,10 @@ func TestSelfTestRPCFailures(t *testing.T) {
 	}
 }
 
-// syncBuffer collects log output from several goroutines.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-func captureLog(t *testing.T) *syncBuffer {
-	t.Helper()
-	out := &syncBuffer{}
-	log.SetOutput(out)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-	return out
-}
-
 // A bug hit while updating the work counts as a failed update: it is
 // reported like a node problem, and the next update tries again.
 func TestPanicUpdatingTheWorkIsAFailedUpdate(t *testing.T) {
-	logs := captureLog(t)
+	logs := logtest.Capture(t)
 	var broken atomic.Bool
 	var templates atomic.Int32
 	node := loopNode{
@@ -246,7 +217,7 @@ func TestPanicUpdatingTheWorkIsAFailedUpdate(t *testing.T) {
 // A bug hit in the long poll counts as a failed long poll. The regular
 // updates go on, and the node is not shown as having a problem.
 func TestPanicInTheLongPollIsContained(t *testing.T) {
-	logs := captureLog(t)
+	logs := logtest.Capture(t)
 	var templates atomic.Int32
 	polled := make(chan struct{}, 1)
 	node := loopNode{
@@ -307,7 +278,7 @@ func within(t *testing.T, what string, f func()) {
 // A bug hit while the manager's lock is held must not leave it held: every
 // miner, the broadcast of new work and the health check need it.
 func TestPanicUnderTheManagerLockReleasesIt(t *testing.T) {
-	captureLog(t)
+	logtest.Capture(t)
 	var templates atomic.Int32
 	node := loopNode{template: func(context.Context, string) (*rpc.BlockTemplate, error) {
 		n := templates.Add(1)

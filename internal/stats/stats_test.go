@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yorgof/solostratum/internal/logtest"
 )
 
 func open(t *testing.T, dir string) *Store {
@@ -1104,23 +1107,27 @@ loop:
 	}
 }
 
-// A panic in the statistics, whether recovered by the statistics' own queue,
-// by the guard around the writer or by the status page's web server, must
-// not leave them locked: the recording, the status page and the last write
-// still need both of their locks.
+// A panic in the statistics, whether recovered by the recording itself, by
+// the guard around the writer or by the status page's web server, must not
+// leave them locked: the recording, the status page and the last write still
+// need both of their locks. A panic in a change or a write switches them off;
+// one in reading them, for a chart, does not.
 func TestPanicDoesNotLeaveTheStatisticsLocked(t *testing.T) {
+	logtest.Capture(t)
 	now := time.Now()
 	for _, tc := range []struct {
-		name string
-		bug  func(s *Store) // breaks the store; called with s.mu held
-		call func(s *Store) // then panics
+		name      string
+		bug       func(s *Store) // breaks the store; called with s.mu held
+		call      func(s *Store) // then panics
+		recording bool           // the store recovers the panic itself (see change)
+		off       bool           // the panic switches the statistics off
 	}{
-		{"writing", func(s *Store) { s.live["rig"] = nil }, func(s *Store) { s.Flush(now) }},
-		{"charting", func(s *Store) { s.live["rig"] = nil }, func(s *Store) { s.Series(now, 24*time.Hour, 15*time.Minute) }},
-		{"an accepted share", func(s *Store) { s.totals = nil }, func(s *Store) { s.Accepted("new", now, 1, 1) }},
-		{"a rejected share", func(s *Store) { s.totals = nil }, func(s *Store) { s.Rejected("new", now) }},
-		{"a connection", func(s *Store) { s.totals = nil }, func(s *Store) { s.Connected("new", now) }},
-		{"a disconnection", func(s *Store) { s.totals = nil }, func(s *Store) { s.Disconnected("rig", now.Add(10*time.Minute)) }},
+		{"writing", func(s *Store) { s.live["rig"] = nil }, func(s *Store) { s.Flush(now) }, false, true},
+		{"charting", func(s *Store) { s.live["rig"] = nil }, func(s *Store) { s.Series(now, 24*time.Hour, 15*time.Minute) }, false, false},
+		{"an accepted share", func(s *Store) { s.totals = nil }, func(s *Store) { s.Accepted("new", now, 1, 1) }, true, true},
+		{"a rejected share", func(s *Store) { s.totals = nil }, func(s *Store) { s.Rejected("new", now) }, true, true},
+		{"a connection", func(s *Store) { s.totals = nil }, func(s *Store) { s.Connected("new", now) }, true, true},
+		{"a disconnection", func(s *Store) { s.totals = nil }, func(s *Store) { s.Disconnected("rig", now.Add(10*time.Minute)) }, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := open(t, t.TempDir())
@@ -1130,12 +1137,15 @@ func TestPanicDoesNotLeaveTheStatisticsLocked(t *testing.T) {
 			s.mu.Unlock()
 			func() {
 				defer func() {
-					if recover() == nil {
-						t.Fatal("the broken state did not cause a panic")
+					if r := recover(); (r == nil) != tc.recording {
+						t.Fatalf("the broken state caused a panic: %v; one was expected: %v", r, !tc.recording)
 					}
 				}()
 				tc.call(s)
 			}()
+			if s.off.Load() != tc.off {
+				t.Fatalf("switched off: %v", s.off.Load())
+			}
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
@@ -1155,4 +1165,60 @@ func TestPanicDoesNotLeaveTheStatisticsLocked(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A bug while recording switches the statistics off: they record and write
+// nothing more. Kept on, they would count a worker whose disconnection was
+// lost as online until the next restart, and write that to disk.
+func TestBugWhileRecordingSwitchesTheStatisticsOff(t *testing.T) {
+	logs := logtest.Capture(t)
+	dir := t.TempDir()
+	s := open(t, dir)
+	start := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	s.Connected("rig", start)
+	s.Accepted("rig", start.Add(time.Minute), 1, 1)
+	s.Flush(start.Add(2 * time.Minute))
+	before := readFiles(t, dir)
+
+	s.mu.Lock()
+	totals := s.totals
+	s.totals = nil
+	s.mu.Unlock()
+	s.Accepted("new", start.Add(3*time.Minute), 1, 1) // panics inside, and is recovered there
+	s.mu.Lock()
+	s.totals = totals
+	s.mu.Unlock()
+	s.Accepted("rig", start.Add(4*time.Minute), 1, 1e9)
+	s.Disconnected("rig", start.Add(5*time.Minute))
+	s.Flush(start.Add(time.Hour))
+	s.writeBestShares()
+
+	if after := readFiles(t, dir); !maps.Equal(before, after) {
+		t.Fatalf("switched-off statistics changed the files:\nbefore %v\nafter  %v", before, after)
+	}
+	if best := s.BestShares(); len(best) != 1 || best[0].Difficulty != 1 {
+		t.Fatalf("best shares %+v: a share was recorded after the bug", best)
+	}
+	if out := logs.String(); strings.Count(out, "WARNING: the statistics are switched off until solostratum is restarted") != 1 ||
+		!strings.Contains(out, "ERROR: recording the statistics failed: assignment to entry in nil map") {
+		t.Fatalf("log:\n%s", out)
+	}
+}
+
+// readFiles returns the contents of every file in dir, by name.
+func readFiles(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{}
+	for _, e := range entries {
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[e.Name()] = string(raw)
+	}
+	return files
 }

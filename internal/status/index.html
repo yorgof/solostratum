@@ -93,12 +93,15 @@
   #summary-box, #best-box { margin-top: 10px; }
   h2 .quiet { text-transform: none; letter-spacing: 0; font-weight: 500; margin-left: 8px; }
   @media (max-width: 1020px) {
-    /* Rank and worker share the title row; the general rule would let the rank span the card. */
-    #best-shares tr { grid-template-columns: auto repeat(auto-fit, minmax(120px, 1fr)); }
+    /* Rank and worker share the title row (the general rule would let the rank
+       span the card), and the share and its time go under the worker. */
+    #best-shares tr { grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr); }
     #best-shares td.rank { grid-column: 1; grid-row: 1; font-size: 15px; font-weight: 600; }
     #best-shares td.rank::before { content: none; }
     #best-shares td.who { grid-column: 2 / -1; grid-row: 1; font-size: 15px; font-weight: 600; align-self: center; }
     #best-shares td.who::before { content: none; }
+    #best-shares td.share { grid-column: 2; }
+    #best-shares td.when { grid-column: 3; }
   }
   #summary tr.total td { color: var(--dim); }
 </style>
@@ -387,8 +390,8 @@ function render(r) {
     const row = bestBody.insertRow();
     cell(row, String(i + 1), "num rank");
     workerCell(row, b.worker, b.worker).classList.add("who");
-    cell(row, fmtDiff(b.bestShare), "num");
-    cell(row, new Date(b.t).toLocaleString());
+    cell(row, fmtDiff(b.bestShare), "num share");
+    cell(row, new Date(b.t).toLocaleString(), "when");
     label($("best-shares"), row);
   });
   $("best-shares").hidden = !best.length;

@@ -88,7 +88,8 @@ your address. No pool, no account, no fees.
    fallback, and they come back by themselves afterwards.
 
 To only verify your settings and node without starting, run
-`./solostratum -check`.
+`./solostratum -check`. It leaves the found blocks alone, so it is safe to
+run next to a solostratum that is mining.
 
 ## Setting up the node
 
@@ -139,7 +140,7 @@ All settings live in `solostratum.conf`, next to the program. Use
 | `node_cookie_file` | –                 | Alternative to the login for a local node. |
 | `payout_address`   | –                 | Where block rewards go. Any address type. |
 | `stratum_listen`   | `0.0.0.0:3333`    | Where miners connect. |
-| `status_listen`    | `0.0.0.0:3334`    | Status page. Empty turns it off; `127.0.0.1:3334` makes it local only. If the port cannot be opened, there is no page during that run. |
+| `status_listen`    | `0.0.0.0:3334`    | Status page. Empty turns it off; `127.0.0.1:3334` makes it local only. If the port is taken, mining goes on without the page, and the port is tried again every 30 seconds. |
 | `coinbase_tag`     | `/solostratum/`   | Short text written into blocks you find. |
 | `start_difficulty` | `1024`            | Share difficulty for a new miner. Adjusts automatically. |
 | `min_difficulty`   | `0.001`           | Lowest share difficulty. |
@@ -154,8 +155,10 @@ start, solostratum logs a warning and mines without it; a failure in either
 while running is logged and does not touch the miners or the blocks. The
 miners hand their shares to the history through a queue, so even a history
 that has stopped answering cannot hold them up: it loses those shares
-instead, and says so in the log. Only `-check`, which does not mine, reports
-an unusable `stats_dir` as an error.
+instead, and says so in the log, when it starts and when it ends. A bug in
+the history switches it off until solostratum is restarted: from then on it
+writes nothing, rather than numbers that are wrong. Only `-check`, which
+does not mine, reports an unusable `stats_dir` as an error.
 
 ### A different payout address per miner
 
@@ -263,9 +266,17 @@ If everything else fails you can submit the block by hand:
 bitcoin-cli submitblock "$(cat blocks/block-....hex)"
 ```
 
-A block that could not be saved is still sent to the node. If it cannot be
-delivered either, it is written in full to the log, as a ready
-`bitcoin-cli submitblock` command.
+A block that could not be saved is still sent to the node. It is also
+written in full to the log, as a ready `bitcoin-cli submitblock` command,
+and so is a block that the disk has not taken within five seconds, so that
+not even a crash can lose it.
+
+When solostratum stops while a block is still being delivered, it waits for
+the node's answer (a second Ctrl-C quits anyway), and gives a slow disk a
+few more seconds to finish the block's files. A block that is not on disk
+yet is first written in full to the log. A saved block that never got its
+answer is delivered again at the next start, if that comes within thirty
+minutes of finding it.
 
 ## How it stays correct
 
@@ -327,7 +338,9 @@ use the node's real address. The image has a health check: Docker reports
 the container as unhealthy when it has no current work from the node. It
 reads `/api/health` on the status page, which reports the node's state and
 the number of miners and never waits for the statistics, so a problem with
-them cannot make it fail.
+them cannot make it fail. If the status port is taken when solostratum
+starts, the check fails until solostratum gets the port, which it tries
+every 30 seconds.
 
 ## Good to know
 

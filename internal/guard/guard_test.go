@@ -1,7 +1,6 @@
 package guard
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -11,33 +10,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/yorgof/solostratum/internal/logtest"
 )
-
-// syncBuffer collects output from several goroutines.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-func captureLog(t *testing.T) *syncBuffer {
-	t.Helper()
-	out := &syncBuffer{}
-	log.SetOutput(out)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-	return out
-}
 
 // within fails the test unless f returns. It is for calls that must never
 // wait: a broken version of them blocks forever.
@@ -62,7 +37,7 @@ func wait(t *testing.T, ch <-chan struct{}, what string) {
 }
 
 func TestRunTurnsAPanicIntoAnError(t *testing.T) {
-	logs := captureLog(t)
+	logs := logtest.Capture(t)
 	err := Run("doing the thing", func() { panic("boom") })
 	if err == nil || err.Error() != "internal error: boom" {
 		t.Fatalf("error %v, want the panic as an error", err)
@@ -131,10 +106,9 @@ func TestQueueNeverWaits(t *testing.T) {
 	q.Close() // a second Close is harmless
 }
 
-// A panic is logged once and switches the queue off: what the functions work
-// on may have been left broken.
-func TestQueueSwitchesOffAfterAPanic(t *testing.T) {
-	logs := captureLog(t)
+// A panic is logged and costs the function that raised it, nothing more.
+func TestQueueCarriesOnAfterAPanic(t *testing.T) {
+	logs := logtest.Capture(t)
 	q := NewQueue("counting things", 10)
 	var ran []string
 	q.Post(func() { ran = append(ran, "before") })
@@ -142,16 +116,58 @@ func TestQueueSwitchesOffAfterAPanic(t *testing.T) {
 	q.Post(func() { ran = append(ran, "after") })
 	q.Close()
 	wait(t, q.Done(), "the queue to finish")
-	if fmt.Sprint(ran) != "[before]" {
-		t.Fatalf("ran %v, want only the function before the panic", ran)
+	if fmt.Sprint(ran) != "[before after]" {
+		t.Fatalf("ran %v, want the functions before and after the panic", ran)
 	}
-	out := logs.String()
-	if !strings.Contains(out, "ERROR: counting things failed: boom") || !strings.Contains(out, "WARNING: counting things is switched off until solostratum is restarted") {
+	if out := logs.String(); strings.Count(out, "ERROR: counting things failed: boom") != 1 {
 		t.Fatalf("log:\n%s", out)
 	}
-	if strings.Count(out, "ERROR:") != 1 {
-		t.Fatalf("the failure was reported more than once:\n%s", out)
+}
+
+func TestQueueWaiting(t *testing.T) {
+	q := NewQueue("testing", 5)
+	entered, release := make(chan struct{}), make(chan struct{})
+	q.Post(func() { close(entered); <-release })
+	wait(t, entered, "the first function to start")
+	for range 3 {
+		q.Post(func() {})
 	}
+	if n := q.Waiting(); n != 3 {
+		t.Fatalf("%d waiting, want 3: the one under way does not count", n)
+	}
+	close(release)
+	q.Close()
+	wait(t, q.Done(), "the queue to finish")
+	if n := q.Waiting(); n != 0 {
+		t.Fatalf("%d waiting after the queue finished", n)
+	}
+}
+
+// Go returns at once, and its result can be waited for or not.
+func TestGo(t *testing.T) {
+	logs := logtest.Capture(t)
+	release := make(chan struct{})
+	var set int
+	done := Go("doing the thing", func() { <-release; set = 1 })
+	select {
+	case <-done:
+		t.Fatal("the result came before f returned")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil || set != 1 {
+		t.Fatalf("error %v, set %d", err, set)
+	}
+	if err := <-Go("doing the other thing", func() { panic("boom") }); err == nil || err.Error() != "internal error: boom" {
+		t.Fatalf("a panic: %v", err)
+	}
+	if out := logs.String(); !strings.Contains(out, "ERROR: doing the other thing failed: boom") {
+		t.Fatalf("log:\n%s", out)
+	}
+	// Nobody waits for this one: it still finishes, without anything stuck.
+	finished := make(chan struct{})
+	Go("doing it unwatched", func() { close(finished) })
+	wait(t, finished, "the unwatched function to finish")
 }
 
 // blockedOutput takes nothing until it is released, like a terminal paused
@@ -160,7 +176,7 @@ type blockedOutput struct {
 	entered chan struct{} // closed when the first write starts
 	release chan struct{}
 	once    sync.Once
-	buf     syncBuffer
+	buf     logtest.Buffer
 }
 
 func newBlockedOutput() *blockedOutput {
@@ -206,7 +222,7 @@ func TestLogOutputNeverWaits(t *testing.T) {
 		t.Fatalf("the queued messages are not in order: %q, %q, %q", lines[0], lines[1], lines[logQueueSize])
 	}
 	// The gap is marked where it happened.
-	if note := lines[logQueueSize+1]; !strings.HasSuffix(note, "(5 log messages were lost here because the log output was blocked)") {
+	if note := lines[logQueueSize+1]; !strings.HasSuffix(note, "(5 log messages were lost here because the log output did not take them)") {
 		t.Fatalf("note %q", note)
 	}
 	if lines[logQueueSize+2] != "after" {
@@ -283,6 +299,71 @@ func TestLogOutputSurvivesAnOutputThatIsGone(t *testing.T) {
 	})
 	if calls, fails := out.calls.Load(), out.fails.Load(); calls != 3 || fails != 3 {
 		t.Fatalf("%d writes, %d of them failed; want 3 and 3", calls, fails)
+	}
+}
+
+// panickyOutput panics on the writes whose text contains bad.
+type panickyOutput struct {
+	bad   string
+	calls atomic.Int32
+	buf   logtest.Buffer
+}
+
+func (p *panickyOutput) Write(b []byte) (int, error) {
+	p.calls.Add(1)
+	if strings.Contains(string(b), p.bad) {
+		panic("bug in the output")
+	}
+	return p.buf.Write(b)
+}
+
+// A panic in the output costs that message only. The log goes on, and marks
+// the gap, for the line after it may be the last copy of a found block.
+func TestLogOutputSurvivesAPanicInTheOutput(t *testing.T) {
+	out := &panickyOutput{bad: "second"}
+	o := NewLogOutput(out)
+	for _, msg := range []string{"first\n", "second\n", "third\n"} {
+		o.Write([]byte(msg))
+		o.Flush(5 * time.Second) // so that the third message comes after the failed second one
+	}
+	o.Close(5 * time.Second)
+	lines := strings.Split(strings.TrimSuffix(out.buf.String(), "\n"), "\n")
+	if len(lines) != 3 || lines[0] != "first" || lines[2] != "third" ||
+		!strings.HasSuffix(lines[1], "(1 log messages were lost here because the log output did not take them)") {
+		t.Fatalf("output:\n%s", out.buf.String())
+	}
+}
+
+// A gap that has been noted is not counted again when the message after the
+// note fails as well.
+func TestLogOutputCountsEachLostMessageOnce(t *testing.T) {
+	out := &panickyOutput{bad: "second"}
+	o := NewLogOutput(out)
+	for _, msg := range []string{"second\n", "second\n", "third\n"} {
+		o.Write([]byte(msg))
+		o.Flush(5 * time.Second)
+	}
+	o.Close(5 * time.Second)
+	// The first "second" is lost; the note about it is written before the
+	// second "second", which is lost too; the note before "third" counts
+	// that one only.
+	got := out.buf.String()
+	if strings.Count(got, "(1 log messages were lost here") != 2 || !strings.HasSuffix(got, "third\n") {
+		t.Fatalf("output:\n%s", got)
+	}
+}
+
+// An output that panics on every message must not keep the log busy for
+// ever by reporting each panic to itself.
+func TestLogOutputThatAlwaysPanicsStaysQuiet(t *testing.T) {
+	out := &panickyOutput{bad: ""} // every text contains ""
+	o := NewLogOutput(out)
+	for range 3 {
+		o.Write([]byte("message\n"))
+	}
+	within(t, "closing a log whose output always panics", func() { o.Close(5 * time.Second) })
+	if n := out.calls.Load(); n != 3 {
+		t.Fatalf("%d writes, want one for each message", n)
 	}
 }
 

@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -16,13 +16,17 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/yorgof/solostratum/internal/blocks"
 	"github.com/yorgof/solostratum/internal/config"
 	"github.com/yorgof/solostratum/internal/guard"
+	"github.com/yorgof/solostratum/internal/logtest"
 	"github.com/yorgof/solostratum/internal/rpc"
 	"github.com/yorgof/solostratum/internal/stats"
+	"github.com/yorgof/solostratum/internal/status"
 	"github.com/yorgof/solostratum/internal/work"
 )
 
@@ -336,33 +340,6 @@ func TestCommandFlags(t *testing.T) {
 	}
 }
 
-// syncBuffer collects log output from several goroutines.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-// captureLog returns what the program logs until the test ends.
-func captureLog(t *testing.T) *syncBuffer {
-	t.Helper()
-	out := &syncBuffer{}
-	log.SetOutput(out)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-	return out
-}
-
 // Statistics and the status page are not worth stopping the mining for: a
 // problem with either is logged and the program starts without it.
 func TestStatisticsAndStatusPageAreOptional(t *testing.T) {
@@ -380,7 +357,7 @@ func TestStatisticsAndStatusPageAreOptional(t *testing.T) {
 		{"status port taken", map[string]string{"status_listen": taken.Addr().String()}, "WARNING: cannot serve the status page"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			logs := captureLog(t)
+			logs := logtest.Capture(t)
 			node, polling := startupNode(t, "regtest")
 			path := settingsFile(t, node.URL, tc.overrides)
 			if err := os.WriteFile(filepath.Join(filepath.Dir(path), "file"), nil, 0o600); err != nil {
@@ -464,8 +441,162 @@ func TestFoundBlockIsDeliveredEvenWhenStartupFails(t *testing.T) {
 	}
 }
 
+// -check does not mine, so it leaves a block from an earlier run alone: the
+// solostratum that is running may be delivering it at that very moment, and
+// -check would send it again and write its own answer next to it.
+func TestCheckLeavesUnansweredBlocksAlone(t *testing.T) {
+	logtest.Capture(t)
+	var submitted atomic.Int32
+	node, _ := startupNodeSubmitting(t, "regtest", func(string) { submitted.Add(1) })
+	blocksDir := t.TempDir()
+	name := "block-101-" + time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + strings.Repeat("ab", 32)
+	if err := os.WriteFile(filepath.Join(blocksDir, name+".hex"), []byte("00\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := settingsFile(t, node.URL, map[string]string{"blocks_dir": blocksDir})
+	if err := run(context.Background(), path, true); err != nil {
+		t.Fatal(err)
+	}
+	if n := submitted.Load(); n != 0 {
+		t.Fatalf("-check submitted %d blocks", n)
+	}
+	if _, err := os.Stat(filepath.Join(blocksDir, name+".result")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("-check wrote a result file: %v", err)
+	}
+}
+
+// heldNode answers a block only once release is closed.
+type heldNode struct{ release chan struct{} }
+
+func (n heldNode) SubmitBlock(context.Context, []byte) (string, error) {
+	<-n.release
+	return "", nil
+}
+
+// At the end, the message about the blocks still being delivered says
+// whether quitting would lose them, and logs in full those that would be.
+func TestFinishDeliveriesSaysWhetherQuittingLosesABlock(t *testing.T) {
+	for _, saved := range []bool{true, false} {
+		t.Run(map[bool]string{true: "saved", false: "not saved"}[saved], func(t *testing.T) {
+			logs := logtest.Capture(t)
+			node := heldNode{make(chan struct{})}
+			dir := filepath.Join(t.TempDir(), "blocks")
+			store, err := blocks.Open(dir, node, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !saved {
+				// The folder is gone, so saving the block fails.
+				if err := os.RemoveAll(dir); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(dir, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store.Found(100, "aa", []byte{0xc0, 0xff, 0xee}, "rig")
+			for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+				if store.Records()[0].File != "" || strings.Contains(logs.String(), "could not save the found block") {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the block was neither saved nor refused by the disk")
+				}
+			}
+			done := make(chan struct{})
+			go func() { defer close(done); finishDeliveries(store, dir) }()
+			for deadline := time.Now().Add(5 * time.Second); !strings.Contains(logs.String(), "Still delivering 1 found block(s)"); time.Sleep(time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatalf("no message about the block being delivered:\n%s", logs.String())
+				}
+			}
+			close(node.release)
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the delivery did not finish")
+			}
+			out := logs.String()
+			lost := strings.Contains(out, "Block aa could not be saved. To submit it by hand, run: bitcoin-cli submitblock c0ffee") &&
+				strings.Contains(out, "WARNING: 1 found block(s) are not saved in")
+			safe := strings.Contains(out, "Press Ctrl-C to quit anyway: they are saved in")
+			if lost == saved || safe != saved {
+				t.Fatalf("log:\n%s", out)
+			}
+		})
+	}
+}
+
+// A status port that is taken at the start is tried again until it is free:
+// the page, and the health check that reads it, then come up by themselves.
+func TestStatusPageWaitsForItsPort(t *testing.T) {
+	logs := logtest.Capture(t)
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := taken.Addr().String()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	src := status.Sources{
+		Node:   func() work.NodeState { return work.NodeState{Connected: true} },
+		Miners: func() int { return 2 },
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); serveStatusPage(ctx, nil, addr, src, 10*time.Millisecond) }()
+	time.Sleep(50 * time.Millisecond) // a few tries while the port is taken
+	taken.Close()
+
+	client := &http.Client{Timeout: time.Second}
+	var health status.Health
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		resp, err := client.Get("http://" + addr + "/api/health")
+		if err == nil {
+			err = json.NewDecoder(resp.Body).Decode(&health)
+			resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the status page never came up: %v", err)
+		}
+	}
+	if !health.Node.Connected || health.Miners != 2 {
+		t.Fatalf("health %+v", health)
+	}
+	// Several tries failed, all for the same reason, which is logged once.
+	if out := logs.String(); !strings.Contains(out, "Status page: http://127.0.0.1:") ||
+		strings.Count(out, "WARNING: still cannot serve the status page on "+addr) != 1 {
+		t.Fatalf("log:\n%s", out)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the status page did not stop")
+	}
+
+	// Asked to stop while still waiting for the port, it stops at once.
+	taken, err = net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	stopped, stop := context.WithCancel(context.Background())
+	stop()
+	gaveUp := make(chan struct{})
+	go func() { defer close(gaveUp); serveStatusPage(stopped, nil, taken.Addr().String(), src, time.Hour) }()
+	select {
+	case <-gaveUp:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting for the port kept the status page from stopping")
+	}
+}
+
 func TestGuardedContainsAPanic(t *testing.T) {
-	logs := captureLog(t)
+	logs := logtest.Capture(t)
 	guarded("the thing", func() { panic("boom") })
 	if out := logs.String(); !strings.Contains(out, "ERROR: the thing failed: boom") ||
 		!strings.Contains(out, "WARNING: the thing has stopped until solostratum is restarted. Mining is not affected.") {
@@ -504,7 +635,7 @@ func TestSaveStatistics(t *testing.T) {
 		}
 	})
 	t.Run("gives up on a stuck disk", func(t *testing.T) {
-		logs := captureLog(t)
+		logs := logtest.Capture(t)
 		stuck := make(chan struct{})
 		t.Cleanup(func() { close(stuck) })
 		returned := make(chan struct{})
@@ -522,7 +653,7 @@ func TestSaveStatistics(t *testing.T) {
 		}
 	})
 	t.Run("gives up on statistics that stopped answering", func(t *testing.T) {
-		logs := captureLog(t)
+		logs := logtest.Capture(t)
 		never := make(chan struct{})
 		returned := make(chan struct{})
 		go func() {
@@ -539,7 +670,7 @@ func TestSaveStatistics(t *testing.T) {
 		}
 	})
 	t.Run("survives a panic", func(t *testing.T) {
-		logs := captureLog(t)
+		logs := logtest.Capture(t)
 		saveStatistics(5*time.Second, func() { panic("boom") })
 		if out := logs.String(); !strings.Contains(out, "WARNING: the statistics could not be saved (internal error: boom)") {
 			t.Fatalf("log:\n%s", out)
@@ -552,7 +683,7 @@ func TestSaveStatistics(t *testing.T) {
 // a stop request, and a bug in opening it makes it a folder that cannot be
 // used.
 func TestOpenStatisticsHasATimeLimit(t *testing.T) {
-	captureLog(t)
+	logtest.Capture(t)
 	hung := make(chan struct{})
 	t.Cleanup(func() { close(hung) })
 	hang := func() (*stats.Store, error) {

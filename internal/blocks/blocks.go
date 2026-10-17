@@ -48,16 +48,18 @@ type Store struct {
 	// retry schedule for submissions that could not reach the node
 	retryEvery time.Duration
 	retryFor   time.Duration
-	saveWait   time.Duration // saveWait; tests shorten it
+	saveWait   time.Duration // see saveWait; tests shorten it
+	fileWait   time.Duration // see fileWait; tests shorten it
 
 	mu      sync.Mutex
 	records []Record
-	wg      sync.WaitGroup // the deliveries; the blocks' files are not counted (see track)
-	pending atomic.Int64   // deliveries without the node's answer yet
-	// files counts the goroutines that look after the blocks' files. Nothing
-	// in the program waits for them, as a stuck disk must hold nothing up;
-	// tests do, to see that none is left behind.
-	files sync.WaitGroup
+	// inFlight holds the blocks whose delivery is under way, by their index
+	// in records, so that one that exists only in memory can be written in
+	// full to the log (see logInFull).
+	inFlight map[int]*flight
+	wg       sync.WaitGroup // the deliveries, which never touch the disk
+	pending  atomic.Int64   // deliveries without the node's answer yet
+	files    sync.WaitGroup // the goroutines that look after the blocks' files
 	// Leave RPC capacity for template updates and node health checks, even
 	// when regtest miners find many blocks at once.
 	submitSlots chan struct{}
@@ -65,6 +67,12 @@ type Store struct {
 	// create makes a new block file; tests replace it to make saving fail or
 	// stall.
 	create func(path string) (*os.File, error)
+}
+
+// flight is a block whose delivery is under way.
+type flight struct {
+	block  []byte
+	logged bool // written in full to the log
 }
 
 const timeLayout = "20060102T150405.000000000Z"
@@ -76,12 +84,19 @@ const maxSubmissions = 2
 // them.
 const saveWait = 5 * time.Second
 
+// fileWait is how long Wait, at the end of the program, gives the disk to
+// finish the blocks' files once every delivery is over. Without the answer
+// next to it, a block is delivered again at the next start, and a block that
+// lost its race would then come back from the node as "duplicate" and be
+// counted as accepted.
+const fileWait = 10 * time.Second
+
 // statusUnknown marks a block from an earlier run whose result was never
 // recorded.
 const statusUnknown = "unknown"
 
 // Open prepares the blocks directory, verifies it is writable and loads the
-// blocks found by earlier runs.
+// blocks found by earlier runs. It delivers none of them: see Resume.
 func Open(dir string, node Submitter, onAccepted func()) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -95,7 +110,8 @@ func Open(dir string, node Submitter, onAccepted func()) (*Store, error) {
 
 	s := &Store{
 		dir: dir, node: node, onAccepted: onAccepted,
-		retryEvery: 2 * time.Second, retryFor: 30 * time.Minute, saveWait: saveWait,
+		retryEvery: 2 * time.Second, retryFor: 30 * time.Minute, saveWait: saveWait, fileWait: fileWait,
+		inFlight:    map[int]*flight{},
 		submitSlots: make(chan struct{}, maxSubmissions),
 		create: func(path string) (*os.File, error) {
 			return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
@@ -105,31 +121,44 @@ func Open(dir string, node Submitter, onAccepted func()) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	var loaded []Record
 	for _, e := range entries {
 		if r, ok := s.parseName(e.Name()); ok {
-			loaded = append(loaded, r)
+			s.records = append(s.records, r)
 		}
 	}
-	sort.Slice(loaded, func(i, j int) bool { return loaded[i].Time.Before(loaded[j].Time) })
-	for _, r := range loaded {
-		// A block without a result file was still being delivered when the
-		// program stopped. If it is recent enough to matter, try again.
-		if r.Status == statusUnknown && time.Since(r.Time) < s.retryFor {
-			if raw, err := os.ReadFile(filepath.Join(dir, r.File)); err == nil {
-				if block, err := hex.DecodeString(strings.TrimSpace(string(raw))); err == nil {
-					log.Printf("Resuming delivery of block %s found before the last shutdown.", r.Hash)
-					r.Status = "submitting"
-					s.track(r, strings.TrimSuffix(r.File, ".hex"), block)
-					continue
-				}
-			}
-		}
-		s.mu.Lock()
-		s.records = append(s.records, r)
-		s.mu.Unlock()
-	}
+	sort.Slice(s.records, func(i, j int) bool { return s.records[i].Time.Before(s.records[j].Time) })
 	return s, nil
+}
+
+// Resume delivers again each block from an earlier run that never got the
+// node's answer, if it was found recently enough to matter: within retryFor,
+// the time a delivery keeps trying. -check does not call it, as it does not
+// mine: a solostratum that is running may be delivering those very blocks.
+func (s *Store) Resume() {
+	s.mu.Lock()
+	var due []int
+	for i, r := range s.records {
+		if r.Status == statusUnknown && time.Since(r.Time) < s.retryFor {
+			due = append(due, i)
+		}
+	}
+	s.mu.Unlock()
+	for _, i := range due {
+		r := s.record(i)
+		raw, err := os.ReadFile(filepath.Join(s.dir, r.File))
+		var block []byte
+		if err == nil {
+			block, err = hex.DecodeString(strings.TrimSpace(string(raw)))
+		}
+		if err != nil {
+			log.Printf("WARNING: could not read block %s, found before the last shutdown, from %s: %v", r.Hash, r.File, err)
+			continue
+		}
+		log.Printf("Resuming delivery of block %s found before the last shutdown.", r.Hash)
+		r.Status = "submitting"
+		s.setStatus(i, r.Status)
+		s.start(i, r, strings.TrimSuffix(r.File, ".hex"), block)
+	}
 }
 
 // parseName recovers a record from "block-<height>-<time>-<hash>.hex".
@@ -167,33 +196,39 @@ func (s *Store) Records() []Record {
 // never touches the disk itself: the submission starts from memory, so a slow
 // or stuck disk cannot hold the block back.
 func (s *Store) Found(height int64, hash string, block []byte, worker string) {
-	s.track(Record{Time: time.Now().UTC(), Height: height, Hash: hash, Status: "submitting", Worker: worker}, "", block)
-}
-
-// track adds a record, then delivers its block and looks after its file in the
-// background, each on a goroutine of its own. base names the block's file if
-// it is saved already, as for a block resumed at the start.
-//
-// Only the delivery is counted in wg, and it never touches the disk, so Wait
-// cannot hang on a disk that has stopped. The file's goroutine saves the
-// block, and writes the node's answer next to it once both are there, however
-// late that is. The delivery waits for it up to saveWait after the answer, so
-// with a working disk the file and its answer are on disk when Wait returns.
-func (s *Store) track(rec Record, base string, block []byte) {
+	rec := Record{Time: time.Now().UTC(), Height: height, Hash: hash, Status: "submitting", Worker: worker}
 	s.mu.Lock()
 	s.records = append(s.records, rec)
 	index := len(s.records) - 1
 	s.mu.Unlock()
+	s.start(index, rec, "", block)
+}
 
-	answered := make(chan string, 1) // the node's answer; closed without one if there is none
-	filed := make(chan string, 1)    // the file's name, or "" if the block could not be saved
+// start delivers the block of records[index] and looks after its file in the
+// background, each on a goroutine of its own. base names the block's file if
+// it is saved already, as for a block resumed at the start.
+//
+// The delivery never touches the disk. The file's goroutine saves the block,
+// and writes the node's answer next to it once both are there, however late
+// that is. The delivery waits for it up to saveWait after the answer, and
+// Wait up to fileWait more, so with a working disk the file and its answer
+// are on disk when Wait returns. A block that the disk has not taken within
+// saveWait goes to the log in full, in case the program dies before its
+// delivery ends.
+func (s *Store) start(index int, rec Record, base string, block []byte) {
+	s.mu.Lock()
+	s.inFlight[index] = &flight{block: block}
+	s.mu.Unlock()
+	answered := make(chan string, 1) // the block's status; closed without one if there is none
 	s.files.Add(1)
-	go func() {
+	filed := guard.Go("saving a found block", func() {
 		defer s.files.Done()
-		var file string
-		guard.Run("saving a found block", func() { file = s.keep(index, rec, base, block, answered) })
-		filed <- file
-	}()
+		s.keep(index, rec, base, block, answered)
+	})
+	wait := s.saveWait
+	time.AfterFunc(wait, func() {
+		guard.Run("logging a found block", func() { s.logInFull(index, fmt.Sprintf("is not saved to disk after %s", wait)) })
+	})
 	s.pending.Add(1)
 	s.wg.Add(1)
 	go func() {
@@ -203,16 +238,16 @@ func (s *Store) track(rec Record, base string, block []byte) {
 }
 
 // keep looks after a block's file. It saves the block, unless base already
-// names its file, and once the delivery has the node's answer it writes that
-// answer next to the file. Without an answer, after an internal error, it
-// writes none, so that the next start delivers the block again. It returns
-// the file's name, or "" if the block could not be saved.
-func (s *Store) keep(index int, rec Record, base string, block []byte, answered <-chan string) string {
+// names its file, and once the delivery has the block's status it writes it
+// next to the file. A block that cannot be saved goes to the log in full at
+// once.
+func (s *Store) keep(index int, rec Record, base string, block []byte, answered <-chan string) {
 	if base == "" {
 		var err error
 		if base, err = s.save(rec.Height, rec.Hash, block, rec.Time); err != nil {
 			log.Printf("WARNING: could not save the found block to disk: %v", err)
-			return ""
+			s.logInFull(index, "could not be saved")
+			return
 		}
 		s.setFile(index, base+".hex")
 	}
@@ -221,42 +256,61 @@ func (s *Store) keep(index int, rec Record, base string, block []byte, answered 
 			log.Printf("Could not write the block result file: %v", err)
 		}
 	}
-	return base
 }
 
-// deliver submits the block, records the node's answer and hands it to the
-// block's file, and asks for new work after an accepted block. It never
-// touches the disk. A panic in it ends the delivery: an answer from the node
-// stands, and without one the block is left without a result file, so that
-// the next start delivers it again.
-func (s *Store) deliver(index int, hash string, block []byte, answered chan<- string, filed <-chan string) {
-	var status string // set once the node has answered or the delivery has given up
-	failed := guard.Run("delivering a found block", func() {
+// deliver submits the block, records its status and hands it to the block's
+// file, and asks for new work after an accepted block. It never touches the
+// disk. A panic before the node has answered is a bug, and the submission
+// starts again within the same retryFor: giving up could lose the block. A
+// panic after the answer changes nothing about it.
+func (s *Store) deliver(index int, hash string, block []byte, answered chan<- string, filed <-chan error) {
+	ctx, cancel := context.WithTimeout(context.Background(), s.retryFor)
+	defer cancel()
+	var status string  // the node's answer, or why the delivery gave up
+	var lastWhy string // why the submission last failed, if it did
+	for {
+		failed := guard.Run("delivering a found block", func() { status = s.submit(ctx, hash, block, lastWhy) })
+		if failed == nil {
+			break
+		}
+		lastWhy = failed.Error()
+		select {
+		case <-ctx.Done():
+		case <-time.After(s.retryEvery):
+		}
+		if ctx.Err() != nil {
+			log.Printf("Giving up submitting block %s: %s", hash, lastWhy)
+			status = "not submitted: " + lastWhy
+			break
+		}
+		log.Printf("Delivering block %s again.", hash)
+	}
+	guard.Run("delivering a found block", func() {
 		defer close(answered)
-		status = s.submit(hash, block)
 		s.setStatus(index, status)
 		answered <- status
 		if status == "accepted" && s.onAccepted != nil {
 			s.onAccepted()
 		}
 	})
-	if failed != nil && status == "" {
-		// The node may not have the block.
-		status = "not submitted: " + failed.Error()
-		s.setStatus(index, status)
-	}
 	s.pending.Add(-1)
-	var base string
 	select {
-	case base = <-filed:
+	case <-filed:
 	case <-time.After(s.saveWait):
 		log.Printf("WARNING: the disk has not finished with block %s within %s. Is it stuck? The block's file, and the node's answer next to it, are written as soon as it lets them.", hash, s.saveWait)
 	}
-	if base == "" && strings.HasPrefix(status, "not submitted") {
-		// The block is not on disk, or not yet: this is the last place it
-		// is known to exist.
-		log.Printf("Block %s was neither saved nor delivered. To submit it by hand, run: bitcoin-cli submitblock %x", hash, block)
+	if strings.HasPrefix(status, "not submitted") && !s.logInFull(index, "was neither saved nor delivered") && s.record(index).File == "" {
+		log.Printf("Block %s was neither saved nor delivered. It is written in full further up in the log, ready to be submitted by hand.", hash)
 	}
+	s.mu.Lock()
+	delete(s.inFlight, index)
+	s.mu.Unlock()
+}
+
+func (s *Store) record(index int) Record {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.records[index]
 }
 
 func (s *Store) setStatus(index int, status string) {
@@ -274,11 +328,65 @@ func (s *Store) setFile(index int, file string) {
 // Pending returns the number of blocks still being delivered to the node.
 func (s *Store) Pending() int { return int(s.pending.Load()) }
 
+// LogUnsaved writes to the log in full, ready to be submitted by hand, each
+// block whose delivery is under way and that exists only in memory (see
+// atRiskLocked), unless the log has it already. It returns how many such
+// blocks there are. The end of the program calls it first thing: quitting
+// before those deliveries end would otherwise lose the blocks, unless the
+// node has them already.
+func (s *Store) LogUnsaved() int {
+	s.mu.Lock()
+	var due []int
+	for i := range s.inFlight {
+		if s.atRiskLocked(i) {
+			due = append(due, i)
+		}
+	}
+	s.mu.Unlock()
+	for _, i := range due {
+		s.logInFull(i, "is not saved to disk yet")
+	}
+	return len(due)
+}
+
+// atRiskLocked reports whether the block of records[index] exists only in
+// memory: it is not on disk, and the node has not settled it, as it has when
+// it accepted or rejected it. s.mu must be held.
+func (s *Store) atRiskLocked(index int) bool {
+	r := s.records[index]
+	return r.File == "" && (r.Status == "submitting" || strings.HasPrefix(r.Status, "not submitted"))
+}
+
+// logInFull writes the block of records[index] to the log, ready to be
+// submitted by hand, if its delivery is under way, it exists only in memory
+// and the log does not have it yet. why says what is the matter with it. It
+// reports whether it wrote the block.
+func (s *Store) logInFull(index int, why string) bool {
+	s.mu.Lock()
+	f := s.inFlight[index]
+	if f == nil || f.logged || !s.atRiskLocked(index) {
+		s.mu.Unlock()
+		return false
+	}
+	f.logged = true
+	hash := s.records[index].Hash
+	s.mu.Unlock()
+	log.Printf("Block %s %s. To submit it by hand, run: bitcoin-cli submitblock %x", hash, why, f.block)
+	return true
+}
+
 // Wait blocks until every delivery has finished, which includes waiting a
 // bounded time for each block's file and the node's answer next to it (see
-// track). Callers must finish handing off blocks through Found before calling
-// Wait.
-func (s *Store) Wait() { s.wg.Wait() }
+// start). It then gives the disk up to fileWait more to finish them. Callers
+// must finish handing off blocks through Found before calling Wait.
+func (s *Store) Wait() {
+	s.wg.Wait()
+	select {
+	case <-guard.Go("waiting for the found blocks' files", s.files.Wait):
+	case <-time.After(s.fileWait):
+		log.Printf("WARNING: the disk has not finished the found blocks' files within %s. Quitting anyway: a block whose file has no result next to it is delivered again at the next start.", s.fileWait)
+	}
+}
 
 // save writes the block as hex to a new file that is never overwritten, and
 // forces it onto the disk. The name carries the height, the time to the
@@ -311,34 +419,26 @@ func (s *Store) save(height int64, hash string, block []byte, now time.Time) (st
 	}
 }
 
-// submit delivers the block and returns its final status. The retry budget
-// covers waiting for a slot and the pauses between attempts, never an attempt
-// itself: the node may be validating the block at that very moment, and the
-// RPC call has its own timeout. A panic during an attempt is a bug, and the
-// attempt is retried like one that could not reach the node: giving up could
-// lose the block.
-func (s *Store) submit(hash string, block []byte) string {
-	ctx, cancel := context.WithTimeout(context.Background(), s.retryFor)
-	defer cancel()
+// submit delivers the block and returns its final status. ctx, the retry
+// budget, covers waiting for a slot and the pauses between attempts, never an
+// attempt itself: the node may be validating the block at that very moment,
+// and the RPC call has its own timeout. A panic during an attempt is a bug,
+// and the attempt is retried like one that could not reach the node: giving
+// up could lose the block. lastWhy is why the submission last failed, when it
+// starts again after a bug.
+func (s *Store) submit(ctx context.Context, hash string, block []byte, lastWhy string) string {
 	giveUp := func(attempt int, why string) string {
 		log.Printf("Giving up submitting block %s after %d attempts: %s", hash, attempt, why)
 		return "not submitted: " + why
 	}
-	var lastWhy string // why the latest attempt failed
 	for attempt := 1; ; attempt++ {
-		select {
-		case s.submitSlots <- struct{}{}:
-		case <-ctx.Done():
-			if attempt > 1 {
+		status, why, ok := s.attemptInSlot(ctx, hash, block)
+		if !ok {
+			if lastWhy != "" {
 				return giveUp(attempt-1, lastWhy)
 			}
 			return giveUp(0, fmt.Sprintf("waited %s behind other block deliveries", s.retryFor))
 		}
-		var status, why string
-		if failed := guard.Run("submitting a found block", func() { status, why = s.attempt(hash, block) }); failed != nil {
-			why = failed.Error()
-		}
-		<-s.submitSlots
 		if status != "" {
 			return status
 		}
@@ -353,6 +453,23 @@ func (s *Store) submit(hash string, block []byte) string {
 		case <-time.After(s.retryEvery):
 		}
 	}
+}
+
+// attemptInSlot waits for a free submission slot, then submits the block once
+// (see attempt). A panic in the attempt fails it. It reports false if ctx
+// ends before a slot is free. The slot is given back whatever happens: two
+// lost slots would hold every later block back.
+func (s *Store) attemptInSlot(ctx context.Context, hash string, block []byte) (status, why string, ok bool) {
+	select {
+	case s.submitSlots <- struct{}{}:
+	case <-ctx.Done():
+		return "", "", false
+	}
+	defer func() { <-s.submitSlots }()
+	if failed := guard.Run("submitting a found block", func() { status, why = s.attempt(hash, block) }); failed != nil {
+		why = failed.Error()
+	}
+	return status, why, true
 }
 
 // attempt submits the block once. It returns the block's final status, or ""

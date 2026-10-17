@@ -19,11 +19,11 @@ const logQueueSize = 1024
 // which text is being selected, or a log collector that has stopped reading,
 // the messages that do not fit are dropped and counted. Left alone, the
 // program would stop at its next log line, and that could be the one about a
-// found block, before the block is saved.
+// found block, before the block is sent.
 type LogOutput struct {
 	out   io.Writer
 	queue *Queue
-	lost  atomic.Int64 // messages dropped since the last one that was queued
+	lost  atomic.Int64 // messages dropped or failed since the last one that was queued
 }
 
 // NewLogOutput starts a LogOutput that writes to out.
@@ -42,9 +42,22 @@ func (o *LogOutput) Write(p []byte) (int, error) {
 }
 
 // write writes one message, and first a note where messages were dropped.
+//
+// A panic in the output costs this message only, and the note on the next
+// one counts it. The log keeps no state that a panic could leave broken, so
+// it must never fall silent: its last lines may be all that is left of a
+// found block. The panic is not reported, nor left to the queue, which would
+// report it to this very log: an output that panics on every message would
+// then keep the queue busy for ever.
 func (o *LogOutput) write(lost int64, msg []byte) {
+	defer func() {
+		if recover() != nil {
+			o.lost.Add(lost + 1)
+		}
+	}()
 	if lost > 0 {
-		fmt.Fprintf(o.out, "%s(%d log messages were lost here because the log output was blocked)\n", time.Now().Format("2006/01/02 15:04:05 "), lost)
+		fmt.Fprintf(o.out, "%s(%d log messages were lost here because the log output did not take them)\n", time.Now().Format("2006/01/02 15:04:05 "), lost)
+		lost = 0 // noted: a panic below costs this message alone
 	}
 	o.out.Write(msg)
 }

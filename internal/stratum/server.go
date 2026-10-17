@@ -326,3 +326,16 @@ func (s *Server) Status() Status {
 	})
 	return st
 }
+
+// Miners returns the number of miners connected and logged in. It is cheap,
+// yet it takes the same locks as Status, one miner at a time: a miner server
+// that is stuck on one makes the health check that asks wait, and fail.
+func (s *Server) Miners() int {
+	n := 0
+	for _, sess := range s.snapshotSessions() {
+		if sess.loggedIn() {
+			n++
+		}
+	}
+	return n
+}

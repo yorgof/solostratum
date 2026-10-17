@@ -35,6 +35,7 @@ func serve(t *testing.T, found []blocks.Record, change func(*Sources)) *httptest
 		Pool: func() stratum.Status {
 			return stratum.Status{Started: time.Now(), Miners: []stratum.MinerStatus{{Worker: `<script>alert(1)</script>`}}}
 		},
+		Miners: func() int { return 1 },
 		Blocks: func() []blocks.Record { return found },
 	}
 	if change != nil {
@@ -315,13 +316,15 @@ func TestPanicInADataSourceFailsOnlyThatRequest(t *testing.T) {
 }
 
 // The health check reads /api/health, which answers from the node's state
-// and the miners alone: statistics that have stopped answering hold up
-// /api/status, never the health check.
+// and the count of miners alone: statistics that have stopped answering hold
+// up /api/status, never the health check, and the full view of the miners is
+// not built for it.
 func TestHealthNeverWaitsForTheStatistics(t *testing.T) {
 	stuck := make(chan struct{})
 	srv := serve(t, nil, func(src *Sources) {
 		src.Offline = func() []stats.Worker { <-stuck; return nil }
 		src.BestShares = func() []stats.BestShare { <-stuck; return nil }
+		src.Pool = func() stratum.Status { <-stuck; return stratum.Status{} }
 	})
 	t.Cleanup(func() { close(stuck) }) // before the server's own cleanup, which waits for requests
 	client := &http.Client{Timeout: 5 * time.Second}

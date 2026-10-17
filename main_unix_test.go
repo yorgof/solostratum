@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yorgof/solostratum/internal/logtest"
 	"github.com/yorgof/solostratum/internal/stats"
 )
 
@@ -79,7 +80,7 @@ func release(fifo string) {
 
 // The real folder that hangs is given up on after the time limit.
 func TestOpenStatisticsGivesUpOnAFolderThatHangs(t *testing.T) {
-	captureLog(t)
+	logtest.Capture(t)
 	dir, fifo := hangingStatsDir(t)
 	t.Cleanup(func() { release(fifo) })
 	done := make(chan error, 1)
@@ -100,7 +101,7 @@ func TestOpenStatisticsGivesUpOnAFolderThatHangs(t *testing.T) {
 // A statistics folder that hangs while solostratum starts must not keep it
 // from stopping.
 func TestStartStopsWhileTheStatisticsFolderHangs(t *testing.T) {
-	captureLog(t)
+	logtest.Capture(t)
 	dir, fifo := hangingStatsDir(t)
 	node, _ := startupNode(t, "regtest")
 	path := settingsFile(t, node.URL, map[string]string{"stats_dir": dir, "status_listen": ""})

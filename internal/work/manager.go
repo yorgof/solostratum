@@ -62,9 +62,10 @@ type Manager struct {
 	tag   string
 	chain string
 
-	// mu is held with defer: a panic while updating the work is recovered
-	// (see update), and must not leave it held, since every miner, the
-	// broadcast of new work and the health check need it.
+	// mu is held with defer wherever its holder does more than copy or set
+	// fields: a panic while updating the work is recovered (see update), and
+	// must not leave it held, since every miner, the broadcast of new work and
+	// the health check need it.
 	mu       sync.RWMutex
 	current  *Job
 	jobs     map[string]*Job
@@ -144,7 +145,9 @@ func (m *Manager) Fetch(ctx context.Context) error {
 }
 
 func (m *Manager) fetch(ctx context.Context, longPollID string) error {
-	gen := m.generation()
+	m.mu.RLock()
+	gen := m.tipGen
+	m.mu.RUnlock()
 	t, err := m.node.GetBlockTemplate(ctx, longPollID, longPollWait)
 	if err != nil {
 		// The regular poll is the authority on node health; a failed long
@@ -162,28 +165,16 @@ func isTimeout(err error) bool {
 	return errors.As(err, &t) && t.Timeout() || errors.Is(err, context.DeadlineExceeded)
 }
 
-// generation returns the number of tip changes published so far.
-func (m *Manager) generation() uint64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.tipGen
-}
-
 // setOK records that the node delivered a usable template.
 func (m *Manager) setOK() {
-	if m.clearError() {
+	m.mu.Lock()
+	recovered := m.lastErr != ""
+	m.lastErr = ""
+	m.lastOK = time.Now()
+	m.mu.Unlock()
+	if recovered {
 		log.Printf("Node connection restored.")
 	}
-}
-
-// clearError forgets the node's problem, notes that the node has delivered,
-// and reports whether there was a problem.
-func (m *Manager) clearError() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	had := m.lastErr != ""
-	m.lastErr, m.lastOK = "", time.Now()
-	return had
 }
 
 // Healthy reports whether the node has delivered usable work recently. When
@@ -196,19 +187,13 @@ func (m *Manager) Healthy() bool {
 
 func (m *Manager) setError(err error) {
 	msg := rpc.Explain(err)
-	if m.replaceError(msg) {
-		log.Printf("Node problem: %s. Retrying; miners keep their current work.", msg)
-	}
-}
-
-// replaceError records msg as the node's problem and reports whether it is a
-// new one.
-func (m *Manager) replaceError(msg string) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	changed := m.lastErr != msg
 	m.lastErr = msg
-	return changed
+	m.mu.Unlock()
+	if changed {
+		log.Printf("Node problem: %s. Retrying; miners keep their current work.", msg)
+	}
 }
 
 // publish turns a template into the current job unless it is stale. gen is
@@ -222,7 +207,13 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 		m.setError(err)
 		return err
 	}
-	cur, raced, seq := m.next(gen)
+	m.mu.Lock()
+	cur := m.current
+	raced := gen != m.tipGen
+	m.nextID++
+	seq := m.nextID
+	m.mu.Unlock()
+
 	newTip := cur == nil || cur.PrevHash != prev
 	if newTip && raced {
 		// The tip changed while this request was under way, so this answer
@@ -234,7 +225,9 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 	if !newTip && (uint32(t.CurTime) < cur.CurTime || time.Since(cur.Created) < time.Second) {
 		// An older answer overtaken by a newer one, or the long poll and
 		// the regular poll answering together.
-		m.setLongPoll(t.LongPollID)
+		m.mu.Lock()
+		m.longPoll = t.LongPollID
+		m.mu.Unlock()
 		m.setOK()
 		return nil
 	}
@@ -255,21 +248,6 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 	}
 	m.onJob(job)
 	return nil
-}
-
-// next returns the current job, whether the tip has changed since generation
-// gen, and the sequence number for a new job.
-func (m *Manager) next(gen uint64) (cur *Job, raced bool, seq uint64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.nextID++
-	return m.current, gen != m.tipGen, m.nextID
-}
-
-func (m *Manager) setLongPoll(id string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.longPoll = id
 }
 
 // install makes job the current job, with longPoll the node's long-poll id
@@ -365,7 +343,9 @@ func (m *Manager) poll(ctx context.Context) {
 // block arrives. A panic in one long poll counts as a failed one.
 func (m *Manager) longPollLoop(ctx context.Context) {
 	for ctx.Err() == nil {
-		id := m.longPollID()
+		m.mu.RLock()
+		id := m.longPoll
+		m.mu.RUnlock()
 		if id == "" {
 			sleep(ctx, time.Second)
 			continue
@@ -378,12 +358,6 @@ func (m *Manager) longPollLoop(ctx context.Context) {
 			sleep(ctx, 5*time.Second) // the regular poll reports the problem
 		}
 	}
-}
-
-func (m *Manager) longPollID() string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.longPoll
 }
 
 func sleep(ctx context.Context, d time.Duration) {

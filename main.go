@@ -145,9 +145,13 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 		return fmt.Errorf("cannot use blocks_dir %s: %v", cfg.BlocksDir, err)
 	}
 	// From here on a block may be on its way to the node: one left over from
-	// the last run is resumed as soon as the store opens. However run ends,
-	// including a failed start, the node gets its answer first.
+	// the last run is resumed at once. However run ends, including a failed
+	// start, the node gets its answer first. -check does not mine, and leaves
+	// those blocks to the solostratum that may be delivering them right now.
 	defer finishDeliveries(store, cfg.BlocksDir)
+	if !checkOnly {
+		store.Resume()
+	}
 	server := stratum.NewServer(stratum.Options{
 		Network: network, DefaultAddress: cfg.PayoutAddress, DefaultScript: payoutScript,
 		StartDifficulty: cfg.StartDifficulty, MinDifficulty: cfg.MinDifficulty,
@@ -178,9 +182,7 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	}
 	log.Printf("Self-test passed: the node accepts the blocks this program builds.")
 	if checkOnly {
-		if logOutput != nil {
-			logOutput.Flush(logCloseTimeout) // the log comes first
-		}
+		flushLog() // the log comes first
 		fmt.Println("Everything looks good.")
 		return nil
 	}
@@ -192,7 +194,7 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	var statusListener net.Listener
 	if cfg.StatusListen != "" {
 		if statusListener, err = net.Listen("tcp", cfg.StatusListen); err != nil {
-			log.Printf("WARNING: cannot serve the status page on %s: %v\n  There is no status page during this run. Mining is not affected. Change status_listen in the settings file, or free that port, and restart to get it back.", cfg.StatusListen, err)
+			log.Printf("WARNING: cannot serve the status page on %s: %v\n  Mining is not affected. solostratum tries again every %s, and the status page, with the Docker health check that reads it, starts as soon as it can. To use another port, change status_listen in the settings file and restart.", cfg.StatusListen, err, statusRetryEvery)
 			statusListener = nil
 		}
 	}
@@ -213,31 +215,32 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 			guarded("the statistics writer", func() { history.Run(ctx) })
 		}()
 	}
-	if statusListener != nil {
+	if cfg.StatusListen != "" {
+		src := status.Sources{
+			Version: version, PayoutAddress: cfg.PayoutAddress, StratumPort: stratumPort,
+			Node: manager.State, Pool: server.Status, Miners: server.Miners, Blocks: store.Records,
+		}
+		if history != nil {
+			src.Offline, src.History, src.BestShares = history.Offline, history.Series, history.BestShares
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			guarded("the status page", func() {
-				src := status.Sources{
-					Version: version, PayoutAddress: cfg.PayoutAddress, StratumPort: stratumPort,
-					Node: manager.State, Pool: server.Status, Blocks: store.Records,
-				}
-				if history != nil {
-					src.Offline, src.History, src.BestShares = history.Offline, history.Series, history.BestShares
-				}
-				err := status.Serve(ctx, statusListener, src)
-				if err != nil {
-					log.Printf("Status page stopped: %v", err)
-				}
-			})
+			guarded("the status page", func() { serveStatusPage(ctx, statusListener, cfg.StatusListen, src, statusRetryEvery) })
 		}()
-		_, statusPort, _ := net.SplitHostPort(statusListener.Addr().String())
-		log.Printf("Status page: http://%s:%s", displayHost(cfg.StatusListen), statusPort)
+		if statusListener != nil {
+			logStatusPage(cfg.StatusListen, statusListener)
+		}
 	}
 	log.Printf("Ready. Point your miners at stratum+tcp://%s:%s", displayHost(cfg.StratumListen), stratumPort)
 
 	<-ctx.Done()
 	log.Printf("Shutting down.")
+	// A found block that is not on disk yet goes to the log in full before
+	// anything else, as the next Ctrl-C can quit (see finishDeliveries).
+	if store.LogUnsaved() > 0 {
+		flushLog()
+	}
 	// Give the default signal behaviour back at once, so a second Ctrl-C
 	// ends the program even if a miner's last share or a disk write hangs.
 	// A found block that is saved by then and was not answered is delivered
@@ -252,15 +255,66 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	return nil // finishDeliveries runs now
 }
 
+// statusRetryEvery is how often the status page tries again for a port that
+// is taken, as by an old copy of solostratum that has not quite stopped.
+const statusRetryEvery = 30 * time.Second
+
+// serveStatusPage serves the status page on ln until ctx ends. Without ln, as
+// when its port was taken at the start, it first tries to listen on addr
+// every retry, until it can. A reason it cannot that differs from the last
+// one is logged.
+func serveStatusPage(ctx context.Context, ln net.Listener, addr string, src status.Sources, retry time.Duration) {
+	var last string // why the last try failed
+	for ln == nil {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retry):
+		}
+		var err error
+		if ln, err = net.Listen("tcp", addr); err == nil {
+			logStatusPage(addr, ln)
+		} else if err.Error() != last {
+			last = err.Error()
+			log.Printf("WARNING: still cannot serve the status page on %s: %v. Trying again every %s.", addr, err, retry)
+		}
+	}
+	if err := status.Serve(ctx, ln, src); err != nil {
+		log.Printf("Status page stopped: %v", err)
+	}
+}
+
+func logStatusPage(addr string, ln net.Listener) {
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	log.Printf("Status page: http://%s:%s", displayHost(addr), port)
+}
+
 // finishDeliveries waits until the node has answered for every found block
 // that is still being delivered. It runs however run ends.
 func finishDeliveries(store *blocks.Store, dir string) {
-	// A second Ctrl-C must end the program, whatever the first one did.
+	// A second Ctrl-C must end the program, whatever the first one did. Any
+	// block that exists only in memory, such as one a miner handed over
+	// while the server was letting the miners go, is in the log first.
 	restoreSignals()
+	unsaved := store.LogUnsaved()
 	if n := store.Pending(); n > 0 {
-		log.Printf("Still delivering %d found block(s) to the node. Press Ctrl-C to quit anyway: a block saved in %s is delivered again if solostratum starts again within 30 minutes of finding it.", n, dir)
+		log.Printf("Still delivering %d found block(s) to the node.", n)
+	}
+	switch {
+	case unsaved > 0:
+		log.Printf("WARNING: %d found block(s) are not saved in %s. Quitting now loses them, unless the node has them already: the log has each in full, ready to be submitted by hand. Press Ctrl-C to quit anyway.", unsaved, dir)
+		flushLog() // those lines must be out before anyone quits on reading this
+	case store.Pending() > 0:
+		log.Printf("Press Ctrl-C to quit anyway: they are saved in %s, and delivered again if solostratum starts again within 30 minutes of finding them.", dir)
 	}
 	store.Wait()
+}
+
+// flushLog waits, within a limit, until what was logged so far is out.
+func flushLog() {
+	if logOutput != nil {
+		logOutput.Flush(logCloseTimeout)
+	}
 }
 
 // statsSaveTimeout is how long the last write of the statistics may take. They
@@ -276,21 +330,14 @@ const statsOpenTimeout = 10 * time.Second
 // openStatistics runs open, which opens the statistics, for at most timeout or
 // until ctx ends. A result that comes later is ignored.
 func openStatistics(ctx context.Context, open func() (*stats.Store, error), timeout time.Duration) (*stats.Store, error) {
-	type result struct {
-		store *stats.Store
-		err   error
-	}
-	done := make(chan result, 1)
-	go func() {
-		var r result
-		if failed := guard.Run("opening the statistics", func() { r.store, r.err = open() }); failed != nil {
-			r.err = failed
-		}
-		done <- r
-	}()
+	var store *stats.Store
+	var err error
 	select {
-	case r := <-done:
-		return r.store, r.err
+	case failed := <-guard.Go("opening the statistics", func() { store, err = open() }):
+		if failed != nil {
+			return nil, failed
+		}
+		return store, err
 	case <-time.After(timeout):
 		return nil, fmt.Errorf("the folder did not answer within %s", timeout)
 	case <-ctx.Done():
@@ -301,15 +348,12 @@ func openStatistics(ctx context.Context, open func() (*stats.Store, error), time
 // saveStatistics runs flush, the last write of the statistics, once every
 // channel in after is closed, and gives all of it at most timeout.
 func saveStatistics(timeout time.Duration, flush func(), after ...<-chan struct{}) {
-	saved := make(chan error, 1)
-	go func() {
-		saved <- guard.Run("saving the statistics", func() {
-			for _, ch := range after {
-				<-ch
-			}
-			flush()
-		})
-	}()
+	saved := guard.Go("saving the statistics", func() {
+		for _, ch := range after {
+			<-ch
+		}
+		flush()
+	})
 	select {
 	case err := <-saved:
 		if err != nil {

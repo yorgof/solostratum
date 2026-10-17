@@ -9,19 +9,21 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/yorgof/solostratum/internal/logtest"
 )
 
 // A disk that stops while the node's answer is written next to the block,
 // shown by a FIFO in place of the result file, holds up nothing: the new work
 // after the accepted block has been asked for, and Wait returns.
 func TestStuckResultFileHoldsUpNothing(t *testing.T) {
-	captureLog(t)
+	logtest.Capture(t)
 	var refreshed int
 	s, err := Open(t.TempDir(), &fakeNode{}, func() { refreshed++ })
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.saveWait = 50 * time.Millisecond
+	s.saveWait, s.fileWait = 50*time.Millisecond, 50*time.Millisecond
 	fifo := make(chan string, 1)
 	create := s.create
 	s.create = func(path string) (*os.File, error) {

@@ -197,6 +197,12 @@ func (s *session) ready() bool {
 	return s.subscribed && s.authorized
 }
 
+func (s *session) loggedIn() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.authorized
+}
+
 func (s *session) writeLoop() {
 	for {
 		select {

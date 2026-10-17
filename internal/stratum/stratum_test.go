@@ -20,6 +20,7 @@ import (
 	"github.com/yorgof/solostratum/internal/axesim"
 	"github.com/yorgof/solostratum/internal/btc"
 	"github.com/yorgof/solostratum/internal/guard"
+	"github.com/yorgof/solostratum/internal/logtest"
 	"github.com/yorgof/solostratum/internal/rpc"
 	"github.com/yorgof/solostratum/internal/work"
 )
@@ -286,8 +287,8 @@ func TestShareAcceptedAndCounted(t *testing.T) {
 		t.Fatalf("valid share rejected: %+v", res)
 	}
 	st := h.srv.Status()
-	if st.Accepted != 1 || st.Rejected != 0 || len(st.Miners) != 1 {
-		t.Fatalf("status after one share: %+v", st)
+	if st.Accepted != 1 || st.Rejected != 0 || len(st.Miners) != 1 || h.srv.Miners() != 1 {
+		t.Fatalf("status after one share: %+v, %d miners counted", st, h.srv.Miners())
 	}
 	miner := st.Miners[0]
 	if miner.Worker != "tester" || miner.OwnPayout || miner.Payout != defaultAddress || miner.Accepted != 1 {
@@ -1108,35 +1109,9 @@ func TestShutdownWaitsForBlockHandoffAndDisconnect(t *testing.T) {
 	if len(events) != 3 || events[0].event != "connected" || events[1].event != "accepted" || events[2].event != "disconnected" {
 		t.Fatalf("the statistics missed events of the shutdown: %+v", events)
 	}
-	if len(srv.Status().Miners) != 0 {
+	if len(srv.Status().Miners) != 0 || srv.Miners() != 0 {
 		t.Fatal("a miner is still registered after shutdown")
 	}
-}
-
-// syncBuffer collects log output from several goroutines.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-func captureLog(t *testing.T) *syncBuffer {
-	t.Helper()
-	out := &syncBuffer{}
-	log.SetOutput(out)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-	return out
 }
 
 // within fails the test unless f returns. It is for calls that must never
@@ -1212,12 +1187,12 @@ func (p *panicRecorder) Accepted(string, time.Time, float64, float64) { p.event(
 func (p *panicRecorder) Rejected(string, time.Time)                   { p.event("rejected") }
 
 // A bug in the statistics must never reach the miners: a panic would end
-// the whole program, and with it any block being delivered. It switches the
-// recording off instead.
+// the whole program, and with it any block being delivered. It costs the one
+// call that raised it; the real statistics then switch themselves off.
 func TestStatisticsPanicNeverReachesMiners(t *testing.T) {
 	for _, event := range []string{"connected", "accepted", "rejected", "disconnected"} {
 		t.Run(event, func(t *testing.T) {
-			logs := captureLog(t)
+			logs := logtest.Capture(t)
 			rec := &panicRecorder{panicOn: event}
 			h := newHarnessWithRecorder(t, 1024, makeJob(t, "a", regtestBits, 0x20000000, 0, true), rec)
 			m := h.dial(axesim.Options{})
@@ -1235,13 +1210,11 @@ func TestStatisticsPanicNeverReachesMiners(t *testing.T) {
 				t.Fatalf("duplicate share: %+v", res)
 			}
 			h.statisticsDone()
-			// Nothing after the event that panicked reached the statistics.
-			want := map[string]int32{"connected": 1, "accepted": 2, "rejected": 3, "disconnected": 4}[event]
-			if got := rec.calls.Load(); got != want {
-				t.Fatalf("%d calls reached the statistics, want %d (all up to the panic, none after)", got, want)
+			// The panic cost its own call only.
+			if got := rec.calls.Load(); got != 4 {
+				t.Fatalf("%d calls reached the statistics, want all 4", got)
 			}
-			if out := logs.String(); !strings.Contains(out, "ERROR: recording the statistics failed: statistics bug on "+event) ||
-				!strings.Contains(out, "recording the statistics is switched off") {
+			if out := logs.String(); strings.Count(out, "ERROR: recording the statistics failed: statistics bug on "+event) != 1 {
 				t.Fatalf("log:\n%s", out)
 			}
 		})
@@ -1295,35 +1268,80 @@ func TestStuckStatisticsNeverHoldUpMining(t *testing.T) {
 	}
 }
 
+// gatedRecorder waits in every call while its gate is held.
+type gatedRecorder struct {
+	gate  sync.Mutex
+	calls atomic.Int32
+}
+
+func (g *gatedRecorder) event() {
+	g.gate.Lock()
+	g.gate.Unlock()
+	g.calls.Add(1)
+}
+
+func (g *gatedRecorder) Connected(string, time.Time)                  { g.event() }
+func (g *gatedRecorder) Disconnected(string, time.Time)               { g.event() }
+func (g *gatedRecorder) Accepted(string, time.Time, float64, float64) { g.event() }
+func (g *gatedRecorder) Rejected(string, time.Time)                   { g.event() }
+
 // While the statistics do not keep up, what does not fit in their queue is
-// dropped, and that is reported once.
+// dropped. Shares may fill only half of it: the rest is kept for connections
+// and disconnections, as a lost disconnection would leave its worker online
+// for good. Each time the drops start, and each time they end, it is logged.
 func TestStatisticsQueueDropsWhatDoesNotFit(t *testing.T) {
-	logs := captureLog(t)
-	rec := newStuckRecorder()
-	q := newQueuedRecorder(rec, 2)
-	q.Connected("rig", time.Now())
-	select {
-	case <-rec.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the statistics were never called")
+	logs := logtest.Capture(t)
+	rec := &gatedRecorder{}
+	q := newQueuedRecorder(rec, 4)
+	t.Cleanup(q.queue.Close)
+	// started posts call and waits until the statistics are busy with it.
+	started := func(call func()) {
+		t.Helper()
+		call()
+		for deadline := time.Now().Add(5 * time.Second); q.queue.Waiting() != 0; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("the statistics never took the call")
+			}
+		}
 	}
+	drained := func(calls int32) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); rec.calls.Load() != calls; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%d calls reached the statistics, want %d", rec.calls.Load(), calls)
+			}
+		}
+	}
+
+	rec.gate.Lock()
+	started(func() { q.Connected("rig", time.Now()) })
 	within(t, "reporting to stuck statistics", func() {
 		for range 10 {
-			q.Accepted("rig", time.Now(), 1, 1)
+			q.Accepted("rig", time.Now(), 1, 1) // two fit, eight are dropped
 		}
+		q.Disconnected("rig", time.Now()) // fits in the room kept for it
+		q.Connected("rig", time.Now())    // and so does this one
+		q.Disconnected("rig", time.Now()) // the queue is full: dropped
 	})
-	close(rec.release)
-	q.queue.Close()
-	select {
-	case <-q.queue.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("the queue did not finish")
+	rec.gate.Unlock()
+	drained(5) // the one under way, two shares, a disconnection and a connection
+	q.Accepted("rig", time.Now(), 1, 1)
+	drained(6)
+
+	rec.gate.Lock()
+	started(func() { q.Accepted("rig", time.Now(), 1, 1) })
+	for range 3 {
+		q.Accepted("rig", time.Now(), 1, 1) // two fit, one is dropped
 	}
-	if n := rec.calls.Load(); n != 3 {
-		t.Fatalf("%d calls reached the statistics, want 3: the one under way and the two that fit", n)
+	rec.gate.Unlock()
+	drained(9) // the one under way and the two that fit
+
+	out := logs.String()
+	if n := strings.Count(out, "WARNING: the statistics are not keeping up"); n != 2 {
+		t.Fatalf("the drops were reported %d times, want once for each time they started:\n%s", n, out)
 	}
-	if n := strings.Count(logs.String(), "the statistics are not keeping up"); n != 1 {
-		t.Fatalf("the drops were reported %d times, want once:\n%s", n, logs.String())
+	if !strings.Contains(out, "The statistics are keeping up again. 9 connections and shares were not counted meanwhile.") {
+		t.Fatalf("the end of the drops was not reported:\n%s", out)
 	}
 }
 
@@ -1369,7 +1387,7 @@ func newBrokenHarness(t *testing.T) (*harness, *brokenJobs) {
 // others keep mining, new miners still get work, and the statistics hear
 // that the miner left.
 func TestPanicServingAMinerEndsOnlyThatConnection(t *testing.T) {
-	logs := captureLog(t)
+	logs := logtest.Capture(t)
 	h, jobs := newBrokenHarness(t)
 	other := h.dial(axesim.Options{User: "other"})
 	job := firstJob(t, other)
@@ -1403,7 +1421,7 @@ func TestPanicServingAMinerEndsOnlyThatConnection(t *testing.T) {
 // A bug hit while sending a new job to one miner ends that miner's
 // connection only. The others get the job and mine on it.
 func TestPanicSendingWorkEndsOnlyThatMiner(t *testing.T) {
-	logs := captureLog(t)
+	logs := logtest.Capture(t)
 	h, jobs := newBrokenHarness(t)
 	victim := h.dial(axesim.Options{User: "victim"})
 	firstJob(t, victim)
@@ -1482,7 +1500,7 @@ func (panicWriteConn) Write([]byte) (int, error) { panic("bug in Write") }
 // A bug hit while taking on a connection drops that connection, and the
 // server goes on accepting others.
 func TestPanicAcceptingAConnectionDropsOnlyIt(t *testing.T) {
-	logs := captureLog(t)
+	logs := logtest.Capture(t)
 	h := newHarnessWith(t, 1024, makeJob(t, "a", regtestBits, 0x20000000, 0, true),
 		breakFirstConn(func(c net.Conn) net.Conn { return panicAddrConn{c} }))
 	if m, err := axesim.Dial(h.addr, axesim.Options{User: "first", Timeout: 5 * time.Second}); err == nil {
@@ -1498,7 +1516,7 @@ func TestPanicAcceptingAConnectionDropsOnlyIt(t *testing.T) {
 
 // A bug hit while writing to one miner ends that miner's connection only.
 func TestPanicWritingToAMinerEndsOnlyThatConnection(t *testing.T) {
-	logs := captureLog(t)
+	logs := logtest.Capture(t)
 	h := newHarnessWith(t, 1024, makeJob(t, "a", regtestBits, 0x20000000, 0, true),
 		breakFirstConn(func(c net.Conn) net.Conn { return panicWriteConn{c} }))
 	if m, err := axesim.Dial(h.addr, axesim.Options{User: "first", Timeout: 5 * time.Second}); err == nil {
@@ -1520,7 +1538,7 @@ func TestPanicWritingToAMinerEndsOnlyThatConnection(t *testing.T) {
 // A bug hit while checking the node is logged, and the next check runs as
 // usual.
 func TestPanicCheckingTheNodeIsContained(t *testing.T) {
-	logs := captureLog(t)
+	logs := logtest.Capture(t)
 	h, jobs := newBrokenHarness(t)
 	m := h.dial(axesim.Options{User: "rig"})
 	job := firstJob(t, m)
@@ -1555,7 +1573,7 @@ func TestPanicUnderTheSessionLockReleasesIt(t *testing.T) {
 	}
 
 	t.Run("suggested difficulty", func(t *testing.T) {
-		captureLog(t)
+		logtest.Capture(t)
 		h, jobs := newBrokenHarness(t)
 		c := h.raw()
 		c.send(`{"id":1,"method":"mining.subscribe","params":["x"]}`)
@@ -1573,7 +1591,7 @@ func TestPanicUnderTheSessionLockReleasesIt(t *testing.T) {
 	})
 
 	t.Run("difficulty change after a share", func(t *testing.T) {
-		captureLog(t)
+		logtest.Capture(t)
 		h, jobs := newBrokenHarness(t)
 		m := h.dial(axesim.Options{User: "victim"})
 		job := firstJob(t, m)

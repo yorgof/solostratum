@@ -50,6 +50,7 @@ type Sources struct {
 	StratumPort   string
 	Node          func() work.NodeState
 	Pool          func() stratum.Status
+	Miners        func() int // the number of miners logged in; cheaper than Pool
 	Blocks        func() []blocks.Record
 	// Offline, History and BestShares come from the statistics. All three are
 	// nil when no statistics are kept.
@@ -112,7 +113,7 @@ func Handler(src Sources) http.Handler {
 		if !readOnly(w, r) {
 			return
 		}
-		writeJSON(w, Health{Node: src.Node(), Miners: len(src.Pool().Miners)})
+		writeJSON(w, Health{Node: src.Node(), Miners: src.Miners()})
 	})
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
 		if !readOnly(w, r) {
