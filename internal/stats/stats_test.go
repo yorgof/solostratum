@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yorgof/solostratum/internal/logtest"
 )
 
 func open(t *testing.T, dir string) *Store {
@@ -804,4 +807,418 @@ func TestFailedTailRepairDoesNotAppend(t *testing.T) {
 		t.Fatalf("retry: %d unwritten, %v", len(rest), err)
 	}
 	checkHistory(t, history(t, dir, "2026-10"), []Sample{sample})
+}
+
+func savedBest(t *testing.T, dir string) []BestShare {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, bestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []BestShare
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("best-share file %q: %v", raw, err)
+	}
+	return out
+}
+
+func sameList(a, b []BestShare) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !sameShare(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func TestBestSharesAreTheHighestSharesOfAnyWorker(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	if got := s.BestShares(); len(got) != 0 {
+		t.Fatalf("a new store lists %+v", got)
+	}
+	when := at(t, "2026-10-03T12:00:00Z")
+	// The first ten shares fill the list whatever their difficulty, and one
+	// worker can hold every place.
+	for i := range 12 {
+		s.Accepted("rig", when.Add(time.Duration(i)*time.Second), 1, float64(100+i))
+	}
+	got := s.BestShares()
+	if len(got) != bestShown || got[0].Difficulty != 111 || got[9].Difficulty != 102 {
+		t.Fatalf("list after twelve shares: %+v", got)
+	}
+	for _, b := range got {
+		if b.Worker != "rig" {
+			t.Fatalf("list after twelve shares: %+v", got)
+		}
+	}
+	// An easier share does not take a place, and neither does one tied with
+	// the tenth: the earlier share keeps it.
+	s.Accepted("other", when.Add(time.Minute), 1, 50)
+	s.Accepted("other", when.Add(time.Minute), 1, 102)
+	if got := s.BestShares(); got[9].Worker != "rig" || got[9].Difficulty != 102 {
+		t.Fatalf("a share that is not higher than the tenth took a place: %+v", got)
+	}
+	// A harder share from another worker goes to the top and pushes out the
+	// lowest.
+	s.Accepted("other", when.Add(2*time.Minute), 1, 500)
+	got = s.BestShares()
+	if len(got) != bestShown || got[0].Worker != "other" || got[0].Difficulty != 500 ||
+		!got[0].Time.Equal(when.Add(2*time.Minute)) || got[1].Worker != "rig" || got[9].Difficulty != 103 {
+		t.Fatalf("list after a harder share: %+v", got)
+	}
+	s.Flush(when.Add(time.Hour))
+
+	// The file holds exactly the list. The shares that fell out of it are gone.
+	raw, err := os.ReadFile(filepath.Join(dir, bestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "[\n  " + `{"t":"2026-10-03T12:02:00Z","worker":"other","bestShare":500},` + "\n  "; !strings.HasPrefix(string(raw), want) {
+		t.Errorf("file starts:\n%s\nwant it to start:\n%s", raw, want)
+	}
+	if saved := savedBest(t, dir); !sameList(saved, got) {
+		t.Fatalf("file %+v, want %+v", saved, got)
+	}
+	if strings.Contains(string(raw), `"bestShare":100}`) || strings.Contains(string(raw), `"bestShare":101}`) {
+		t.Errorf("a share that fell out of the ten is still in the file:\n%s", raw)
+	}
+
+	again := open(t, dir)
+	if reloaded := again.BestShares(); !sameList(reloaded, got) {
+		t.Fatalf("reloaded %+v, want %+v", reloaded, got)
+	}
+	// The list does not change what is kept per worker.
+	if again.totals["other"].BestShare != 500 || again.totals["rig"].BestShare != 111 {
+		t.Fatalf("totals: other %+v, rig %+v", again.totals["other"], again.totals["rig"])
+	}
+}
+
+func TestBestSharesIgnoreImpossibleSharesAndRepeatedEntries(t *testing.T) {
+	dir := t.TempDir()
+	when := at(t, "2026-10-03T12:00:00Z")
+	entry, err := json.Marshal(BestShare{when, "rig", 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same share twice, one without a time, one without a worker, one
+	// without a usable difficulty.
+	file := "[" + string(entry) + "," + string(entry) +
+		`,{"worker":"rig","bestShare":9},{"t":"2026-10-03T12:00:00Z","bestShare":9},{"t":"2026-10-03T12:00:00Z","worker":"rig","bestShare":-3}]`
+	if err := os.WriteFile(filepath.Join(dir, bestFile), []byte(file), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := open(t, dir)
+	if got := s.BestShares(); len(got) != 1 || got[0].Difficulty != 7 {
+		t.Fatalf("loaded %+v, want the one share of 7", got)
+	}
+	for _, diff := range []float64{math.Inf(1), math.NaN(), 0, -1} {
+		s.Accepted("rig", when.Add(time.Second), 1, diff)
+	}
+	if got := s.BestShares(); len(got) != 1 || s.bestDirty {
+		t.Fatalf("an impossible share was listed: %+v (changed: %v)", got, s.bestDirty)
+	}
+}
+
+func TestBestShareFileThatCannotBeReadIsSetAside(t *testing.T) {
+	when := at(t, "2026-10-03T12:00:00Z")
+	for name, setup := range map[string]func(path string) error{
+		"not json": func(path string) error { return os.WriteFile(path, []byte("{\"t\":\"2026"), 0o644) },
+		"a folder": func(path string) error { return os.Mkdir(path, 0o755) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := setup(filepath.Join(dir, bestFile)); err != nil {
+				t.Fatal(err)
+			}
+			// Statistics are never a reason not to start.
+			s, err := Open(dir)
+			if err != nil {
+				t.Fatalf("Open failed over the best-share file: %v", err)
+			}
+			if len(s.BestShares()) != 0 {
+				t.Fatal("an unreadable best-share file was loaded")
+			}
+			var damaged bool
+			for _, f := range files(t, dir) {
+				damaged = damaged || strings.HasPrefix(f, bestFile+".damaged-")
+			}
+			if !damaged {
+				t.Fatalf("files %v, want the unreadable file renamed", files(t, dir))
+			}
+			s.Accepted("rig", when, 1, 5)
+			s.Flush(when)
+			if saved := savedBest(t, dir); len(saved) != 1 || saved[0].Difficulty != 5 {
+				t.Fatalf("recording after recovery: %+v", saved)
+			}
+		})
+	}
+}
+
+func TestBestShareWriteFailureDoesNotStopTheRestAndIsRetried(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:00:00Z")
+	// A folder where the file belongs makes every attempt to replace it fail.
+	path := filepath.Join(dir, bestFile)
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.Accepted("rig", when, 1, 5)
+	s.Flush(when)
+	// The list is kept in memory, and the totals and the history were written
+	// all the same.
+	if got := s.BestShares(); len(got) != 1 || got[0].Difficulty != 5 {
+		t.Fatalf("list after a failed write: %+v", got)
+	}
+	if !s.bestDirty {
+		t.Fatal("a failed write was not marked for another try")
+	}
+	checkHistory(t, history(t, dir, "2026-10"), []Sample{{Time: when, Worker: "rig", Counts: Counts{Accepted: 1, Work: 1, BestShare: 5}}})
+	if _, err := os.Stat(filepath.Join(dir, totalsFile)); err != nil {
+		t.Fatalf("the totals were not written: %v", err)
+	}
+	for _, f := range files(t, dir) {
+		if strings.HasSuffix(f, ".tmp") {
+			t.Fatalf("a failed write left %s behind", f)
+		}
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	s.Flush(when)
+	s.Flush(when)
+	if saved := savedBest(t, dir); len(saved) != 1 || saved[0].Difficulty != 5 || saved[0].Worker != "rig" {
+		t.Fatalf("file after the retry: %+v", saved)
+	}
+}
+
+func TestBestSharesAreNotWrittenMoreOftenThanTheGap(t *testing.T) {
+	s := open(t, t.TempDir())
+	now := at(t, "2026-10-03T12:00:00Z")
+	if d := s.bestWriteDelay(now); d != 0 {
+		t.Fatalf("delay before the first write: %v", d)
+	}
+	s.bestSaved = now
+	for _, c := range []struct{ after, want time.Duration }{
+		{0, time.Minute},
+		{10 * time.Second, 50 * time.Second},
+		{time.Minute, 0},
+		{time.Hour, 0},
+	} {
+		if d := s.bestWriteDelay(now.Add(c.after)); d != c.want {
+			t.Errorf("delay %v after a write: %v, want %v", c.after, d, c.want)
+		}
+	}
+}
+
+func TestBestShareIsWrittenPromptly(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	s.bestGap = 200 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.Run(ctx); close(done) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waitFor := func(want string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			raw, err := os.ReadFile(filepath.Join(dir, bestFile))
+			if err == nil && strings.Contains(string(raw), want) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s was not written in time: %q, %v", want, raw, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	when := time.Now().UTC().Truncate(time.Second)
+	s.Accepted("rig", when, 1, 42)
+	waitFor(`"bestShare":42`)
+	// A change soon after the first is written too, after the gap.
+	s.Accepted("rig", when, 1, 43)
+	waitFor(`"bestShare":43`)
+}
+
+// Miners keep recording while the totals are copied and written. Nothing may
+// be lost or counted twice, and the race detector must stay quiet.
+func TestFlushWhileMinersRecord(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	when := at(t, "2026-10-03T12:00:00Z")
+	const miners, shares = 4, 2000
+	var wg sync.WaitGroup
+	for m := range miners {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker := fmt.Sprintf("rig%d", m)
+			for i := range shares {
+				s.Accepted(worker, when.Add(time.Duration(i)*time.Millisecond), 2, float64(i+1))
+				s.Rejected(worker, when)
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+loop:
+	for {
+		select {
+		case <-done:
+			break loop
+		default:
+			s.flush(when.Add(time.Hour), false)
+		}
+	}
+	s.Flush(when.Add(time.Hour))
+
+	raw, err := os.ReadFile(filepath.Join(dir, totalsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var totals map[string]Totals
+	if err := json.Unmarshal(raw, &totals); err != nil {
+		t.Fatal(err)
+	}
+	var accepted, rejected uint64
+	var work float64
+	for _, tot := range totals {
+		accepted += tot.Accepted
+		rejected += tot.Rejected
+		work += tot.Work
+	}
+	if len(totals) != miners || accepted != miners*shares || rejected != miners*shares || work != 2*miners*shares {
+		t.Fatalf("totals: %d workers, %d accepted, %d rejected, work %v", len(totals), accepted, rejected, work)
+	}
+	var lines uint64
+	for _, sample := range history(t, dir, "2026-10") {
+		lines += sample.Accepted
+	}
+	if lines != miners*shares {
+		t.Fatalf("history holds %d accepted shares, want %d", lines, miners*shares)
+	}
+}
+
+// A panic in the statistics, whether recovered by the recording itself, by
+// the guard around the writer or by the status page's web server, must not
+// leave them locked: the recording, the status page and the last write still
+// need both of their locks. A panic in a change or a write switches them off;
+// one in reading them, for a chart, does not.
+func TestPanicDoesNotLeaveTheStatisticsLocked(t *testing.T) {
+	logtest.Capture(t)
+	now := time.Now()
+	for _, tc := range []struct {
+		name      string
+		bug       func(s *Store) // breaks the store; called with s.mu held
+		call      func(s *Store) // then panics
+		recording bool           // the store recovers the panic itself (see change)
+		off       bool           // the panic switches the statistics off
+	}{
+		{"writing", func(s *Store) { s.live["rig"] = nil }, func(s *Store) { s.Flush(now) }, false, true},
+		{"charting", func(s *Store) { s.live["rig"] = nil }, func(s *Store) { s.Series(now, 24*time.Hour, 15*time.Minute) }, false, false},
+		{"an accepted share", func(s *Store) { s.totals = nil }, func(s *Store) { s.Accepted("new", now, 1, 1) }, true, true},
+		{"a rejected share", func(s *Store) { s.totals = nil }, func(s *Store) { s.Rejected("new", now) }, true, true},
+		{"a connection", func(s *Store) { s.totals = nil }, func(s *Store) { s.Connected("new", now) }, true, true},
+		{"a disconnection", func(s *Store) { s.totals = nil }, func(s *Store) { s.Disconnected("rig", now.Add(10*time.Minute)) }, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := open(t, t.TempDir())
+			s.Connected("rig", now)
+			s.mu.Lock()
+			tc.bug(s)
+			s.mu.Unlock()
+			func() {
+				defer func() {
+					if r := recover(); (r == nil) != tc.recording {
+						t.Fatalf("the broken state caused a panic: %v; one was expected: %v", r, !tc.recording)
+					}
+				}()
+				tc.call(s)
+			}()
+			if s.off.Load() != tc.off {
+				t.Fatalf("switched off: %v", s.off.Load())
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				s.mu.Lock()
+				s.totals, s.live = map[string]*Totals{}, map[string]*presence{}
+				s.mu.Unlock()
+				s.Accepted("rig", now, 1, 1)
+				s.BestShares()
+				s.Offline()
+				s.Series(now, 24*time.Hour, 15*time.Minute)
+				s.Flush(now)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the panic left the statistics locked")
+			}
+		})
+	}
+}
+
+// A bug while recording switches the statistics off: they record and write
+// nothing more. Kept on, they would count a worker whose disconnection was
+// lost as online until the next restart, and write that to disk.
+func TestBugWhileRecordingSwitchesTheStatisticsOff(t *testing.T) {
+	logs := logtest.Capture(t)
+	dir := t.TempDir()
+	s := open(t, dir)
+	start := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	s.Connected("rig", start)
+	s.Accepted("rig", start.Add(time.Minute), 1, 1)
+	s.Flush(start.Add(2 * time.Minute))
+	before := readFiles(t, dir)
+
+	s.mu.Lock()
+	totals := s.totals
+	s.totals = nil
+	s.mu.Unlock()
+	s.Accepted("new", start.Add(3*time.Minute), 1, 1) // panics inside, and is recovered there
+	s.mu.Lock()
+	s.totals = totals
+	s.mu.Unlock()
+	s.Accepted("rig", start.Add(4*time.Minute), 1, 1e9)
+	s.Disconnected("rig", start.Add(5*time.Minute))
+	s.Flush(start.Add(time.Hour))
+	s.writeBestShares()
+
+	if after := readFiles(t, dir); !maps.Equal(before, after) {
+		t.Fatalf("switched-off statistics changed the files:\nbefore %v\nafter  %v", before, after)
+	}
+	if best := s.BestShares(); len(best) != 1 || best[0].Difficulty != 1 {
+		t.Fatalf("best shares %+v: a share was recorded after the bug", best)
+	}
+	if out := logs.String(); strings.Count(out, "WARNING: the statistics are switched off until solostratum is restarted") != 1 ||
+		!strings.Contains(out, "ERROR: recording the statistics failed: assignment to entry in nil map") {
+		t.Fatalf("log:\n%s", out)
+	}
+}
+
+// readFiles returns the contents of every file in dir, by name.
+func readFiles(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{}
+	for _, e := range entries {
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[e.Name()] = string(raw)
+	}
+	return files
 }

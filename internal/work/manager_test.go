@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yorgof/solostratum/internal/logtest"
 	"github.com/yorgof/solostratum/internal/rpc"
 )
 
@@ -157,5 +158,142 @@ func TestSelfTestRPCFailures(t *testing.T) {
 	}
 	if got := (&SelfTestError{Reason: "bad-txnmrklroot"}).Error(); !strings.Contains(got, "bad-txnmrklroot") || !strings.Contains(got, "Mining was not started") {
 		t.Fatalf("missing actionable validation failure: %q", got)
+	}
+}
+
+// A bug hit while updating the work counts as a failed update: it is
+// reported like a node problem, and the next update tries again.
+func TestPanicUpdatingTheWorkIsAFailedUpdate(t *testing.T) {
+	logs := logtest.Capture(t)
+	var broken atomic.Bool
+	var templates atomic.Int32
+	node := loopNode{
+		template: func(ctx context.Context, id string) (*rpc.BlockTemplate, error) {
+			if id != "" {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			if broken.Load() {
+				panic("bug in reading a template")
+			}
+			n := templates.Add(1)
+			return template(byte(n), int64(99+n), 1000, 0), nil
+		},
+		info: func(context.Context) (rpc.ChainInfo, error) {
+			return rpc.ChainInfo{BestBlockHash: strings.Repeat(fmt.Sprintf("%02x", templates.Load()), 32)}, nil
+		},
+	}
+	jobs := make(chan *Job, 10)
+	m := NewManager(node, "regtest", "", func(j *Job) { jobs <- j })
+	if err := m.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitForJob(t, jobs, 100)
+	runManager(t, m)
+
+	broken.Store(true)
+	m.Refresh()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(m.State().Error, "internal error: bug in reading a template") {
+		if time.Now().After(deadline) {
+			t.Fatalf("state after the bug: %+v", m.State())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if m.State().Connected {
+		t.Fatal("a failed update left the node shown as connected")
+	}
+	broken.Store(false)
+	m.Refresh()
+	waitForJob(t, jobs, 101)
+	if state := m.State(); !state.Connected || state.Error != "" {
+		t.Fatalf("the work did not recover: %+v", state)
+	}
+	if out := logs.String(); !strings.Contains(out, "ERROR: updating the work failed: bug in reading a template") {
+		t.Fatalf("log:\n%s", out)
+	}
+}
+
+// A bug hit in the long poll counts as a failed long poll. The regular
+// updates go on, and the node is not shown as having a problem.
+func TestPanicInTheLongPollIsContained(t *testing.T) {
+	logs := logtest.Capture(t)
+	var templates atomic.Int32
+	polled := make(chan struct{}, 1)
+	node := loopNode{
+		template: func(ctx context.Context, id string) (*rpc.BlockTemplate, error) {
+			if id != "" {
+				select {
+				case polled <- struct{}{}:
+				default:
+				}
+				panic("bug in the long poll")
+			}
+			n := templates.Add(1)
+			return template(byte(n), int64(99+n), 1000, 0), nil
+		},
+		info: func(context.Context) (rpc.ChainInfo, error) {
+			return rpc.ChainInfo{BestBlockHash: strings.Repeat(fmt.Sprintf("%02x", templates.Load()), 32)}, nil
+		},
+	}
+	jobs := make(chan *Job, 10)
+	m := NewManager(node, "regtest", "", func(j *Job) { jobs <- j })
+	if err := m.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitForJob(t, jobs, 100)
+	runManager(t, m)
+	select {
+	case <-polled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the long poll did not start")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "ERROR: waiting for a new block failed: bug in the long poll") {
+		if time.Now().After(deadline) {
+			t.Fatalf("log:\n%s", logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	m.Refresh()
+	waitForJob(t, jobs, 101)
+	if state := m.State(); !state.Connected || state.Error != "" {
+		t.Fatalf("a failed long poll was reported as a node problem: %+v", state)
+	}
+}
+
+// within fails the test unless f returns. It is for calls that must never
+// wait: a broken version of them blocks forever.
+func within(t *testing.T, what string, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { defer close(done); f() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s blocked", what)
+	}
+}
+
+// A bug hit while the manager's lock is held must not leave it held: every
+// miner, the broadcast of new work and the health check need it.
+func TestPanicUnderTheManagerLockReleasesIt(t *testing.T) {
+	logtest.Capture(t)
+	var templates atomic.Int32
+	node := loopNode{template: func(context.Context, string) (*rpc.BlockTemplate, error) {
+		n := templates.Add(1)
+		return template(byte(n), int64(99+n), 1000, 0), nil
+	}}
+	m := NewManager(node, "regtest", "", func(*Job) {})
+	if err := m.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.jobs["broken"] = nil // a bug: dropping old jobs now panics
+	m.mu.Unlock()
+	within(t, "a failed update", func() { m.update(func() { m.Fetch(context.Background()) }) })
+	within(t, "reading the current job", func() { m.Current() })
+	if state := m.State(); !strings.Contains(state.Error, "internal error") {
+		t.Fatalf("state after the bug: %+v", state)
 	}
 }

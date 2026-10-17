@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yorgof/solostratum/internal/btc"
+	"github.com/yorgof/solostratum/internal/guard"
 	"github.com/yorgof/solostratum/internal/rpc"
 )
 
@@ -61,6 +62,10 @@ type Manager struct {
 	tag   string
 	chain string
 
+	// mu is held with defer wherever its holder does more than copy or set
+	// fields: a panic while updating the work is recovered (see update), and
+	// must not leave it held, since every miner, the broadcast of new work and
+	// the health check need it.
 	mu       sync.RWMutex
 	current  *Job
 	jobs     map[string]*Job
@@ -98,12 +103,11 @@ func (m *Manager) Current() *Job {
 // tip has moved on.
 func (m *Manager) Get(id string) *Job {
 	m.mu.RLock()
-	job := m.jobs[id]
-	m.mu.RUnlock()
-	if job == nil || job.expired(time.Now()) {
-		return nil
+	defer m.mu.RUnlock()
+	if job := m.jobs[id]; job != nil && !job.expired(time.Now()) {
+		return job
 	}
-	return job
+	return nil
 }
 
 // pruneLocked drops retired jobs past retiredJobGrace.
@@ -236,10 +240,22 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 	job.Seq = seq
 	m.setOK()
 	job.CleanJobs = newTip
+	m.install(job, t.LongPollID, time.Now())
 
-	now := time.Now()
-	m.mu.Lock()
 	if newTip {
+		log.Printf("New block to mine: height %d, %d transactions, reward %s BTC, network difficulty %s",
+			job.Height, job.TxCount, formatBTC(job.Value), formatDiff(job.NetDiff))
+	}
+	m.onJob(job)
+	return nil
+}
+
+// install makes job the current job, with longPoll the node's long-poll id
+// for it, and drops the jobs that are no longer kept.
+func (m *Manager) install(job *Job, longPoll string, now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if job.CleanJobs {
 		// Ordinary shares for the old tip are stale. A block solved on it
 		// may still be on its way: those jobs stay until pruneLocked drops
 		// them.
@@ -260,18 +276,10 @@ func (m *Manager) publish(t *rpc.BlockTemplate, gen uint64) error {
 	}
 	m.pruneLocked(now)
 	m.current = job
-	m.longPoll = t.LongPollID
-	if newTip {
+	m.longPoll = longPoll
+	if job.CleanJobs {
 		m.tipGen++
 	}
-	m.mu.Unlock()
-
-	if newTip {
-		log.Printf("New block to mine: height %d, %d transactions, reward %s BTC, network difficulty %s",
-			job.Height, job.TxCount, formatBTC(job.Value), formatDiff(job.NetDiff))
-	}
-	m.onJob(job)
-	return nil
 }
 
 // Run keeps jobs current until ctx is cancelled.
@@ -291,32 +299,48 @@ func (m *Manager) Run(ctx context.Context) {
 			wg.Wait()
 			return
 		case <-m.refreshC:
-			m.Fetch(ctx)
+			m.update(func() { m.Fetch(ctx) })
 		case <-ticker.C:
-			cur := m.Current()
-			if cur == nil || time.Since(cur.Created) >= refreshInterval {
-				m.Fetch(ctx)
-				continue
-			}
-			info, err := m.node.GetBlockchainInfo(ctx)
-			if err != nil {
-				if ctx.Err() == nil {
-					m.setError(err)
-				}
-				continue
-			}
-			// Fetch right away on a new tip, and after a failure so that
-			// recovery is noticed without waiting for the next refresh.
-			tip, err := btc.HashFromDisplayHex(info.BestBlockHash)
-			if (err == nil && tip != cur.PrevHash) || m.State().Error != "" {
-				m.Fetch(ctx)
-			}
+			m.update(func() { m.poll(ctx) })
 		}
 	}
 }
 
+// update runs one pass of Run. A panic in it is a bug, and counts as a failed
+// update: it is logged and reported like a node problem, and the next pass
+// tries again. Miners keep their current work meanwhile, and are disconnected
+// if no update succeeds within nodeTimeout, as when the node is down.
+func (m *Manager) update(f func()) {
+	if err := guard.Run("updating the work", f); err != nil {
+		m.setError(err)
+	}
+}
+
+// poll checks the chain tip, and fetches a new template when the job is due
+// for a refresh, the tip has moved or the last update failed.
+func (m *Manager) poll(ctx context.Context) {
+	cur := m.Current()
+	if cur == nil || time.Since(cur.Created) >= refreshInterval {
+		m.Fetch(ctx)
+		return
+	}
+	info, err := m.node.GetBlockchainInfo(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			m.setError(err)
+		}
+		return
+	}
+	// Fetch right away on a new tip, and after a failure so that recovery is
+	// noticed without waiting for the next refresh.
+	tip, err := btc.HashFromDisplayHex(info.BestBlockHash)
+	if (err == nil && tip != cur.PrevHash) || m.State().Error != "" {
+		m.Fetch(ctx)
+	}
+}
+
 // longPollLoop waits on the node's long poll, which answers the moment a new
-// block arrives.
+// block arrives. A panic in one long poll counts as a failed one.
 func (m *Manager) longPollLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		m.mu.RLock()
@@ -326,7 +350,11 @@ func (m *Manager) longPollLoop(ctx context.Context) {
 			sleep(ctx, time.Second)
 			continue
 		}
-		if err := m.fetch(ctx, id); err != nil && !isTimeout(err) {
+		var err error
+		if failed := guard.Run("waiting for a new block", func() { err = m.fetch(ctx, id) }); failed != nil {
+			err = failed
+		}
+		if err != nil && !isTimeout(err) {
 			sleep(ctx, 5*time.Second) // the regular poll reports the problem
 		}
 	}

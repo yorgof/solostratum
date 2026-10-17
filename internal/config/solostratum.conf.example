@@ -31,7 +31,8 @@ payout_address =
 
 # Status web page: http://<this computer's IP>:3334
 # Use 127.0.0.1:3334 to make it reachable from this computer only, or leave
-# the value empty to turn the page off.
+# the value empty to turn the page off. If the port is taken, mining goes on
+# without the page, and the port is tried again every 30 seconds.
 # status_listen = 0.0.0.0:3334
 
 # Short text written into blocks you find (at most 32 characters).
@@ -42,10 +43,12 @@ payout_address =
 # start_difficulty = 1024
 # min_difficulty = 0.001
 
-# Folder where every block you find is saved before it is sent to the node.
+# Folder where every block you find is saved, at the same time as it is sent
+# to the node.
 # blocks_dir = blocks
 
 # Folder for the permanent mining history: each worker's lifetime totals,
 # and its shares for every five minutes. The offline list and the charts on
 # the status page are made from it. Leave the value empty to keep no history.
+# If the folder cannot be used, no history is kept and mining goes on.
 # stats_dir = stats

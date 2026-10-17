@@ -1,6 +1,6 @@
 // Package stats keeps a permanent record of what every worker has mined.
 //
-// The statistics folder holds two kinds of plain-text files:
+// The statistics folder holds plain-text files:
 //
 //   - workers.json has each worker's lifetime totals. It is replaced as a
 //     whole whenever the totals have changed.
@@ -8,6 +8,9 @@
 //     interval in which that worker was connected. Lines are only ever
 //     appended. The one exception is an unfinished last line, as a power
 //     cut can leave behind: it is removed before the next line is added.
+//   - best-shares.json has the ten highest shares this program has
+//     accepted, from any worker. It is replaced as a whole when the list
+//     changes, so a share that falls out of the ten is gone.
 //
 // A history line counts what happened in the interval that starts at "t".
 // Lines add up: after a restart the same worker and interval can appear
@@ -31,7 +34,10 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/yorgof/solostratum/internal/guard"
 )
 
 // Interval is the length of one history interval, and how often the files
@@ -52,11 +58,19 @@ const (
 	// to take it, so a folder that stays unwritable cannot exhaust memory.
 	// It holds several intervals of the largest possible set of workers.
 	maxPending = 5 * maxWorkers
+	// bestShown is how many shares the best-share list holds.
+	bestShown = 10
+	// bestWriteGap is the shortest time between two writes of the best-share
+	// file. The file only has to survive a restart, so a burst of changes,
+	// as when the list fills up, is written once. The first change after a
+	// quiet time is still written at once.
+	bestWriteGap = time.Minute
 	// recent is how far back a Series looks for workers. It is the longest
 	// period worth charting, so a worker keeps its place in every chart.
 	recent = 30 * 24 * time.Hour
 
 	totalsFile = "workers.json"
+	bestFile   = "best-shares.json"
 )
 
 // Counts are the numbers kept per worker, for its lifetime and for each
@@ -98,6 +112,14 @@ type Sample struct {
 	Time   time.Time `json:"t"`
 	Worker string    `json:"worker"`
 	Counts
+}
+
+// BestShare is one share on the list of the highest shares, and one entry of
+// the best-share file: the worker that found it and when it was accepted.
+type BestShare struct {
+	Time       time.Time `json:"t"`
+	Worker     string    `json:"worker"`
+	Difficulty float64   `json:"bestShare"`
 }
 
 // Series is what the workers did over a period, cut into steps of equal
@@ -143,7 +165,8 @@ type cachedSeries struct {
 }
 
 // Store collects shares and connections in memory and writes them to disk
-// once per Interval.
+// once per Interval. A share that makes the list of the highest shares is
+// written sooner.
 type Store struct {
 	dir string
 
@@ -153,12 +176,23 @@ type Store struct {
 	io    sync.Mutex
 	cache map[seriesKey]cachedSeries
 
+	// mu is held with defer around everything under it that does more than
+	// copy or set fields, so that a panic cannot leave it held: the
+	// recording, the status page and the last write still need it.
 	mu      sync.Mutex
 	totals  map[string]*Totals
 	changed bool                  // totals differ from the file on disk
 	pending map[sampleKey]*Sample // history not yet written
 	live    map[string]*presence
 	full    bool // the maxWorkers warning has been logged
+
+	best      []BestShare   // the highest shares accepted, highest first
+	bestDirty bool          // the list differs from the file on disk
+	bestSaved time.Time     // when the file was last written
+	bestGap   time.Duration // bestWriteGap; tests shorten it
+	bestWake  chan struct{} // the list has changed and wants writing
+
+	off atomic.Bool // switched off after a bug (see change)
 }
 
 // Open prepares the statistics folder, verifies it is writable and loads
@@ -177,7 +211,9 @@ func Open(dir string) (*Store, error) {
 	s := &Store{
 		dir: dir, cache: map[seriesKey]cachedSeries{},
 		totals: map[string]*Totals{}, pending: map[sampleKey]*Sample{}, live: map[string]*presence{},
+		bestGap: bestWriteGap, bestWake: make(chan struct{}, 1),
 	}
+	s.loadBestShares()
 	path := filepath.Join(dir, totalsFile)
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -207,44 +243,77 @@ func Open(dir string) (*Store, error) {
 // Accepted records an accepted share. credit is the difficulty the share
 // counts for, shareDiff the difficulty its hash actually reached.
 func (s *Store) Accepted(worker string, at time.Time, credit, shareDiff float64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.recordLocked(worker, at, Counts{Accepted: 1, Work: credit, BestShare: shareDiff})
+	s.change(func() {
+		s.recordLocked(worker, at, Counts{Accepted: 1, Work: credit, BestShare: shareDiff})
+		// The list of the highest shares covers every worker, including one
+		// whose name is no longer recorded. Infinity would sort above every
+		// real share.
+		if shareDiff > 0 && shareDiff < math.Inf(1) {
+			s.noteBestLocked(worker, at, shareDiff)
+		}
+	})
 }
 
 // Rejected records a rejected share.
 func (s *Store) Rejected(worker string, at time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.recordLocked(worker, at, Counts{Rejected: 1})
+	s.change(func() { s.recordLocked(worker, at, Counts{Rejected: 1}) })
 }
 
 // Connected records that a miner has logged in as worker.
 func (s *Store) Connected(worker string, at time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.recordLocked(worker, at, Counts{Connections: 1}) {
-		return
-	}
-	p := s.live[worker]
-	if p == nil {
-		p = &presence{since: at.UTC().Truncate(time.Second)}
-		s.live[worker] = p
-	}
-	p.sessions++
+	s.change(func() {
+		if !s.recordLocked(worker, at, Counts{Connections: 1}) {
+			return
+		}
+		p := s.live[worker]
+		if p == nil {
+			p = &presence{since: at.UTC().Truncate(time.Second)}
+			s.live[worker] = p
+		}
+		p.sessions++
+	})
 }
 
 // Disconnected records that one of the worker's connections has ended.
 func (s *Store) Disconnected(worker string, at time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p := s.live[worker]
-	if p == nil {
+	s.change(func() {
+		p := s.live[worker]
+		if p == nil {
+			return
+		}
+		if p.sessions--; p.sessions == 0 {
+			s.countOnlineLocked(worker, p, at)
+			delete(s.live, worker)
+		}
+	})
+}
+
+// change makes one change to the statistics, with mu held. A panic in it is
+// logged, and switches the statistics off (see offUnlessFinished).
+func (s *Store) change(f func()) {
+	if s.off.Load() {
 		return
 	}
-	if p.sessions--; p.sessions == 0 {
-		s.countOnlineLocked(worker, p, at)
-		delete(s.live, worker)
+	guard.Run("recording the statistics", func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		finished := false
+		defer s.offUnlessFinished(&finished)
+		f()
+		finished = true
+	})
+}
+
+// offUnlessFinished is deferred, with finished set as its last step, by the
+// code that changes or writes the statistics. Code that does not finish has
+// hit a bug, and may have left them half changed: they are switched off
+// until solostratum is restarted, before that code lets go of its locks.
+// From then on nothing is recorded or written, rather than numbers that are
+// wrong for good, such as the online time of a worker whose disconnection
+// was never counted. The files keep what they had.
+func (s *Store) offUnlessFinished(finished *bool) {
+	if !*finished && !s.off.Swap(true) {
+		log.Printf("WARNING: the statistics are switched off until solostratum is restarted, and nothing more is written to %s. Mining is not affected.", s.dir)
 	}
 }
 
@@ -304,6 +373,62 @@ func (s *Store) countAllOnlineLocked(until time.Time) {
 	}
 }
 
+// BestShares returns the highest shares this program has accepted, at most
+// ten, the highest first. They come from any workers, so one worker can
+// appear several times. A share that falls out of the ten is forgotten.
+func (s *Store) BestShares() []BestShare {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]BestShare, len(s.best))
+	copy(out, s.best)
+	return out
+}
+
+// noteBestLocked puts an accepted share on the list of the highest shares
+// when it belongs there, and asks for the file to be written.
+func (s *Store) noteBestLocked(worker string, at time.Time, diff float64) {
+	rec := BestShare{Time: at.UTC().Truncate(time.Second), Worker: worker, Difficulty: diff}
+	if !s.rankLocked(rec) {
+		return
+	}
+	s.bestDirty = true
+	select {
+	case s.bestWake <- struct{}{}:
+	default:
+	}
+}
+
+// rankLocked places rec among the highest shares and reports whether it made
+// the list. A share that ties with the tenth does not: the earlier one stays.
+func (s *Store) rankLocked(rec BestShare) bool {
+	i := sort.Search(len(s.best), func(i int) bool { return ranksBefore(rec, s.best[i]) })
+	if i >= bestShown || (i > 0 && sameShare(s.best[i-1], rec)) {
+		return false
+	}
+	s.best = append(s.best, BestShare{})
+	copy(s.best[i+1:], s.best[i:])
+	s.best[i] = rec
+	if len(s.best) > bestShown {
+		s.best = s.best[:bestShown]
+	}
+	return true
+}
+
+// ranksBefore orders the list: the higher share first, then the earlier one.
+func ranksBefore(a, b BestShare) bool {
+	if a.Difficulty != b.Difficulty {
+		return a.Difficulty > b.Difficulty
+	}
+	if !a.Time.Equal(b.Time) {
+		return a.Time.Before(b.Time)
+	}
+	return a.Worker < b.Worker
+}
+
+func sameShare(a, b BestShare) bool {
+	return a.Difficulty == b.Difficulty && a.Time.Equal(b.Time) && a.Worker == b.Worker
+}
+
 // Offline returns the workers that have mined here before and are not
 // connected now, the most recently seen first.
 func (s *Store) Offline() []Worker {
@@ -336,23 +461,7 @@ func (s *Store) Series(now time.Time, span, step time.Duration) (Series, error) 
 		return c.series, nil
 	}
 
-	s.mu.Lock()
-	s.countAllOnlineLocked(now)
-	since := end
-	var known []Worker
-	for worker, t := range s.totals {
-		if t.FirstSeen.Before(since) {
-			since = t.FirstSeen
-		}
-		if !t.LastSeen.Before(end.Add(-recent)) {
-			known = append(known, Worker{worker, *t})
-		}
-	}
-	samples := make([]Sample, 0, len(s.pending))
-	for _, sample := range s.pending {
-		samples = append(samples, *sample)
-	}
-	s.mu.Unlock()
+	since, known, samples := s.seriesInput(now, end)
 	sort.Slice(known, func(i, j int) bool {
 		if !known[i].FirstSeen.Equal(known[j].FirstSeen) {
 			return known[i].FirstSeen.Before(known[j].FirstSeen)
@@ -419,6 +528,28 @@ func (s *Store) Series(now time.Time, span, step time.Duration) (Series, error) 
 	return out, nil
 }
 
+// seriesInput copies what Series needs from memory: when the statistics
+// begin, the workers seen recently, and the history not yet written.
+func (s *Store) seriesInput(now, end time.Time) (since time.Time, known []Worker, samples []Sample) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.countAllOnlineLocked(now)
+	since = end
+	for worker, t := range s.totals {
+		if t.FirstSeen.Before(since) {
+			since = t.FirstSeen
+		}
+		if !t.LastSeen.Before(end.Add(-recent)) {
+			known = append(known, Worker{worker, *t})
+		}
+	}
+	samples = make([]Sample, 0, len(s.pending))
+	for _, sample := range s.pending {
+		samples = append(samples, *sample)
+	}
+	return since, known, samples
+}
+
 func historyFile(month time.Time) string {
 	return "history-" + month.Format("2006-01") + ".jsonl"
 }
@@ -466,20 +597,34 @@ func completeLines(data []byte, atEOF bool) (int, []byte, error) {
 }
 
 // Run writes the statistics to disk at the end of every interval until ctx
-// is cancelled, and once more on the way out.
+// is cancelled, and once more on the way out. When the list of the highest
+// shares changes, its file is written soon, not at the end of the interval.
 func (s *Store) Run(ctx context.Context) {
+	checkpoint := time.NewTimer(untilNextInterval(time.Now()))
+	defer checkpoint.Stop()
+	// bestDue is set while a write of the best-share file waits for its turn.
+	var bestDue <-chan time.Time
 	for {
-		now := time.Now()
-		timer := time.NewTimer(now.Truncate(Interval).Add(Interval).Sub(now))
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			s.flush(time.Now(), true)
 			return
-		case <-timer.C:
+		case <-checkpoint.C:
 			s.flush(time.Now(), false)
+			checkpoint.Reset(untilNextInterval(time.Now()))
+		case <-s.bestWake:
+			if bestDue == nil {
+				bestDue = time.After(s.bestWriteDelay(time.Now()))
+			}
+		case <-bestDue:
+			bestDue = nil
+			s.writeBestShares()
 		}
 	}
+}
+
+func untilNextInterval(now time.Time) time.Duration {
+	return now.Truncate(Interval).Add(Interval).Sub(now)
 }
 
 // Flush writes everything recorded so far, including the interval still in
@@ -488,38 +633,83 @@ func (s *Store) Run(ctx context.Context) {
 func (s *Store) Flush(now time.Time) { s.flush(now, true) }
 
 // flush writes the totals and every interval that has ended. The interval
-// still in progress is kept in memory, unless final is set.
+// still in progress is kept in memory, unless final is set. Statistics that
+// are switched off are not written.
 func (s *Store) flush(now time.Time, final bool) {
 	s.io.Lock()
 	defer s.io.Unlock()
+	if s.off.Load() {
+		return
+	}
+	finished := false
+	defer s.offUnlessFinished(&finished)
+	samples, snapshot := s.takeDue(now, final)
+	var totals []byte
+	if snapshot != nil {
+		var err error
+		if totals, err = json.MarshalIndent(snapshot, "", "  "); err != nil {
+			log.Printf("WARNING: could not encode the worker totals: %v", err)
+			s.mu.Lock()
+			s.changed = true // try again at the next interval
+			s.mu.Unlock()
+		}
+	}
+
+	unwritten, err := s.appendHistory(samples)
+	if err != nil {
+		log.Printf("WARNING: could not write the mining history: %v", err)
+	}
+	if dropped := s.putBack(unwritten); dropped > 0 {
+		log.Printf("WARNING: the mining history could not be written for so long that its oldest %d samples have been dropped. The lifetime totals are not affected.", dropped)
+	}
+	if totals != nil {
+		if err := s.replaceFile(totalsFile, totals); err != nil {
+			log.Printf("WARNING: could not write the worker totals: %v", err)
+			s.mu.Lock()
+			s.changed = true // try again at the next interval
+			s.mu.Unlock()
+		}
+	}
+	s.saveBestShares()
+	finished = true
+}
+
+// takeDue removes from the pending history the samples that flush writes
+// now, and copies the totals if they have changed. Only copies are taken
+// under the lock: encoding the totals takes milliseconds with many workers,
+// and the recording of new shares should not wait for that.
+func (s *Store) takeDue(now time.Time, final bool) (samples []Sample, totals map[string]Totals) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.off.Load() {
+		return nil, nil // a change has just failed (see offUnlessFinished)
+	}
 	s.countAllOnlineLocked(now)
 	current := now.UTC().Truncate(Interval)
-	var samples []Sample
 	for key, sample := range s.pending {
 		if final || sample.Time.Before(current) {
 			samples = append(samples, *sample)
 			delete(s.pending, key)
 		}
 	}
-	var totals []byte
 	if s.changed {
-		var err error
-		if totals, err = json.MarshalIndent(s.totals, "", "  "); err != nil {
-			log.Printf("WARNING: could not encode the worker totals: %v", err)
+		totals = make(map[string]Totals, len(s.totals))
+		for worker, t := range s.totals {
+			totals[worker] = *t
 		}
-		s.changed = totals == nil // retry an encoding failure too
+		s.changed = false
 	}
-	s.mu.Unlock()
+	return samples, totals
+}
 
-	unwritten, err := s.appendHistory(samples)
-	if err != nil {
-		log.Printf("WARNING: could not write the mining history: %v", err)
-	}
-	// Only complete lines have reached disk. Merge everything else back
-	// without adding it to lifetime totals a second time; a miner may have
-	// recorded more work in the same interval while the write was running.
+// putBack returns the samples that did not reach disk as complete lines to
+// the pending history, without adding them to the lifetime totals a second
+// time: a miner may have recorded more work in the same interval while the
+// write was running. It returns how many of the oldest samples it had to
+// drop.
+func (s *Store) putBack(unwritten []Sample) int {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, sample := range unwritten {
 		key := sampleKey{sample.Time.Unix(), sample.Worker}
 		if pending := s.pending[key]; pending != nil {
@@ -529,18 +719,7 @@ func (s *Store) flush(now time.Time, final bool) {
 			s.pending[key] = &retained
 		}
 	}
-	if dropped := s.trimPendingLocked(); dropped > 0 {
-		log.Printf("WARNING: the mining history could not be written for so long that its oldest %d samples have been dropped. The lifetime totals are not affected.", dropped)
-	}
-	s.mu.Unlock()
-	if totals != nil {
-		if err := s.replaceTotals(totals); err != nil {
-			log.Printf("WARNING: could not write the worker totals: %v", err)
-			s.mu.Lock()
-			s.changed = true // try again at the next interval
-			s.mu.Unlock()
-		}
-	}
+	return s.trimPendingLocked()
 }
 
 // trimPendingLocked forgets the oldest unwritten samples beyond maxPending
@@ -652,11 +831,11 @@ func appendHistoryBatch(f historyAppender, data []byte) (int, error) {
 	return bytes.Count(data[:complete], []byte{'\n'}), err
 }
 
-// replaceTotals swaps in a new totals file. The new contents are forced
-// onto the disk first, so a power cut leaves either the old file or the new
-// one, never half of one.
-func (s *Store) replaceTotals(data []byte) error {
-	path := filepath.Join(s.dir, totalsFile)
+// replaceFile swaps in a new version of a file in the statistics folder. The
+// new contents are forced onto the disk first, so a power cut leaves either
+// the old file or the new one, never half of one.
+func (s *Store) replaceFile(name string, data []byte) error {
+	path := filepath.Join(s.dir, name)
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -676,4 +855,97 @@ func (s *Store) replaceTotals(data []byte) error {
 		os.Remove(tmp)
 	}
 	return err
+}
+
+// loadBestShares reads the saved list of the highest shares. It cannot fail:
+// a list that is missing or unreadable is not worth refusing to mine over, so
+// the damaged file is kept for a person to look at and the list starts empty.
+func (s *Store) loadBestShares() {
+	path := filepath.Join(s.dir, bestFile)
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	var saved []BestShare
+	if err == nil {
+		err = json.Unmarshal(raw, &saved)
+	}
+	if err != nil {
+		aside := path + ".damaged-" + time.Now().UTC().Format("20060102T150405Z")
+		if rerr := os.Rename(path, aside); rerr != nil {
+			log.Printf("WARNING: could not read %s (%v) and could not move it aside (%v). The best-share list starts again from empty.", path, err, rerr)
+			return
+		}
+		log.Printf("WARNING: could not read %s (%v). It has been renamed to %s and the best-share list starts again from empty.", path, err, filepath.Base(aside))
+		return
+	}
+	for _, rec := range saved {
+		if rec.Worker == "" || rec.Time.IsZero() || !(rec.Difficulty > 0) || rec.Difficulty >= math.Inf(1) {
+			continue
+		}
+		s.rankLocked(rec)
+	}
+}
+
+// bestWriteDelay is how long a write of the best-share file has to wait so
+// that the file is not written more often than bestGap.
+func (s *Store) bestWriteDelay(now time.Time) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return max(s.bestGap-now.Sub(s.bestSaved), 0)
+}
+
+// writeBestShares saves the list of the highest shares if it has changed. It
+// takes the disk lock, so flush, which already holds that lock, calls
+// saveBestShares directly.
+func (s *Store) writeBestShares() {
+	s.io.Lock()
+	defer s.io.Unlock()
+	finished := false
+	defer s.offUnlessFinished(&finished)
+	s.saveBestShares()
+	finished = true
+}
+
+// saveBestShares replaces the best-share file with the list as it is now. The
+// caller holds the disk lock. When the write fails the list stays marked as
+// changed, so the next checkpoint tries again; nothing is queued.
+func (s *Store) saveBestShares() {
+	s.mu.Lock()
+	if !s.bestDirty || s.off.Load() {
+		s.mu.Unlock()
+		return
+	}
+	s.bestDirty = false
+	s.bestSaved = time.Now()
+	list := make([]BestShare, len(s.best))
+	copy(list, s.best)
+	s.mu.Unlock()
+
+	err := s.replaceFile(bestFile, encodeBestShares(list))
+	if err != nil {
+		log.Printf("WARNING: could not write the best shares: %v", err)
+		s.mu.Lock()
+		s.bestDirty = true
+		s.mu.Unlock()
+	}
+}
+
+// encodeBestShares writes a JSON array with one share on each line.
+func encodeBestShares(list []BestShare) []byte {
+	var out bytes.Buffer
+	out.WriteString("[")
+	for i, rec := range list {
+		line, err := json.Marshal(rec)
+		if err != nil {
+			continue // cannot happen: impossible difficulties never reach the list
+		}
+		if i > 0 {
+			out.WriteString(",")
+		}
+		out.WriteString("\n  ")
+		out.Write(line)
+	}
+	out.WriteString("\n]")
+	return out.Bytes()
 }

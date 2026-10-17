@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +35,7 @@ func serve(t *testing.T, found []blocks.Record, change func(*Sources)) *httptest
 		Pool: func() stratum.Status {
 			return stratum.Status{Started: time.Now(), Miners: []stratum.MinerStatus{{Worker: `<script>alert(1)</script>`}}}
 		},
+		Miners: func() int { return 1 },
 		Blocks: func() []blocks.Record { return found },
 	}
 	if change != nil {
@@ -60,7 +64,7 @@ func TestAPI(t *testing.T) {
 		t.Errorf("report: %v", r)
 	}
 	// Lists must be arrays, never null, so the page can iterate them.
-	for _, list := range []string{"blocks", "offline"} {
+	for _, list := range []string{"blocks", "offline", "bestShares"} {
 		if _, ok := r[list].([]any); !ok {
 			t.Errorf("%s is %T, want an array", list, r[list])
 		}
@@ -203,6 +207,44 @@ func TestHistoryIsOffWithoutStatistics(t *testing.T) {
 	}
 }
 
+func TestBestSharesInStatus(t *testing.T) {
+	when := time.Date(2026, 10, 3, 12, 4, 10, 0, time.UTC)
+	srv := serve(t, nil, func(src *Sources) {
+		src.History = func(time.Time, time.Duration, time.Duration) (stats.Series, error) {
+			return stats.Series{Workers: []stats.WorkerSeries{}}, nil
+		}
+		src.BestShares = func() []stats.BestShare {
+			return []stats.BestShare{{Time: when, Worker: "bitaxe1", Difficulty: 5000}}
+		}
+	})
+	resp, err := http.Get(srv.URL + "/api/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var report struct {
+		History    bool              `json:"history"`
+		BestShares []stats.BestShare `json:"bestShares"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.History || len(report.BestShares) != 1 || report.BestShares[0].Worker != "bitaxe1" ||
+		report.BestShares[0].Difficulty != 5000 || !report.BestShares[0].Time.Equal(when) {
+		t.Fatalf("status: %+v", report)
+	}
+
+	page, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(page.Body)
+	page.Body.Close()
+	if !strings.Contains(string(body), `id="best-shares"`) || !strings.Contains(string(body), "all time") {
+		t.Fatal("status page has no best-share list")
+	}
+}
+
 func TestServeCancellationAndListenerFailure(t *testing.T) {
 	for _, broken := range []bool{false, true} {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -239,5 +281,76 @@ func TestServeCancellationAndListenerFailure(t *testing.T) {
 		}
 		cancel()
 		l.Close()
+	}
+}
+
+// A bug in a data source fails the one request that hit it, and the page
+// goes on serving. The web server recovers the panic, so it never reaches
+// the rest of the program.
+func TestPanicInADataSourceFailsOnlyThatRequest(t *testing.T) {
+	log.SetOutput(io.Discard) // the web server logs the panic
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	var broken atomic.Bool
+	srv := serve(t, nil, func(src *Sources) {
+		src.BestShares = func() []stats.BestShare {
+			if broken.Load() {
+				panic("bug in the best shares")
+			}
+			return nil
+		}
+	})
+	broken.Store(true)
+	if resp, err := http.Get(srv.URL + "/api/status"); err == nil {
+		resp.Body.Close()
+		t.Fatalf("the request that hit the bug was answered with %d", resp.StatusCode)
+	}
+	broken.Store(false)
+	resp, err := http.Get(srv.URL + "/api/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d after the bug", resp.StatusCode)
+	}
+}
+
+// The health check reads /api/health, which answers from the node's state
+// and the count of miners alone: statistics that have stopped answering hold
+// up /api/status, never the health check, and the full view of the miners is
+// not built for it.
+func TestHealthNeverWaitsForTheStatistics(t *testing.T) {
+	stuck := make(chan struct{})
+	srv := serve(t, nil, func(src *Sources) {
+		src.Offline = func() []stats.Worker { <-stuck; return nil }
+		src.BestShares = func() []stats.BestShare { <-stuck; return nil }
+		src.Pool = func() stratum.Status { <-stuck; return stratum.Status{} }
+	})
+	t.Cleanup(func() { close(stuck) }) // before the server's own cleanup, which waits for requests
+	client := &http.Client{Timeout: 5 * time.Second}
+	go func() {
+		if resp, err := client.Get(srv.URL + "/api/status"); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	resp, err := client.Get(srv.URL + "/api/health")
+	if err != nil {
+		t.Fatalf("the health check waited for the statistics: %v", err)
+	}
+	defer resp.Body.Close()
+	var health Health
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatal(err)
+	}
+	if !health.Node.Connected || health.Node.Chain != "main" || health.Miners != 1 {
+		t.Fatalf("health answer %+v", health)
+	}
+	for _, method := range []string{"POST", "DELETE"} {
+		req, _ := http.NewRequest(method, srv.URL+"/api/health", nil)
+		if resp, err := client.Do(req); err != nil || resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("%s /api/health: %v, %v", method, resp, err)
+		} else {
+			resp.Body.Close()
+		}
 	}
 }

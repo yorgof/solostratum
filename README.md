@@ -10,7 +10,8 @@ your address. No pool, no account, no fees.
   remote.
 - Checks your settings and your node before it starts, and tells you in
   plain words what is wrong.
-- Every block found is saved to disk before it is sent to the node.
+- Every block found is sent to the node at once and saved to disk at the
+  same time, so a slow disk cannot hold it back.
 - A simple status page shows your miners, hashrate and best shares, with
   charts of the last day, week and month.
 - The history of every miner is kept for good, in plain text files.
@@ -87,7 +88,8 @@ your address. No pool, no account, no fees.
    fallback, and they come back by themselves afterwards.
 
 To only verify your settings and node without starting, run
-`./solostratum -check`.
+`./solostratum -check`. It leaves the found blocks alone, so it is safe to
+run next to a solostratum that is mining.
 
 ## Setting up the node
 
@@ -138,15 +140,25 @@ All settings live in `solostratum.conf`, next to the program. Use
 | `node_cookie_file` | –                 | Alternative to the login for a local node. |
 | `payout_address`   | –                 | Where block rewards go. Any address type. |
 | `stratum_listen`   | `0.0.0.0:3333`    | Where miners connect. |
-| `status_listen`    | `0.0.0.0:3334`    | Status page. Empty turns it off; `127.0.0.1:3334` makes it local only. |
+| `status_listen`    | `0.0.0.0:3334`    | Status page. Empty turns it off; `127.0.0.1:3334` makes it local only. If the port is taken, mining goes on without the page, and the port is tried again every 30 seconds. |
 | `coinbase_tag`     | `/solostratum/`   | Short text written into blocks you find. |
 | `start_difficulty` | `1024`            | Share difficulty for a new miner. Adjusts automatically. |
 | `min_difficulty`   | `0.001`           | Lowest share difficulty. |
 | `blocks_dir`       | `blocks`          | Folder for found blocks. |
-| `stats_dir`        | `stats`           | Folder for the mining history. Empty keeps no history and shows no charts. |
+| `stats_dir`        | `stats`           | Folder for the mining history. Empty keeps no history and shows no charts. If the folder cannot be used, no history is kept during that run. |
 
 A typo in a setting name is reported with its line number instead of being
 silently ignored.
+
+The status page and the history never come before mining. If either cannot
+start, solostratum logs a warning and mines without it; a failure in either
+while running is logged and does not touch the miners or the blocks. The
+miners hand their shares to the history through a queue, so even a history
+that has stopped answering cannot hold them up: it loses those shares
+instead, and says so in the log, when it starts and when it ends. A bug in
+the history switches it off until solostratum is restarted: from then on it
+writes nothing, rather than numbers that are wrong. Only `-check`, which
+does not mine, reports an unusable `stats_dir` as an error.
 
 ### A different payout address per miner
 
@@ -176,6 +188,12 @@ the internet. The same data is available as JSON at `/api/status`.
   the time it was online in that period. A miner that keeps reconnecting
   shows up here. The chart's data is at `/api/history?range=24h` (or `7d`,
   `30d`).
+- **Best shares**, under the chart, are the ten highest shares solostratum
+  has accepted, from any worker, with the worker and when each was accepted.
+  A worker can appear more than once. The list is all-time: the buttons
+  above the chart do not change it. It starts with the first ten shares and
+  changes often at first, then less and less as only harder shares can enter
+  it. A share that drops out of the ten is forgotten.
 
 A miner named `bc1q....workername` is listed as `workername`; hover over
 the name to see all of it. On a narrow screen the tables turn into one
@@ -207,21 +225,41 @@ and `online` the seconds it was connected. Lines add up: after a restart
 the same worker and time can appear twice. A worker is recorded under its
 full Stratum username.
 
-The files are written every five minutes and when solostratum stops, so a
-power cut loses at most the last five minutes. One miner adds 15 to 20 MB
-a year. To drop a miner you no longer own from the offline list, stop
-solostratum and remove its entry from `workers.json`.
+- `best-shares.json` holds the ten highest shares, from any worker, as shown
+  on the status page, one share to a line:
+
+  ```json
+  [
+    {"t":"2026-10-03T12:04:10Z","worker":"bitaxe1","bestShare":182934.2},
+    {"t":"2026-10-02T21:40:55Z","worker":"bitaxe2","bestShare":96120.7}
+  ]
+  ```
+
+  `t` is when that share was accepted, in UTC, and `bestShare` its
+  difficulty. The file is replaced whole when the list changes, at most once a
+  minute, and when solostratum stops, so a share that falls out of the ten is
+  gone from it. Shares accepted before this file existed are not in it: the
+  list begins with the first shares after the update.
+
+The monthly history and the worker totals are written every five minutes and
+when solostratum stops, so a power cut loses at most the last five minutes
+of that history. One miner adds 15 to 20 MB a year. To drop a miner you no
+longer own from the offline list, stop solostratum and remove its entry from
+`workers.json`.
 
 ## When you find a block
 
 1. The complete block is written to the `blocks` folder, in its own file
    named after its height, the time and its hash, for example
    `block-900000-20260102T030405.000000006Z-0000...beef.hex`. Files are
-   never overwritten.
-2. Only then is it sent to your node. If the node cannot be reached, it is
-   retried every two seconds for thirty minutes.
-3. The node's answer is written next to it in a `.result` file and shown on
-   the status page.
+   never overwritten. This takes a few milliseconds.
+2. Then the block is sent to your node, so it is on disk before the node
+   is contacted. A slow or stuck disk holds it back by 50 milliseconds at
+   most. If the node cannot be reached, the block is retried every two
+   seconds for thirty minutes.
+3. The node's answer is shown on the status page at once, and written next
+   to the file in a `.result` file as soon as the file is saved, even if the
+   disk is slow to finish it.
 
 If everything else fails you can submit the block by hand:
 
@@ -229,11 +267,30 @@ If everything else fails you can submit the block by hand:
 bitcoin-cli submitblock "$(cat blocks/block-....hex)"
 ```
 
+A block that could not be saved is still sent to the node. It is also
+written in full to the log, as a ready `bitcoin-cli submitblock` command,
+and so is a block that the disk has not taken within five seconds, so that
+a crash of the program later on cannot lose it.
+
+When solostratum stops while a block is still being delivered, it waits for
+the node's answer (a second Ctrl-C quits anyway), and gives a slow disk a
+few more seconds to finish the block's files. A block that is not on disk
+yet is first written in full to the log. A saved block that never got its
+answer is delivered again at the next start, if that comes within thirty
+minutes of finding it: as soon as the node answers, even if something else
+then stops solostratum from starting.
+
 ## How it stays correct
 
 - **At every start** solostratum builds a complete block from the node's
   current template and asks the node to validate it (everything except the
   proof of work). If the node objects, mining does not start.
+- **A bug stays where it happens.** It is logged with the details needed to
+  fix it, and ends only the work that hit it: one miner's connection, one
+  attempt to submit a block (which is then retried), one update of the work,
+  one request to the status page, or the statistics, which then switch off.
+  Statistics that stop answering, or a terminal that stops reading, cost
+  some statistics or log lines, never a share or a found block.
 - **Unit tests** check the Bitcoin building blocks against real mainnet
   blocks and the official address test vectors. They also cover startup,
   protocol errors, node outages, shutdown, disk-write recovery, and the CPU
@@ -280,7 +337,12 @@ docker run -d --name solostratum --restart unless-stopped \
 
 Inside a container `127.0.0.1` is the container itself, so `node_url` must
 use the node's real address. The image has a health check: Docker reports
-the container as unhealthy when it has no current work from the node.
+the container as unhealthy when it has no current work from the node. It
+reads `/api/health` on the status page, which reports the node's state and
+the number of miners and never waits for the statistics, so a problem with
+them cannot make it fail. If the status port is taken when solostratum
+starts, the check fails until solostratum gets the port, which it tries
+every 30 seconds.
 
 ## Good to know
 
@@ -292,6 +354,10 @@ the container as unhealthy when it has no current work from the node.
   what Bitaxe uses. Stratum v2 is not supported.
 - **No payout splitting.** Each block pays one address. This is a personal
   solo-mining server, not a pool.
+- **The log never holds anything up.** When nothing reads solostratum's
+  output, for example in a terminal paused with Ctrl-S or a Windows console
+  in which text is being selected, log messages are dropped and the gap is
+  marked, while mining goes on.
 - Work is refreshed every 30 seconds to pick up new transactions, and
   immediately when a new block arrives.
 
