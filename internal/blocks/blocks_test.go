@@ -111,6 +111,38 @@ func TestBlockIsSubmittedAndSaved(t *testing.T) {
 
 // Blocks found in quick succession, even at the same height or with the same
 // hash, must each get their own file.
+// On a working disk the block's file is written before the node is
+// contacted, so that from then on not even a crash can lose the block. The
+// wait is far shorter than writeWait.
+func TestBlockIsOnDiskBeforeTheNodeGetsIt(t *testing.T) {
+	logtest.Capture(t)
+	dir := t.TempDir()
+	block := []byte{0xc0, 0xff, 0xee}
+	var onDisk bool
+	node := submitFunc(func(context.Context, []byte) (string, error) {
+		names, _ := filepath.Glob(filepath.Join(dir, "*.hex"))
+		if len(names) == 1 {
+			raw, _ := os.ReadFile(names[0])
+			onDisk = string(raw) == "c0ffee\n"
+		}
+		return "", nil
+	})
+	s, err := Open(dir, node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.writeWait = time.Minute // a test that waits this long has failed
+	start := time.Now()
+	s.Found(100, "aa", block, "rig")
+	s.Wait()
+	if !onDisk {
+		t.Fatal("the node got the block before its file was written")
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("the delivery took %s: it waited for writeWait", took)
+	}
+}
+
 func TestEveryBlockGetsItsOwnFile(t *testing.T) {
 	s, dir, _ := open(t, &fakeNode{})
 	const n = 50
@@ -146,11 +178,11 @@ func TestEveryBlockGetsItsOwnFile(t *testing.T) {
 func TestSameNameIsNeverOverwritten(t *testing.T) {
 	s, dir, _ := open(t, &fakeNode{})
 	now := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
-	first, err := s.save(1, "abcd", []byte{1}, now)
+	first, err := s.save(1, "abcd", []byte{1}, now, func() {})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.save(1, "abcd", []byte{2}, now)
+	second, err := s.save(1, "abcd", []byte{2}, now, func() {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -960,7 +992,7 @@ func within(t *testing.T, what string, f func()) {
 }
 
 // A disk that never answers cannot hold a found block back: Found returns at
-// once, the node gets the block straight away, and the delivery finishes
+// once, the node gets the block after writeWait, and the delivery finishes
 // without waiting for the file, so no result file is written.
 func TestStuckDiskDoesNotHoldUpTheBlock(t *testing.T) {
 	logs := logtest.Capture(t)
@@ -974,7 +1006,7 @@ func TestStuckDiskDoesNotHoldUpTheBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.saveWait, s.fileWait = 50*time.Millisecond, 50*time.Millisecond
+	s.writeWait, s.saveWait, s.fileWait = 20*time.Millisecond, 50*time.Millisecond, 50*time.Millisecond
 	stuck := make(chan struct{})
 	s.create = func(string) (*os.File, error) {
 		<-stuck
@@ -993,7 +1025,8 @@ func TestStuckDiskDoesNotHoldUpTheBlock(t *testing.T) {
 	if results, _ := filepath.Glob(filepath.Join(dir, "*.result")); len(results) != 0 {
 		t.Fatalf("result files %v", results)
 	}
-	if out := logs.String(); !strings.Contains(out, "WARNING: the disk has not finished with block aa within 50ms") ||
+	if out := logs.String(); !strings.Contains(out, "WARNING: the disk has not written block aa within 20ms. Sending it to the node without waiting any longer.") ||
+		!strings.Contains(out, "WARNING: the disk has not finished with block aa within 50ms") ||
 		!strings.Contains(out, "WARNING: the disk has not finished the found blocks' files within 50ms. Quitting anyway") {
 		t.Fatalf("log:\n%s", out)
 	}
@@ -1001,7 +1034,7 @@ func TestStuckDiskDoesNotHoldUpTheBlock(t *testing.T) {
 	within(t, "the file's goroutine to finish", s.files.Wait)
 }
 
-// A slow disk does not delay a found block either. The node's answer is
+// A slow disk delays a found block by writeWait at most. The node's answer is
 // written next to the file once the file is there.
 func TestSlowDiskDoesNotDelayTheBlock(t *testing.T) {
 	logtest.Capture(t)

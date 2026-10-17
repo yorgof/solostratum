@@ -249,13 +249,14 @@ longer own from the offline list, stop solostratum and remove its entry from
 
 ## When you find a block
 
-1. The block is sent to your node at once. If the node cannot be reached,
-   it is retried every two seconds for thirty minutes.
-2. At the same time the complete block is written to the `blocks` folder,
-   in its own file named after its height, the time and its hash, for
-   example `block-900000-20260102T030405.000000006Z-0000...beef.hex`. Files
-   are never overwritten. The block is saved and sent side by side, so a
-   slow or stuck disk cannot hold it back.
+1. The complete block is written to the `blocks` folder, in its own file
+   named after its height, the time and its hash, for example
+   `block-900000-20260102T030405.000000006Z-0000...beef.hex`. Files are
+   never overwritten. This takes a few milliseconds.
+2. Then the block is sent to your node, so it is on disk before the node
+   is contacted. A slow or stuck disk holds it back by 50 milliseconds at
+   most. If the node cannot be reached, the block is retried every two
+   seconds for thirty minutes.
 3. The node's answer is shown on the status page at once, and written next
    to the file in a `.result` file as soon as the file is saved, even if the
    disk is slow to finish it.
@@ -269,14 +270,15 @@ bitcoin-cli submitblock "$(cat blocks/block-....hex)"
 A block that could not be saved is still sent to the node. It is also
 written in full to the log, as a ready `bitcoin-cli submitblock` command,
 and so is a block that the disk has not taken within five seconds, so that
-not even a crash can lose it.
+a crash of the program later on cannot lose it.
 
 When solostratum stops while a block is still being delivered, it waits for
 the node's answer (a second Ctrl-C quits anyway), and gives a slow disk a
 few more seconds to finish the block's files. A block that is not on disk
 yet is first written in full to the log. A saved block that never got its
 answer is delivered again at the next start, if that comes within thirty
-minutes of finding it.
+minutes of finding it: as soon as the node answers, even if something else
+then stops solostratum from starting.
 
 ## How it stays correct
 

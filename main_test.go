@@ -400,44 +400,62 @@ func TestStatisticsAndStatusPageAreOptional(t *testing.T) {
 	}
 }
 
-// A block left over from the last run is resumed the moment the block store
-// opens. If the start then fails, for whatever reason, the program must not
+// A block left over from the last run is resumed as soon as the node
+// answers. If the start then fails, for whatever reason, the program must not
 // quit before the node has answered.
 func TestFoundBlockIsDeliveredEvenWhenStartupFails(t *testing.T) {
-	var mu sync.Mutex
-	var submitted []string
-	node, _ := startupNodeSubmitting(t, "regtest", func(blockHex string) {
-		mu.Lock()
-		defer mu.Unlock()
-		submitted = append(submitted, blockHex)
-	})
-	blocksDir := t.TempDir()
-	name := "block-101-" + time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + strings.Repeat("ab", 32)
-	if err := os.WriteFile(filepath.Join(blocksDir, name+".hex"), []byte("00\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	taken, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer taken.Close()
-	path := settingsFile(t, node.URL, map[string]string{"blocks_dir": blocksDir, "stratum_listen": taken.Addr().String()})
+	for _, tc := range []struct {
+		name      string
+		overrides map[string]string
+		failure   string
+	}{
+		{"stratum port taken", map[string]string{"stratum_listen": taken.Addr().String()}, "cannot listen for miners"},
+		// For example, an address for another network typed in while the
+		// block was being delivered, just before a restart.
+		{"payout address unusable", map[string]string{"payout_address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}, "payout_address"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logtest.Capture(t)
+			var mu sync.Mutex
+			var submitted []string
+			node, _ := startupNodeSubmitting(t, "regtest", func(blockHex string) {
+				mu.Lock()
+				defer mu.Unlock()
+				submitted = append(submitted, blockHex)
+			})
+			blocksDir := t.TempDir()
+			name := "block-101-" + time.Now().UTC().Format("20060102T150405.000000000Z") + "-" + strings.Repeat("ab", 32)
+			if err := os.WriteFile(filepath.Join(blocksDir, name+".hex"), []byte("00\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			overrides := map[string]string{"blocks_dir": blocksDir}
+			for key, value := range tc.overrides {
+				overrides[key] = value
+			}
+			path := settingsFile(t, node.URL, overrides)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := run(ctx, path, false); err == nil || !strings.Contains(err.Error(), "cannot listen for miners") {
-		t.Fatalf("run: %v, want a failure to listen", err)
-	}
-	// run has returned: the node must already have answered.
-	mu.Lock()
-	got := append([]string(nil), submitted...)
-	mu.Unlock()
-	if len(got) != 1 || got[0] != "00" {
-		t.Fatalf("the node was given %q, want the one leftover block", got)
-	}
-	result, err := os.ReadFile(filepath.Join(blocksDir, name+".result"))
-	if err != nil || strings.TrimSpace(string(result)) != "accepted" {
-		t.Fatalf("result file %q, %v: run quit before the delivery finished", result, err)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := run(ctx, path, false); err == nil || !strings.Contains(err.Error(), tc.failure) {
+				t.Fatalf("run: %v, want a failure about %s", err, tc.failure)
+			}
+			// run has returned: the node must already have answered.
+			mu.Lock()
+			got := append([]string(nil), submitted...)
+			mu.Unlock()
+			if len(got) != 1 || got[0] != "00" {
+				t.Fatalf("the node was given %q, want the one leftover block", got)
+			}
+			result, err := os.ReadFile(filepath.Join(blocksDir, name+".result"))
+			if err != nil || strings.TrimSpace(string(result)) != "accepted" {
+				t.Fatalf("result file %q, %v: run quit before the delivery finished", result, err)
+			}
+		})
 	}
 }
 

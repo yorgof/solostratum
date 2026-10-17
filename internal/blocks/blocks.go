@@ -48,6 +48,7 @@ type Store struct {
 	// retry schedule for submissions that could not reach the node
 	retryEvery time.Duration
 	retryFor   time.Duration
+	writeWait  time.Duration // see writeWait; tests change it
 	saveWait   time.Duration // see saveWait; tests shorten it
 	fileWait   time.Duration // see fileWait; tests shorten it
 
@@ -77,6 +78,14 @@ type flight struct {
 
 const timeLayout = "20060102T150405.000000000Z"
 const maxSubmissions = 2
+
+// writeWait is how long a delivery waits for the block's file to be written,
+// though not yet forced onto the disk, before it sends the block. On a
+// working disk that takes a few milliseconds, and the block is then on disk
+// before the node is contacted: from there even a crash that nothing can
+// catch, such as running out of memory, cannot lose it. A slow or stuck disk
+// holds the block back for this long at most.
+const writeWait = 50 * time.Millisecond
 
 // saveWait is how long a delivery waits, once the node has answered, for the
 // block's file and the answer next to it. A slow or stuck disk is never
@@ -110,7 +119,8 @@ func Open(dir string, node Submitter, onAccepted func()) (*Store, error) {
 
 	s := &Store{
 		dir: dir, node: node, onAccepted: onAccepted,
-		retryEvery: 2 * time.Second, retryFor: 30 * time.Minute, saveWait: saveWait, fileWait: fileWait,
+		retryEvery: 2 * time.Second, retryFor: 30 * time.Minute,
+		writeWait: writeWait, saveWait: saveWait, fileWait: fileWait,
 		inFlight:    map[int]*flight{},
 		submitSlots: make(chan struct{}, maxSubmissions),
 		create: func(path string) (*os.File, error) {
@@ -190,11 +200,12 @@ func (s *Store) Records() []Record {
 	return append([]Record(nil), s.records...)
 }
 
-// Found submits a solved block to the node and, at the same time, saves it to
-// a file of its own, from which it can be submitted by hand ("bitcoin-cli
-// submitblock <contents>") if everything else fails. It returns at once and
-// never touches the disk itself: the submission starts from memory, so a slow
-// or stuck disk cannot hold the block back.
+// Found saves a solved block to a file of its own, from which it can be
+// submitted by hand ("bitcoin-cli submitblock <contents>") if everything else
+// fails, and submits it to the node. It returns at once and never touches the
+// disk itself. The submission waits for the file to be written, so that the
+// block is on disk before the node is contacted, but never longer than
+// writeWait: a slow or stuck disk cannot hold the block back.
 func (s *Store) Found(height int64, hash string, block []byte, worker string) {
 	rec := Record{Time: time.Now().UTC(), Height: height, Hash: hash, Status: "submitting", Worker: worker}
 	s.mu.Lock()
@@ -210,7 +221,8 @@ func (s *Store) Found(height int64, hash string, block []byte, worker string) {
 //
 // The delivery never touches the disk. The file's goroutine saves the block,
 // and writes the node's answer next to it once both are there, however late
-// that is. The delivery waits for it up to saveWait after the answer, and
+// that is. The delivery waits up to writeWait for the file to be written
+// before it sends the block, up to saveWait after the answer for the rest, and
 // Wait up to fileWait more, so with a working disk the file and its answer
 // are on disk when Wait returns. A block that the disk has not taken within
 // saveWait goes to the log in full, in case the program dies before its
@@ -220,10 +232,16 @@ func (s *Store) start(index int, rec Record, base string, block []byte) {
 	s.inFlight[index] = &flight{block: block}
 	s.mu.Unlock()
 	answered := make(chan string, 1) // the block's status; closed without one if there is none
+	written := make(chan struct{})   // closed once the file is written, or cannot be
+	markWritten := sync.OnceFunc(func() { close(written) })
+	if base != "" {
+		markWritten()
+	}
 	s.files.Add(1)
 	filed := guard.Go("saving a found block", func() {
 		defer s.files.Done()
-		s.keep(index, rec, base, block, answered)
+		defer markWritten()
+		s.keep(index, rec, base, block, answered, markWritten)
 	})
 	wait := s.saveWait
 	time.AfterFunc(wait, func() {
@@ -233,18 +251,19 @@ func (s *Store) start(index int, rec Record, base string, block []byte) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.deliver(index, rec.Hash, block, answered, filed)
+		s.deliver(index, rec.Hash, block, written, answered, filed)
 	}()
 }
 
 // keep looks after a block's file. It saves the block, unless base already
-// names its file, and once the delivery has the block's status it writes it
-// next to the file. A block that cannot be saved goes to the log in full at
-// once.
-func (s *Store) keep(index int, rec Record, base string, block []byte, answered <-chan string) {
+// names its file, calling written once the file is written, and once the
+// delivery has the block's status it writes it next to the file. A block that
+// cannot be saved goes to the log in full at once.
+func (s *Store) keep(index int, rec Record, base string, block []byte, answered <-chan string, written func()) {
 	if base == "" {
 		var err error
-		if base, err = s.save(rec.Height, rec.Hash, block, rec.Time); err != nil {
+		if base, err = s.save(rec.Height, rec.Hash, block, rec.Time, written); err != nil {
+			written() // nothing to wait for
 			log.Printf("WARNING: could not save the found block to disk: %v", err)
 			s.logInFull(index, "could not be saved")
 			return
@@ -260,10 +279,16 @@ func (s *Store) keep(index int, rec Record, base string, block []byte, answered 
 
 // deliver submits the block, records its status and hands it to the block's
 // file, and asks for new work after an accepted block. It never touches the
-// disk. A panic before the node has answered is a bug, and the submission
-// starts again within the same retryFor: giving up could lose the block. A
-// panic after the answer changes nothing about it.
-func (s *Store) deliver(index int, hash string, block []byte, answered chan<- string, filed <-chan error) {
+// disk: it waits for the file to be written up to writeWait, then sends the
+// block whatever the disk does. A panic before the node has answered is a
+// bug, and the submission starts again within the same retryFor: giving up
+// could lose the block. A panic after the answer changes nothing about it.
+func (s *Store) deliver(index int, hash string, block []byte, written <-chan struct{}, answered chan<- string, filed <-chan error) {
+	select {
+	case <-written:
+	case <-time.After(s.writeWait):
+		log.Printf("WARNING: the disk has not written block %s within %s. Sending it to the node without waiting any longer.", hash, s.writeWait)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), s.retryFor)
 	defer cancel()
 	var status string  // the node's answer, or why the delivery gave up
@@ -388,11 +413,11 @@ func (s *Store) Wait() {
 	}
 }
 
-// save writes the block as hex to a new file that is never overwritten, and
-// forces it onto the disk. The name carries the height, the time to the
-// nanosecond and the block hash, and the file is created exclusively. It
-// returns the name without ".hex".
-func (s *Store) save(height int64, hash string, block []byte, now time.Time) (string, error) {
+// save writes the block as hex to a new file that is never overwritten, calls
+// written, and forces the file onto the disk. The name carries the height,
+// the time to the nanosecond and the block hash, and the file is created
+// exclusively. It returns the name without ".hex".
+func (s *Store) save(height int64, hash string, block []byte, now time.Time, written func()) (string, error) {
 	base := fmt.Sprintf("block-%d-%s-%s", height, now.Format(timeLayout), hash)
 	for attempt := 1; ; attempt++ {
 		name := base
@@ -410,6 +435,7 @@ func (s *Store) save(height int64, hash string, block []byte, now time.Time) (st
 			f.Close()
 			return "", err
 		}
+		written()
 		log.Printf("Block saved to %s", filepath.Join(s.dir, name+".hex"))
 		if err := f.Sync(); err != nil {
 			log.Printf("WARNING: could not flush the block file to disk: %v", err)

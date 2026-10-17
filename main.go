@@ -120,6 +120,28 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	if err != nil {
 		return err
 	}
+
+	// A block left over from the last run is resumed as soon as the node
+	// answers, before anything else can stop the start: a payout address
+	// that no longer fits, a self-test that fails, a port that is taken.
+	// However run ends from here on, the node gets its answer first. The
+	// store may deliver it before the manager exists, hence the indirection.
+	// -check does not mine, and leaves those blocks to the solostratum that
+	// may be delivering them right now.
+	var managerRef atomic.Pointer[work.Manager]
+	store, err := blocks.Open(cfg.BlocksDir, node, func() {
+		if m := managerRef.Load(); m != nil {
+			m.Refresh()
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("cannot use blocks_dir %s: %v", cfg.BlocksDir, err)
+	}
+	defer finishDeliveries(store, cfg.BlocksDir)
+	if !checkOnly {
+		store.Resume()
+	}
+
 	network, ok := btc.NetworkByChain(info.Chain)
 	if !ok {
 		return fmt.Errorf("the node is on an unknown network %q", info.Chain)
@@ -133,25 +155,6 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	}
 	log.Printf("Node %s is on %s at block %d. Rewards go to %s", cfg.NodeURL, chainName(info.Chain), info.Blocks, cfg.PayoutAddress)
 
-	// The store may deliver a block left over from the last run before the
-	// manager exists, hence the indirection.
-	var managerRef atomic.Pointer[work.Manager]
-	store, err := blocks.Open(cfg.BlocksDir, node, func() {
-		if m := managerRef.Load(); m != nil {
-			m.Refresh()
-		}
-	})
-	if err != nil {
-		return fmt.Errorf("cannot use blocks_dir %s: %v", cfg.BlocksDir, err)
-	}
-	// From here on a block may be on its way to the node: one left over from
-	// the last run is resumed at once. However run ends, including a failed
-	// start, the node gets its answer first. -check does not mine, and leaves
-	// those blocks to the solostratum that may be delivering them right now.
-	defer finishDeliveries(store, cfg.BlocksDir)
-	if !checkOnly {
-		store.Resume()
-	}
 	server := stratum.NewServer(stratum.Options{
 		Network: network, DefaultAddress: cfg.PayoutAddress, DefaultScript: payoutScript,
 		StartDifficulty: cfg.StartDifficulty, MinDifficulty: cfg.MinDifficulty,
