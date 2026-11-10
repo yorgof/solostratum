@@ -9,6 +9,7 @@ import (
 	"log"
 	"maps"
 	"math"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
@@ -592,32 +593,149 @@ func roundDifficulty(d float64) float64 {
 	return math.Exp2(math.Round(math.Log2(d)))
 }
 
+// hexUint32 reads a 32-bit number written as hex. Miners send eight digits.
+// Fewer are read too, as the same number without its leading zeros: turning a
+// share away over how its numbers are written could turn away a block.
 func hexUint32(s string) (uint32, bool) {
-	if len(s) != 8 {
+	if len(s) == 0 || len(s) > 8 {
 		return 0, false
 	}
 	v, err := strconv.ParseUint(s, 16, 32)
 	return uint32(v), err == nil
 }
 
-func (s *session) handleSubmit(req *request, params []json.RawMessage) {
-	reject := func(code int, msg string) {
-		s.mu.Lock()
-		s.rejected++
-		if s.rejectReasons == nil {
-			s.rejectReasons = make(map[string]uint64)
-		}
-		s.rejectReasons[msg]++
-		worker := s.worker
-		s.mu.Unlock()
-		s.srv.rejected.Add(1)
-		s.reply(req.ID, nil, code, msg)
-		// A miner that has not logged in yet has no name to record it under.
-		if s.srv.stats != nil && worker != "" {
-			s.srv.stats.Rejected(worker, time.Now())
+// submission is a mining.submit as the miner sent it.
+type submission struct {
+	jobID       string
+	extranonce2 []byte
+	ntime       uint32
+	nonce       uint32
+	versionBits uint32 // 0 if the miner sent none
+}
+
+// parseSubmit reads the parameters of a mining.submit: the worker's name,
+// which is not used, then the job id, the extranonce2, the time, the nonce
+// and, from a miner that rolls the version, the version bits. It returns what
+// is wrong with them, or "".
+func parseSubmit(params []json.RawMessage) (submission, string) {
+	jobID, ok1 := stringParam(params, 1)
+	en2Hex, ok2 := stringParam(params, 2)
+	ntimeHex, ok3 := stringParam(params, 3)
+	nonceHex, ok4 := stringParam(params, 4)
+	if !(ok1 && ok2 && ok3 && ok4) {
+		return submission{}, "Malformed submit"
+	}
+	extranonce2, err := hex.DecodeString(en2Hex)
+	ntime, okT := hexUint32(ntimeHex)
+	nonce, okN := hexUint32(nonceHex)
+	if err != nil || len(extranonce2) != work.Extranonce2Size || !okT || !okN {
+		return submission{}, "Malformed submit"
+	}
+	sub := submission{jobID: jobID, extranonce2: extranonce2, ntime: ntime, nonce: nonce}
+	if bitsHex, ok := stringParam(params, 5); ok {
+		if sub.versionBits, ok = hexUint32(bitsHex); !ok {
+			return submission{}, "Malformed version bits"
 		}
 	}
+	return sub, ""
+}
 
+// versionReadings returns the block versions a miner may have hashed for a
+// job of the given version when it submits bits, and whether the bits keep to
+// mask, the bits it was allowed to change.
+//
+// BIP310 says the submitted bits replace the masked bits of the job's
+// version. Some firmware sends the XOR against the job's version instead. The
+// two only differ when the job's version already has bits inside the mask.
+// Both are returned, and the one that produces the better hash is the one the
+// miner hashed: the other is a random number.
+//
+// Bits outside the mask break the protocol, and such a share is not paid.
+// The header behind it may still be a block, though, and the network does not
+// ask which bits a miner was allowed to change. So for those the readings
+// are returned that a miner rolling too many bits, or sending the whole
+// version, may have meant, for the caller to test against the network target
+// and nothing else.
+func versionReadings(jobVersion, mask, bits uint32) (versions []uint32, inMask bool) {
+	add := func(v uint32) {
+		for _, known := range versions {
+			if known == v {
+				return
+			}
+		}
+		versions = append(versions, v)
+	}
+	if bits&^mask == 0 {
+		add(jobVersion&^mask | bits)
+		add(jobVersion ^ bits)
+		return versions, true
+	}
+	add(jobVersion ^ bits)                     // changed bits, sent as a difference
+	add(jobVersion | bits)                     // changed bits, added to the job's version
+	add(jobVersion&^versionRollingMask | bits) // BIP310 with every bit BIP320 allows
+	add(bits)                                  // the whole version
+	return versions, false
+}
+
+// solution is a submitted share worked out against its job: the header the
+// miner hashed, and what that hash is worth.
+type solution struct {
+	header    [80]byte
+	hash      btc.Hash
+	hashInt   *big.Int
+	version   uint32
+	shareDiff float64
+	isBlock   bool // the hash meets the network target
+}
+
+// solve builds the header a submission stands for, in each of the given
+// readings of its version, and returns the one with the best hash.
+func solve(job *work.Job, coinbase []byte, sub submission, versions []uint32) solution {
+	var best solution
+	for i, v := range versions {
+		header := job.Header(coinbase, v, sub.ntime, sub.nonce)
+		hash := btc.SHA256d(header[:])
+		if hashInt := btc.HashToInt(hash); i == 0 || hashInt.Cmp(best.hashInt) < 0 {
+			best = solution{header: header, hash: hash, hashInt: hashInt, version: v}
+		}
+	}
+	best.shareDiff = btc.DifficultyFromTarget(best.hashInt)
+	best.isBlock = best.hashInt.Cmp(job.Target) <= 0
+	return best
+}
+
+// rejectShare answers a mining.submit with an error and counts the share as
+// rejected.
+func (s *session) rejectShare(req *request, code int, msg string) {
+	s.mu.Lock()
+	s.rejected++
+	if s.rejectReasons == nil {
+		s.rejectReasons = make(map[string]uint64)
+	}
+	s.rejectReasons[msg]++
+	worker := s.worker
+	s.mu.Unlock()
+	s.srv.rejected.Add(1)
+	s.reply(req.ID, nil, code, msg)
+	// A miner that has not logged in yet has no name to record it under.
+	if s.srv.stats != nil && worker != "" {
+		s.srv.stats.Rejected(worker, time.Now())
+	}
+}
+
+// handleSubmit takes a share. It goes in this order, and the order matters:
+//
+//  1. Read the share and find its job. Without both, there is no header.
+//  2. Build the header and hash it.
+//  3. If the hash meets the network target, the share is a block, and from
+//     here on nothing but being a repeat can turn it away. Only the node can
+//     judge a block, and refusing the header here would throw the block away.
+//  4. Anything else is an ordinary share, and must keep to the rules that
+//     make it worth paying: the mask, a job that is current, a time close to
+//     the job's, and the difficulty the miner was given.
+//
+// A rule for ordinary shares must never be checked before step 3.
+func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	s.mu.Lock()
 	subscribed, authorized := s.subscribed, s.authorized
 	payoutScript, mask, worker := s.payoutScript, s.versionMask, s.worker
@@ -627,113 +745,88 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 		// Refusing such a share could throw away a valid block.
 		mask = versionRollingMask
 	}
+	// A miner that has not subscribed and logged in was never sent a job.
 	if !subscribed {
-		reject(errNotSubbed, "Not subscribed")
+		s.rejectShare(req, errNotSubbed, "Not subscribed")
 		return
 	}
 	if !authorized {
-		reject(errUnauthorized, "Unauthorized worker")
+		s.rejectShare(req, errUnauthorized, "Unauthorized worker")
 		return
 	}
 
-	jobID, ok1 := stringParam(params, 1)
-	en2Hex, ok2 := stringParam(params, 2)
-	ntimeHex, ok3 := stringParam(params, 3)
-	nonceHex, ok4 := stringParam(params, 4)
-	if !(ok1 && ok2 && ok3 && ok4) {
-		reject(errOther, "Malformed submit")
+	// 1. The share and its job.
+	sub, problem := parseSubmit(params)
+	if problem != "" {
+		s.rejectShare(req, errOther, problem)
 		return
 	}
-	extranonce2, err := hex.DecodeString(en2Hex)
-	ntime, okT := hexUint32(ntimeHex)
-	nonce, okN := hexUint32(nonceHex)
-	if err != nil || len(extranonce2) != work.Extranonce2Size || !okT || !okN {
-		reject(errOther, "Malformed submit")
-		return
-	}
-	var versionBits uint32
-	if bitsHex, ok := stringParam(params, 5); ok {
-		if versionBits, ok = hexUint32(bitsHex); !ok {
-			reject(errOther, "Malformed version bits")
-			return
-		}
-		if versionBits&^mask != 0 {
-			reject(errOther, "Version bits outside the allowed mask")
-			return
-		}
-	}
-
-	job := s.srv.jobs.Get(jobID)
+	job := s.srv.jobs.Get(sub.jobID)
 	if job == nil {
-		reject(errJobNotFound, "Job not found (stale)")
+		s.rejectShare(req, errJobNotFound, "Job not found (stale)")
 		return
 	}
 
-	// BIP310 says the submitted bits replace the masked bits of the job's
-	// version. Some firmware sends the XOR against the job's version
-	// instead. The two only differ when the job's version already has bits
-	// inside the mask, so accept whichever one produces the better hash.
-	versions := []uint32{job.Version&^mask | versionBits}
-	if alt := job.Version ^ versionBits; alt != versions[0] {
-		versions = append(versions, alt)
-	}
-	coinbase := job.Coinbase(payoutScript, s.extranonce1[:], extranonce2)
-	var header [80]byte
-	var hash btc.Hash
-	var version uint32
-	for i, v := range versions {
-		h := job.Header(coinbase, v, ntime, nonce)
-		sum := btc.SHA256d(h[:])
-		if i == 0 || btc.HashToInt(sum).Cmp(btc.HashToInt(hash)) < 0 {
-			header, hash, version = h, sum, v
-		}
-	}
-	hashInt := btc.HashToInt(hash)
-	shareDiff := btc.DifficultyFromTarget(hashInt)
-	isBlock := hashInt.Cmp(job.Target) <= 0
-
-	// Ordinary shares use a short time window: new work arrives every few
-	// seconds, so rolling further gains nothing. A header that meets the
-	// network target is submitted whatever its job or time. Only the node
-	// can judge a block's time against its own clock, and refusing the
-	// header here would throw the block away.
-	if !isBlock {
-		if !job.AcceptsShares() {
-			reject(errJobNotFound, "Job not found (stale)")
-			return
-		}
-		if ntime < job.CurTime || ntime > job.CurTime+maxNTimeRoll {
-			reject(errOther, "Time out of range")
-			return
-		}
-	}
+	// 2. The header and its hash.
+	versions, inMask := versionReadings(job.Version, mask, sub.versionBits)
+	coinbase := job.Coinbase(payoutScript, s.extranonce1[:], sub.extranonce2)
+	sol := solve(job, coinbase, sub, versions)
 
 	s.mu.Lock()
-	assigned, known := s.jobDiff[jobID]
+	assigned, known := s.jobDiff[sub.jobID]
 	if !known {
 		assigned = math.Min(s.diff, job.NetDiff)
 	}
 	current := s.sentDiff
 	s.mu.Unlock()
 
-	if !isBlock && hashInt.Cmp(btc.TargetFromDifficulty(assigned)) > 0 {
-		reject(errLowDiff, "Difficulty too low")
+	// 4. The rules for an ordinary share. (3. is that a block skips them.)
+	if !sol.isBlock {
+		if code, msg := ordinaryShareProblem(job, sub, sol, inMask, assigned); msg != "" {
+			s.rejectShare(req, code, msg)
+			return
+		}
+	}
+	if !job.MarkShare(s.extranonce1[:], sub.extranonce2, sub.ntime, sub.nonce, sol.version) {
+		s.rejectShare(req, errDuplicate, "Duplicate share")
 		return
 	}
-	if !job.MarkShare(s.extranonce1[:], extranonce2, ntime, nonce, version) {
-		reject(errDuplicate, "Duplicate share")
-		return
-	}
-	if isBlock {
-		log.Printf("*** BLOCK FOUND by %s: height %d, hash %s ***", worker, job.Height, hash)
-		s.srv.blocks.Found(job.Height, hash.String(), job.Block(header, coinbase), worker)
+	if sol.isBlock {
+		log.Printf("*** BLOCK FOUND by %s: height %d, hash %s ***", worker, job.Height, sol.hash)
+		s.srv.blocks.Found(job.Height, sol.hash.String(), job.Block(sol.header, coinbase), worker)
 	}
 
 	// Credit the share at the difficulty the miner was actually working at.
 	credit := assigned
-	if current > assigned && shareDiff >= current {
+	if current > assigned && sol.shareDiff >= current {
 		credit = current
 	}
+	s.acceptShare(req, worker, credit, sol.shareDiff)
+}
+
+// ordinaryShareProblem checks a share that is not a block against the rules
+// for ordinary shares. It returns the Stratum error for the first one the
+// share breaks, or an empty message.
+func ordinaryShareProblem(job *work.Job, sub submission, sol solution, inMask bool, assigned float64) (code int, msg string) {
+	switch {
+	case !inMask:
+		return errOther, "Version bits outside the allowed mask"
+	case !job.AcceptsShares():
+		return errJobNotFound, "Job not found (stale)"
+	// A short time window: new work arrives every few seconds, so rolling
+	// the time further gains nothing.
+	case sub.ntime < job.CurTime || sub.ntime > job.CurTime+maxNTimeRoll:
+		return errOther, "Time out of range"
+	case sol.hashInt.Cmp(btc.TargetFromDifficulty(assigned)) > 0:
+		return errLowDiff, "Difficulty too low"
+	}
+	return 0, ""
+}
+
+// acceptShare counts an accepted share, tells the miner, and adjusts its
+// difficulty. credit is the difficulty the share counts for, shareDiff the
+// difficulty its hash reached.
+func (s *session) acceptShare(req *request, worker string, credit, shareDiff float64) {
 	now := time.Now()
 	s.mu.Lock()
 	s.accepted++

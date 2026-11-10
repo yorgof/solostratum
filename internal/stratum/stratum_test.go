@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/big"
 	"net"
 	"os"
 	"strings"
@@ -1832,5 +1833,172 @@ func TestStuckLogNeverHoldsUpMining(t *testing.T) {
 	for i := range 3 {
 		m := h.dial(axesim.Options{User: fmt.Sprintf("rig%d", i)})
 		h.mineBlock(m, firstJob(t, m))
+	}
+}
+
+// easyBits is a network target that about one hash in 65,000 meets: a block
+// takes a moment to find, and a header that was not mined for it is
+// practically never one.
+const easyBits = "1f00ffff"
+
+// mineFor finds a nonce with which the job's header, for a miner with the
+// given extranonces that hashes the given version, meets target.
+func mineFor(t *testing.T, job *work.Job, extranonce1, extranonce2 []byte, version uint32, target *big.Int) (nonce uint32, header [80]byte, hash btc.Hash) {
+	t.Helper()
+	coinbase := job.Coinbase(defaultScript, extranonce1, extranonce2)
+	for nonce = 0; nonce < 50_000_000; nonce++ {
+		header = job.Header(coinbase, version, job.CurTime, nonce)
+		if hash = btc.SHA256d(header[:]); btc.HashToInt(hash).Cmp(target) <= 0 {
+			return nonce, header, hash
+		}
+	}
+	t.Fatal("no nonce found")
+	return
+}
+
+func extranonce1Of(t *testing.T, m *axesim.Miner) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(m.Extranonce1())
+	if err != nil || len(b) != work.Extranonce1Size {
+		t.Fatalf("extranonce1 %q", m.Extranonce1())
+	}
+	return b
+}
+
+// A header that meets the network target is a block whatever the miner did to
+// the version: the network does not ask which bits a miner was allowed to
+// change. Such a share used to be turned away before its hash was looked at.
+func TestBlockWithVersionBitsOutsideTheMaskIsSubmitted(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version uint32 // what the miner hashed
+		sent    uint32 // what it sent as version bits
+	}{
+		{"a bit below the mask", 0x20000004, 0x00000004},
+		{"a bit above the mask", 0x60000000, 0x40000000},
+		{"bits inside and outside the mask", 0x2000a004, 0x0000a004},
+		{"the whole version sent", 0x2000a000, 0x2000a000},
+		{"the whole version sent, with a bit outside the mask", 0x2000a004, 0x2000a004},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			serverJob := makeJob(t, "a", easyBits, 0x20000000, 3, true)
+			h := newHarness(t, 1024, serverJob)
+			m := h.dial(axesim.Options{User: "rig1"})
+			firstJob(t, m)
+			if tc.sent&^m.VersionMask() == 0 {
+				t.Fatalf("version bits %08x are inside the mask %08x: nothing to test", tc.sent, m.VersionMask())
+			}
+			extranonce2 := []byte{0, 0, 0, 7}
+			nonce, header, hash := mineFor(t, serverJob, extranonce1Of(t, m), extranonce2, tc.version, serverJob.Target)
+			res := mustSubmit(t, m, axesim.Share{JobID: "a", Extranonce2: hex.EncodeToString(extranonce2), NTime: serverJob.CurTime, Nonce: nonce, VersionBits: tc.sent})
+			if !res.Accepted {
+				t.Fatalf("a block was turned away: %+v", res)
+			}
+			select {
+			case found := <-h.sink.ch:
+				if found.hash != hash.String() || !bytes.Equal(found.block[:80], header[:]) {
+					t.Fatalf("block %s with header %x handed over, want %s with %x", found.hash, found.block[:80], hash, header)
+				}
+				checkBlock(t, found.block, serverJob, 3, defaultScript)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the block was not handed over")
+			}
+		})
+	}
+}
+
+// An ordinary share with version bits outside the mask is still not paid.
+func TestOrdinaryShareOutsideTheMaskIsRejected(t *testing.T) {
+	serverJob := makeJob(t, "1", diff1Bits, 0x20000000, 0, true)
+	h := newHarness(t, lowDifficulty, serverJob)
+	m := h.dial(axesim.Options{})
+	firstJob(t, m)
+	extranonce2 := []byte{0, 0, 0, 7}
+	nonce, _, _ := mineFor(t, serverJob, extranonce1Of(t, m), extranonce2, 0x20000004, btc.TargetFromDifficulty(lowDifficulty))
+	res := mustSubmit(t, m, axesim.Share{JobID: "1", Extranonce2: hex.EncodeToString(extranonce2), NTime: serverJob.CurTime, Nonce: nonce, VersionBits: 4})
+	if res.Accepted || res.Code != errOther || !strings.Contains(res.Message, "outside the allowed mask") {
+		t.Fatalf("share with version bits outside the mask: %+v", res)
+	}
+	select {
+	case found := <-h.sink.ch:
+		t.Fatalf("an ordinary share was handed over as block %s", found.hash)
+	default:
+	}
+	if st := h.srv.Status(); st.Accepted != 0 || st.Rejected != 1 {
+		t.Fatalf("accepted %d, rejected %d", st.Accepted, st.Rejected)
+	}
+}
+
+// Miners send their numbers as eight hex digits. One that leaves out the
+// leading zeros means the same number, and its share, which may be a block,
+// is read and not turned away over how it is written.
+func TestNumbersWithoutLeadingZerosAreRead(t *testing.T) {
+	serverJob := makeJob(t, "a", easyBits, 0x20000000, 0, true)
+	h := newHarness(t, 1024, serverJob)
+	c := h.raw()
+	c.send(`{"id":1,"method":"mining.subscribe","params":["test"]}`)
+	extranonce1, err := hex.DecodeString(c.answer(1)["result"].([]any)[1].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.send(`{"id":2,"method":"mining.authorize","params":["rig1","x"]}`)
+	c.answer(2)
+
+	extranonce2 := []byte{0, 0, 0, 7}
+	nonce, _, hash := mineFor(t, serverJob, extranonce1, extranonce2, 0x20000000, serverJob.Target)
+	short := fmt.Sprintf("%x", nonce)
+	if len(short) == 8 {
+		t.Fatalf("nonce %s has no leading zero to leave out", short)
+	}
+	c.send(fmt.Sprintf(`{"id":3,"method":"mining.submit","params":["rig1","a","%x","%x","%s","0"]}`, extranonce2, serverJob.CurTime, short))
+	if msg := c.answer(3); msg["result"] != true {
+		t.Fatalf("block with nonce %q and version bits \"0\" was turned away: %v", short, msg)
+	}
+	select {
+	case found := <-h.sink.ch:
+		if found.hash != hash.String() {
+			t.Fatalf("block %s handed over, want %s", found.hash, hash)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the block was not handed over")
+	}
+}
+
+func TestHexUint32(t *testing.T) {
+	for in, want := range map[string]uint32{"00000000": 0, "0": 0, "1": 1, "abc": 0xabc, "ABCDEF12": 0xabcdef12, "ffffffff": 0xffffffff, "0000001f": 0x1f} {
+		if got, ok := hexUint32(in); !ok || got != want {
+			t.Errorf("hexUint32(%q) = %x, %v, want %x", in, got, ok, want)
+		}
+	}
+	for _, in := range []string{"", "123456789", "0x12", "-1", "+1", "1_0", "12g4", " 1", "000000000"} {
+		if got, ok := hexUint32(in); ok {
+			t.Errorf("hexUint32(%q) = %x, want it refused", in, got)
+		}
+	}
+}
+
+func TestVersionReadings(t *testing.T) {
+	const mask = versionRollingMask
+	for _, tc := range []struct {
+		name            string
+		job, mask, bits uint32
+		want            []uint32
+		inMask          bool
+	}{
+		{"no bits sent", 0x20000000, mask, 0, []uint32{0x20000000}, true},
+		{"rolled bits", 0x20000000, mask, 0x00a04000, []uint32{0x20a04000}, true},
+		// The job's version has a bit inside the mask: the two encodings differ.
+		{"job bit inside the mask, none sent", 0x20002000, mask, 0, []uint32{0x20000000, 0x20002000}, true},
+		{"job bit inside the mask, bits sent", 0x20002000, mask, 0x00006000, []uint32{0x20006000, 0x20004000}, true},
+		{"a narrower mask", 0x20000000, 0x00ffe000, 0x00a04000, []uint32{0x20a04000}, true},
+		// Outside the mask: every reading a miner may have meant.
+		{"a bit below the mask", 0x20000000, mask, 0x00000004, []uint32{0x20000004, 0x00000004}, false},
+		{"the whole version", 0x20000000, mask, 0x2000a000, []uint32{0x0000a000, 0x2000a000}, false},
+		{"outside a narrower mask", 0x20002000, 0x00ffe000, 0x10004000, []uint32{0x30006000, 0x30004000, 0x10004000}, false},
+	} {
+		got, inMask := versionReadings(tc.job, tc.mask, tc.bits)
+		if inMask != tc.inMask || fmt.Sprintf("%08x", got) != fmt.Sprintf("%08x", tc.want) {
+			t.Errorf("%s: versionReadings(%08x, %08x, %08x) = %08x, %v, want %08x, %v", tc.name, tc.job, tc.mask, tc.bits, got, inMask, tc.want, tc.inMask)
+		}
 	}
 }
