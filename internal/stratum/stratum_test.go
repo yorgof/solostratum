@@ -959,6 +959,10 @@ func TestRetarget(t *testing.T) {
 	at := func(seconds float64) time.Time {
 		return time.Unix(1000, 0).Add(time.Duration(seconds * float64(time.Second)))
 	}
+	// delivered gives the session a window of shares, all at its difficulty.
+	delivered := func(s *session, shares int) {
+		s.windowShares, s.windowWork = shares, float64(shares)*s.diff
+	}
 
 	s := newSess(1024, 0.001)
 	if s.retargetLocked(at(10)) {
@@ -967,21 +971,21 @@ func TestRetarget(t *testing.T) {
 
 	// 30 shares in 3 seconds is 60 times too fast: raise by the maximum step.
 	s = newSess(1024, 0.001)
-	s.windowShares = 30
+	delivered(s, 30)
 	if !s.retargetLocked(at(3)) || s.diff != 1024*16 {
 		t.Errorf("fast miner: difficulty %v, want %v", s.diff, 1024*16)
 	}
 
 	// Five shares in 30 seconds is the goal: leave it alone.
 	s = newSess(1024, 0.001)
-	s.windowShares = 5
+	delivered(s, 5)
 	if s.retargetLocked(at(30)) || s.diff != 1024 {
 		t.Errorf("on-target miner was retargeted to %v", s.diff)
 	}
 
 	// One share in 30 seconds is five times too slow.
 	s = newSess(1024, 0.001)
-	s.windowShares = 1
+	delivered(s, 1)
 	if !s.retargetLocked(at(30)) || s.diff != 256 {
 		t.Errorf("slow miner: difficulty %v, want 256", s.diff)
 	}
@@ -1002,6 +1006,196 @@ func TestRetarget(t *testing.T) {
 	}
 	if s.retargetLocked(at(200)) {
 		t.Error("retargeted although already at the floor")
+	}
+}
+
+// The difficulty follows the work a miner delivers, not the number of its
+// shares. Shares that still arrive at an old, lower difficulty after a raise
+// say nothing new about the miner's speed, and must not raise it again.
+func TestRetargetGoesByWorkNotByShareCount(t *testing.T) {
+	start := time.Unix(1000, 0)
+	s := &session{diff: 1024, floor: 0.001, minDiff: 0.001, windowStart: start}
+	// 30 shares in 3 seconds at 1024: the right difficulty is 61,440.
+	s.windowShares, s.windowWork = 30, 30*1024
+	now := start.Add(3 * time.Second)
+	if !s.retargetLocked(now) || s.diff != 16384 {
+		t.Fatalf("first raise: difficulty %v, want 16384", s.diff)
+	}
+	// The miner has not taken the raise in yet: 30 more shares at 1024.
+	s.windowShares, s.windowWork = 30, 30*1024
+	now = now.Add(3 * time.Second)
+	if !s.retargetLocked(now) || s.diff != 65536 {
+		t.Fatalf("second window at the old difficulty: difficulty %v, want 65536", s.diff)
+	}
+	// And 30 more. The work says the difficulty is right now, so it stays,
+	// where counting shares would raise it by 16 again, and again.
+	for i := 0; i < 20; i++ {
+		s.windowShares, s.windowWork = 30, 30*1024
+		now = now.Add(3 * time.Second)
+		if s.retargetLocked(now) {
+			t.Fatalf("window %d of shares at the old difficulty changed the difficulty to %v", i+3, s.diff)
+		}
+	}
+}
+
+// A miner that applies a new difficulty only from the next job keeps sending
+// shares at the old one until then. Whatever its speed, half a minute of that
+// must leave it with a difficulty it can work at. Before, a 100 TH/s miner
+// ended up at a difficulty of 10^29.
+func TestRetargetWithAMinerThatDefersTheDifficulty(t *testing.T) {
+	for _, hashrate := range []float64{50e3, 1.2e12, 5e12, 22e12, 100e12, 200e12, 1e15} {
+		s := &session{diff: 1024, floor: 0.001, minDiff: 0.001}
+		start := time.Unix(1000, 0)
+		s.windowStart = start
+		const working = 1024.0 // the miner stays at the starting difficulty
+		perShare := time.Duration(working * 4294967296 / hashrate * float64(time.Second))
+		highest := s.diff
+		for now := start.Add(perShare); now.Before(start.Add(30 * time.Second)); now = now.Add(perShare) {
+			s.windowShares++
+			s.windowWork += working
+			s.retargetLocked(now)
+			highest = math.Max(highest, s.diff)
+		}
+		ideal := hashrate * sharePeriod.Seconds() / 4294967296
+		if limit := math.Max(4*ideal, 1024); highest > limit {
+			t.Errorf("%.3g H/s: difficulty reached %.3g, want at most %.3g (the right one is %.3g)", hashrate, highest, limit, ideal)
+		}
+	}
+}
+
+// A silent miner is helped down faster with every silent window, so that one
+// far below its starting difficulty gets work it can do within minutes. A
+// share ends the run.
+func TestSilentMinerIsLoweredFasterEachWindow(t *testing.T) {
+	start := time.Unix(1000, 0)
+	s := &session{diff: 1 << 20, floor: 1 << 20, minDiff: 0.001, windowStart: start}
+	now := start
+	quiet := func() float64 {
+		now = now.Add(quietWindow + time.Second)
+		s.retargetLocked(now)
+		return s.diff
+	}
+	for i, want := range []float64{1 << 17, 1 << 11, 4, 4.0 / 512, 0.001, 0.001} {
+		if got := quiet(); got != want {
+			t.Fatalf("after %d silent windows: difficulty %v, want %v", i+1, got, want)
+		}
+	}
+	// From the default start, the lowest difficulty is four windows away.
+	s = &session{diff: 1024, floor: 0.001, minDiff: 0.001, windowStart: now}
+	for i := 0; i < 4; i++ {
+		quiet()
+	}
+	if s.diff != 0.001 {
+		t.Fatalf("difficulty %v after four silent windows from 1024, want 0.001", s.diff)
+	}
+	// A window with a share starts the steps over.
+	s = &session{diff: 1 << 20, floor: 0.001, minDiff: 0.001, windowStart: now}
+	quiet()
+	quiet() // 2^20 / 8 / 64 = 2048
+	s.windowShares, s.windowWork = 1, 2048
+	now = now.Add(retargetWindow / 5)
+	s.retargetLocked(now) // too early to judge one share
+	now = now.Add(retargetWindow)
+	s.retargetLocked(now)
+	before := s.diff
+	if got := quiet(); got != before/8 {
+		t.Fatalf("first silent window after a share: difficulty %v, want %v", got, before/8)
+	}
+}
+
+// deadlineConn records the read deadlines set on a connection.
+type deadlineConn struct {
+	net.Conn
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (c *deadlineConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deadlines = append(c.deadlines, t)
+	return nil
+}
+
+func (c *deadlineConn) set() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.deadlines...)
+}
+
+// A miner that finds no share sends nothing, and would be taken for dead
+// while its difficulty is still on the way down to something it can do. Each
+// lowering gives it the full idle time again. Work sent without a lowering
+// does not: a connection that is really dead must still time out.
+func TestLoweringTheDifficultyRestartsTheIdleTime(t *testing.T) {
+	job := makeJob(t, "1", diff1Bits, 0x20000000, 0, true)
+	jobs := &fakeJobs{}
+	jobs.add(job)
+	srv := NewServer(Options{Network: regtest, DefaultAddress: defaultAddress, DefaultScript: defaultScript, StartDifficulty: 1, MinDifficulty: 0.001}, jobs, &fakeSink{})
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	conn := &deadlineConn{Conn: server}
+	sess := newSession(srv, conn, [work.Extranonce1Size]byte{1})
+	sess.subscribed, sess.authorized = true, true
+
+	sess.sendJob(job, false)
+	if got := conn.set(); len(got) != 0 {
+		t.Fatalf("work sent without lowering the difficulty moved the idle deadline: %v", got)
+	}
+	sess.mu.Lock()
+	sess.windowStart = time.Now().Add(-2 * quietWindow)
+	sess.mu.Unlock()
+	sess.sendJob(job, false)
+	got := conn.set()
+	if sess.diff != 1.0/8 || len(got) != 1 {
+		t.Fatalf("difficulty %v with %d deadlines set, want 0.125 with one", sess.diff, len(got))
+	}
+	if left := time.Until(got[0]); left < idleTimeout-time.Minute || left > idleTimeout {
+		t.Fatalf("the idle deadline is %s away, want about %s", left, idleTimeout)
+	}
+	// At the lowest difficulty there is nothing left to wait for.
+	sess.mu.Lock()
+	sess.diff, sess.windowStart = 0.001, time.Now().Add(-2*quietWindow)
+	sess.mu.Unlock()
+	sess.sendJob(job, false)
+	if got := conn.set(); len(got) != 1 {
+		t.Fatalf("a miner already at the lowest difficulty got more idle time: %d deadlines", len(got))
+	}
+}
+
+// The same through a real connection: a miner that ignores every
+// mining.set_difficulty and keeps sending shares at the difficulty it started
+// with. Its work is all the server has to go by, and the difficulty must
+// settle near the one that suits its speed.
+func TestMinerThatIgnoresADifficultyRaise(t *testing.T) {
+	// About 4,000 hashes per share, so that many shares take little time.
+	const working = lowDifficulty / 10
+	h := newHarness(t, working, makeJob(t, "1", diff1Bits, 0x20000000, 0, true))
+	m := h.dial(axesim.Options{})
+	job := firstJob(t, m)
+	sess := h.srv.snapshotSessions()[0]
+
+	const shares = 6 * retargetShares
+	started := time.Now()
+	for i := 0; i < shares; i++ {
+		if res := mustSubmit(t, m, mustMine(t, m, job, working)); !res.Accepted {
+			t.Fatalf("share %d at the difficulty the job was sent with was rejected: %+v", i, res)
+		}
+	}
+	// Every share was credited at the difficulty the miner works at, whatever
+	// its hash reached, so this is the difficulty that suits its speed.
+	ideal := shares * working / time.Since(started).Seconds() * sharePeriod.Seconds()
+	sess.mu.Lock()
+	diff := sess.diff
+	sess.mu.Unlock()
+	// Counting shares would have raised it by 16 for every 30 of them: by
+	// 16 to the power of 6 in all.
+	if diff > 8*ideal {
+		t.Fatalf("difficulty %.3g after %d shares at %.3g, want at most %.3g (the right one is about %.3g)", diff, shares, working, 8*ideal, ideal)
+	}
+	if diff <= working {
+		t.Fatalf("difficulty %.3g was never raised for a miner sending %d shares in %s", diff, shares, time.Since(started))
 	}
 }
 
