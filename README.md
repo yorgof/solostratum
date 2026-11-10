@@ -271,8 +271,9 @@ longer own from the offline list, stop solostratum and remove its entry from
    never overwritten. This takes a few milliseconds.
 2. Then the block is sent to your node, so it is on disk before the node
    is contacted. A slow or stuck disk holds it back by 50 milliseconds at
-   most. If the node cannot be reached, the block is retried every two
-   seconds for thirty minutes.
+   most. If the node cannot be reached, the block is sent again a tenth of
+   a second later, then after twice as long each time, and from then on
+   every two seconds, for thirty minutes.
 3. The node's answer is shown on the status page at once, and written next
    to the file in a `.result` file as soon as the file is saved, even if the
    disk is slow to finish it.
@@ -294,7 +295,11 @@ few more seconds to finish the block's files. A block that is not on disk
 yet is first written in full to the log. A saved block that never got its
 answer is delivered again at the next start, if that comes within thirty
 minutes of finding it: as soon as the node answers, even if something else
-then stops solostratum from starting.
+then stops solostratum from starting. If the node has the block already by
+then, the block is listed as "already known to the node" and not as
+accepted: the answer that said whether it won was lost, and the node does
+not repeat it. `bitcoin-cli getblockheader <hash>` tells you: one or more
+confirmations mean the block is in the chain.
 
 ## How it stays correct
 

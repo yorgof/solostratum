@@ -374,7 +374,8 @@ function render(r) {
     const row = bb.insertRow();
     cell(row, new Date(b.time).toLocaleString());
     cell(row, fmtInt(b.height), "num");
-    cell(row, b.status, b.status === "accepted" ? "ok" : b.status === "submitting" ? "accent" : "bad");
+    // "already known to the node" is neither a win nor a loss: see the README.
+    cell(row, b.status, b.status === "accepted" ? "ok" : b.status === "submitting" ? "accent" : b.status.startsWith("already known") ? "" : "bad");
     cell(row, b.hash, "mono");
     cell(row, b.file, "mono dim");
   }
