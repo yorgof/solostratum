@@ -234,7 +234,8 @@ func TestRejectedAndDuplicate(t *testing.T) {
 		t.Errorf("status %q, %d calls", recs[0].Status, node.calls)
 	}
 
-	// The node already having the block counts as success.
+	// The node already having a block found in this run counts as success:
+	// an earlier attempt reached it and the answer was lost.
 	node = &fakeNode{reason: "duplicate"}
 	s, _, accepted = open(t, node)
 	s.Found(100, "aa", []byte{1}, "")
@@ -1074,7 +1075,7 @@ func TestSlowDiskDoesNotDelayTheBlock(t *testing.T) {
 // A file that the disk finishes only well after the node's answer still gets
 // that answer next to it. Otherwise the next start would deliver the block
 // again, and a block that lost its race, answered "inconclusive", would come
-// back from the node as "duplicate" and be counted as accepted.
+// back from the node as "duplicate", which no longer says that it lost.
 func TestLateFileStillGetsTheAnswer(t *testing.T) {
 	logtest.Capture(t)
 	node := &fakeNode{answers: []submitAnswer{{reason: "inconclusive"}, {reason: "duplicate"}}}
@@ -1199,5 +1200,109 @@ func TestRefusalOfAnUnsavedBlockPointsToTheLog(t *testing.T) {
 	if !strings.Contains(out, "WARNING: THE NODE REFUSES BLOCK aa") || !strings.Contains(out, "this log has it in full") ||
 		!strings.Contains(out, "bitcoin-cli submitblock c0ffee") {
 		t.Fatalf("the warning does not lead to the block:\n%s", out)
+	}
+}
+
+// A block resumed from an earlier run that the node already has may have won
+// or lost: the answer that said which was lost with that run, and the node
+// answers "duplicate" for both. It is recorded as known to the node, not as
+// accepted, and that is final: the next start leaves it alone.
+func TestResumedBlockTheNodeAlreadyHasIsNotClaimed(t *testing.T) {
+	logs := logtest.Capture(t)
+	dir := filepath.Join(t.TempDir(), "blocks")
+	os.MkdirAll(dir, 0o755)
+	name := "block-500-" + time.Now().UTC().Add(-time.Minute).Format(timeLayout) + "-aa11"
+	os.WriteFile(filepath.Join(dir, name+".hex"), []byte("c0ffee\n"), 0o644)
+
+	var accepted atomic.Int64
+	node := &fakeNode{reason: "duplicate"}
+	s, err := Open(dir, node, func() { accepted.Add(1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Resume()
+	s.Wait()
+	if got := s.Records()[0].Status; got != "already known to the node" || accepted.Load() != 0 || node.calls != 1 {
+		t.Fatalf("status %q after %d calls, counted as accepted %d times", got, node.calls, accepted.Load())
+	}
+	if raw, _ := os.ReadFile(filepath.Join(dir, name+".result")); strings.TrimSpace(string(raw)) != "already known to the node" {
+		t.Fatalf("result file: %q", raw)
+	}
+	out := logs.String()
+	if strings.Contains(out, "BLOCK ACCEPTED") || !strings.Contains(out, "bitcoin-cli getblockheader aa11") {
+		t.Fatalf("the log claims the block, or does not say how to find out:\n%s", out)
+	}
+
+	again, err := Open(dir, node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again.Resume()
+	again.Wait()
+	if node.calls != 1 || again.Records()[0].Status != "already known to the node" {
+		t.Fatalf("the next start delivered the block again: %d calls, status %q", node.calls, again.Records()[0].Status)
+	}
+}
+
+// A resumed block the node did not have yet is accepted like any other, even
+// when the answer to that takes two attempts to arrive.
+func TestResumedBlockAcceptedNow(t *testing.T) {
+	logtest.Capture(t)
+	dir := filepath.Join(t.TempDir(), "blocks")
+	os.MkdirAll(dir, 0o755)
+	name := "block-500-" + time.Now().UTC().Add(-time.Minute).Format(timeLayout) + "-aa11"
+	os.WriteFile(filepath.Join(dir, name+".hex"), []byte("c0ffee\n"), 0o644)
+	node := &fakeNode{failures: 1}
+	s, err := Open(dir, node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.retryFirst = time.Millisecond
+	s.Resume()
+	s.Wait()
+	if got := s.Records()[0].Status; got != "accepted" || node.calls != 2 {
+		t.Fatalf("status %q after %d calls, want accepted after 2", got, node.calls)
+	}
+}
+
+// The first retry comes quickly and the later ones less often: most failures
+// to reach the node pass at once, and every second a found block waits is a
+// chance for another block to arrive first.
+func TestRetryDelayGrowsFromShortToRetryEvery(t *testing.T) {
+	s, err := Open(t.TempDir(), &fakeNode{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := time.Millisecond
+	for failed, want := range map[int]time.Duration{1: 100 * ms, 2: 200 * ms, 3: 400 * ms, 4: 800 * ms, 5: 1600 * ms, 6: 2000 * ms, 7: 2000 * ms, 500: 2000 * ms} {
+		if got := s.retryDelay(failed); got != want {
+			t.Errorf("after %d failed attempts: wait %s, want %s", failed, got, want)
+		}
+	}
+	// Never longer than retryEvery, whatever the first step is.
+	s.retryFirst, s.retryEvery = time.Second, 300*ms
+	if got := s.retryDelay(1); got != 300*ms {
+		t.Errorf("wait %s with retryEvery %s", got, s.retryEvery)
+	}
+}
+
+// With the real schedule: a node that fails twice has the block within a
+// second, where a fixed two seconds between attempts took four.
+func TestBlockReachesAFlakyNodeWithinASecond(t *testing.T) {
+	logtest.Capture(t)
+	node := &fakeNode{failures: 2}
+	s, err := Open(t.TempDir(), node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	s.Found(100, "aa", []byte{1}, "rig")
+	s.Wait()
+	took := time.Since(started)
+	if got := s.Records()[0].Status; got != "accepted" || node.calls != 3 {
+		t.Fatalf("status %q after %d calls", got, node.calls)
+	}
+	if took < 300*time.Millisecond || took > 1500*time.Millisecond {
+		t.Fatalf("delivery took %s, want the 100 ms and 200 ms waits and little more", took)
 	}
 }

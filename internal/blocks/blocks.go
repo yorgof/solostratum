@@ -35,7 +35,7 @@ type Record struct {
 	Height int64     `json:"height"`
 	Hash   string    `json:"hash"`
 	File   string    `json:"file"`
-	Status string    `json:"status"` // "accepted", "submitting", or the rejection reason
+	Status string    `json:"status"` // "accepted", "submitting", "already known to the node", or the rejection reason
 	Worker string    `json:"worker,omitempty"`
 }
 
@@ -45,7 +45,10 @@ type Store struct {
 	node       Submitter
 	onAccepted func()
 
-	// retry schedule for submissions that could not reach the node
+	// retry schedule for submissions that could not reach the node: the first
+	// retry comes after retryFirst, each later one after twice as long, up to
+	// retryEvery, until retryFor has passed (see retryDelay)
+	retryFirst time.Duration
 	retryEvery time.Duration
 	retryFor   time.Duration
 	writeWait  time.Duration // see writeWait; tests change it
@@ -97,9 +100,21 @@ const saveWait = 5 * time.Second
 // fileWait is how long Wait, at the end of the program, gives the disk to
 // finish the blocks' files once every delivery is over. Without the answer
 // next to it, a block is delivered again at the next start, and a block that
-// lost its race would then come back from the node as "duplicate" and be
-// counted as accepted.
+// lost its race would then come back from the node as "duplicate", which
+// says less than the answer that was lost (see statusKnown).
 const fileWait = 10 * time.Second
+
+// statusDuplicate is the node's answer for a block it already has. It is
+// never a block's final status: see settleDuplicate.
+const statusDuplicate = "duplicate"
+
+// statusKnown is the status of a block from an earlier run that the node
+// already had when its delivery was resumed. The node's first answer was lost
+// with that run. It may have been that the block was accepted, or that it was
+// stored without becoming the tip because another block got there first: the
+// node answers "duplicate" for both from then on. Calling such a block
+// accepted would claim a win that nothing here can confirm.
+const statusKnown = "already known to the node"
 
 // statusUnknown marks a block from an earlier run whose result was never
 // recorded.
@@ -120,7 +135,7 @@ func Open(dir string, node Submitter, onAccepted func()) (*Store, error) {
 
 	s := &Store{
 		dir: dir, node: node, onAccepted: onAccepted,
-		retryEvery: 2 * time.Second, retryFor: 30 * time.Minute,
+		retryFirst: 100 * time.Millisecond, retryEvery: 2 * time.Second, retryFor: 30 * time.Minute,
 		writeWait: writeWait, saveWait: saveWait, fileWait: fileWait,
 		inFlight:    map[int]*flight{},
 		submitSlots: make(chan struct{}, maxSubmissions),
@@ -252,7 +267,7 @@ func (s *Store) start(index int, rec Record, base string, block []byte) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.deliver(index, rec.Hash, block, written, answered, filed)
+		s.deliver(index, rec.Hash, block, base != "", written, answered, filed)
 	}()
 }
 
@@ -292,7 +307,8 @@ func (s *Store) keep(index int, rec Record, base string, block []byte, answered 
 // block whatever the disk does. A panic before the node has answered is a
 // bug, and the submission starts again within the same retryFor: giving up
 // could lose the block. A panic after the answer changes nothing about it.
-func (s *Store) deliver(index int, hash string, block []byte, written <-chan struct{}, answered chan<- string, filed <-chan error) {
+// resumed says that the block is one from an earlier run (see Resume).
+func (s *Store) deliver(index int, hash string, block []byte, resumed bool, written <-chan struct{}, answered chan<- string, filed <-chan error) {
 	select {
 	case <-written:
 	case <-time.After(s.writeWait):
@@ -321,6 +337,9 @@ func (s *Store) deliver(index int, hash string, block []byte, written <-chan str
 	}
 	guard.Run("delivering a found block", func() {
 		defer close(answered)
+		if status == statusDuplicate {
+			status = settleDuplicate(hash, resumed)
+		}
 		s.setStatus(index, status)
 		answered <- status
 		if status == "accepted" && s.onAccepted != nil {
@@ -339,6 +358,25 @@ func (s *Store) deliver(index int, hash string, block []byte, written <-chan str
 	s.mu.Lock()
 	delete(s.inFlight, index)
 	s.mu.Unlock()
+}
+
+// settleDuplicate turns the node's answer "duplicate", for a block it already
+// has, into the block's status.
+//
+// In a delivery that began in this run it follows a lost answer: an earlier
+// attempt reached the node and its answer did not come back. The block is
+// taken as accepted, which is what the node says to a new block in all but
+// the rare case that another one beat it.
+//
+// For a block resumed from an earlier run that cannot be told (see
+// statusKnown), so it is not claimed.
+func settleDuplicate(hash string, resumed bool) string {
+	if !resumed {
+		log.Printf("BLOCK ACCEPTED by the node: %s", hash)
+		return "accepted"
+	}
+	log.Printf("Block %s was already known to the node when its delivery was resumed. The node's first answer was lost with the last shutdown, and it no longer says whether the block is in the chain. To find out, run: bitcoin-cli getblockheader %s (1 or more confirmations mean that it is).", hash, hash)
+	return statusKnown
 }
 
 func (s *Store) record(index int) Record {
@@ -497,9 +535,23 @@ func (s *Store) submit(ctx context.Context, index int, hash string, block []byte
 		select {
 		case <-ctx.Done():
 			return giveUp(attempt, why)
-		case <-time.After(s.retryEvery):
+		case <-time.After(s.retryDelay(attempt)):
 		}
 	}
+}
+
+// retryDelay is how long to wait after the given number of failed attempts
+// before the next one: retryFirst, then twice as long each time, up to
+// retryEvery. Most failures to reach the node pass at once, as when it closes
+// a connection or is busy for a moment, and every second a found block waits
+// is a chance for another block to arrive first. A node that stays away is
+// still asked no more often than every retryEvery.
+func (s *Store) retryDelay(failed int) time.Duration {
+	delay := s.retryFirst
+	for i := 1; i < failed && delay < s.retryEvery; i++ {
+		delay *= 2
+	}
+	return min(delay, s.retryEvery)
 }
 
 // attemptInSlot waits for a free submission slot, then submits the block once
@@ -539,11 +591,13 @@ func (s *Store) byHand(index int) string {
 func (s *Store) attempt(hash string, block []byte) (status, why string, refused bool) {
 	reason, err := s.node.SubmitBlock(context.Background(), block)
 	switch {
-	case err == nil && (reason == "" || reason == "duplicate"):
-		// "duplicate" means the node already has this exact block, which
-		// happens when a retry follows a lost answer.
+	case err == nil && reason == "":
 		log.Printf("BLOCK ACCEPTED by the node: %s", hash)
 		return "accepted", "", false
+	case err == nil && reason == statusDuplicate:
+		// The node already has this exact block. What that means for the
+		// block depends on how its delivery began: see settleDuplicate.
+		return statusDuplicate, "", false
 	case err == nil:
 		// Every other answer is final. "inconclusive" means the node stored
 		// the block without making it the tip, typically because another
