@@ -351,8 +351,16 @@ docker build -t solostratum .
 mkdir data && cp internal/config/solostratum.conf.example data/solostratum.conf
 # edit data/solostratum.conf, then:
 docker run -d --name solostratum --restart unless-stopped \
+    --user "$(id -u):$(id -g)" \
     -p 3333:3333 -p 3334:3334 -v "$PWD/data:/data" solostratum
 ```
+
+The container does not run as root. `--user` makes it run as you, so that it
+can read the settings file and write found blocks and the history into your
+`data` folder. Without `--user` it runs as user 65532, which fits a volume
+that Docker creates for `/data` itself, but cannot write to a folder of
+yours: solostratum then stops at once and says that it cannot use
+`blocks_dir`.
 
 Inside a container `127.0.0.1` is the container itself, so `node_url` must
 use the node's real address. The image has a health check: Docker reports

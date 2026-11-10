@@ -27,6 +27,25 @@ jobs:
       - name: Build for every release platform
         run: make release VERSION=ci
 
+  oldest-go:
+    # go.mod and the README promise that this version of Go is enough. The
+    # other jobs use the newest one, which would not notice a call to
+    # something newer.
+    name: Unit tests (oldest supported Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false # no go.sum to key a cache on: the program has no dependencies
+      - name: Show the Go version
+        run: go version
+      - name: Vet and test
+        env:
+          GOTOOLCHAIN: local # fail rather than fetch a newer Go
+        run: make test
+
   platforms:
     name: Unit tests (${{ matrix.os }})
     strategy:
