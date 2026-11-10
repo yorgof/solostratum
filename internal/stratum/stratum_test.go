@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"math/rand"
 	"net"
 	"os"
 	"strings"
@@ -1039,31 +1040,6 @@ func TestRetargetGoesByWorkNotByShareCount(t *testing.T) {
 	}
 }
 
-// A miner that applies a new difficulty only from the next job keeps sending
-// shares at the old one until then. Whatever its speed, half a minute of that
-// must leave it with a difficulty it can work at. Before, a 100 TH/s miner
-// ended up at a difficulty of 10^29.
-func TestRetargetWithAMinerThatDefersTheDifficulty(t *testing.T) {
-	for _, hashrate := range []float64{50e3, 1.2e12, 5e12, 22e12, 100e12, 200e12, 1e15} {
-		s := &session{diff: 1024, floor: 0.001, minDiff: 0.001}
-		start := time.Unix(1000, 0)
-		s.windowStart = start
-		const working = 1024.0 // the miner stays at the starting difficulty
-		perShare := time.Duration(working * 4294967296 / hashrate * float64(time.Second))
-		highest := s.diff
-		for now := start.Add(perShare); now.Before(start.Add(30 * time.Second)); now = now.Add(perShare) {
-			s.windowShares++
-			s.windowWork += working
-			s.retargetLocked(now)
-			highest = math.Max(highest, s.diff)
-		}
-		ideal := hashrate * sharePeriod.Seconds() / 4294967296
-		if limit := math.Max(4*ideal, 1024); highest > limit {
-			t.Errorf("%.3g H/s: difficulty reached %.3g, want at most %.3g (the right one is %.3g)", hashrate, highest, limit, ideal)
-		}
-	}
-}
-
 // A silent miner is helped down faster with every silent window, so that one
 // far below its starting difficulty gets work it can do within minutes. A
 // share ends the run.
@@ -1165,10 +1141,11 @@ func TestLoweringTheDifficultyRestartsTheIdleTime(t *testing.T) {
 	}
 }
 
-// The same through a real connection: a miner that ignores every
-// mining.set_difficulty and keeps sending shares at the difficulty it started
-// with. Its work is all the server has to go by, and the difficulty must
-// settle near the one that suits its speed.
+// Through a real connection: a miner that ignores every mining.set_difficulty
+// and keeps sending shares at the difficulty it started with, while no new
+// job goes out. Its first 30 shares raise the difficulty, and from then until
+// the next job nothing it sends raises it again. Counting shares raised it
+// by 16 for every 30 of them: by 16 to the power of 6 here.
 func TestMinerThatIgnoresADifficultyRaise(t *testing.T) {
 	// About 4,000 hashes per share, so that many shares take little time.
 	const working = lowDifficulty / 10
@@ -1178,25 +1155,19 @@ func TestMinerThatIgnoresADifficultyRaise(t *testing.T) {
 	sess := h.srv.snapshotSessions()[0]
 
 	const shares = 6 * retargetShares
-	started := time.Now()
 	for i := 0; i < shares; i++ {
 		if res := mustSubmit(t, m, mustMine(t, m, job, working)); !res.Accepted {
 			t.Fatalf("share %d at the difficulty the job was sent with was rejected: %+v", i, res)
 		}
 	}
-	// Every share was credited at the difficulty the miner works at, whatever
-	// its hash reached, so this is the difficulty that suits its speed.
-	ideal := shares * working / time.Since(started).Seconds() * sharePeriod.Seconds()
 	sess.mu.Lock()
-	diff := sess.diff
+	diff, held := sess.diff, sess.held
 	sess.mu.Unlock()
-	// Counting shares would have raised it by 16 for every 30 of them: by
-	// 16 to the power of 6 in all.
-	if diff > 8*ideal {
-		t.Fatalf("difficulty %.3g after %d shares at %.3g, want at most %.3g (the right one is about %.3g)", diff, shares, working, 8*ideal, ideal)
+	if diff <= working || diff > 16*working || !held {
+		t.Fatalf("difficulty %.3g (held %v) after %d shares at %.3g, want one raise of at most 16 times, held until the next job", diff, held, shares, working)
 	}
-	if diff <= working {
-		t.Fatalf("difficulty %.3g was never raised for a miner sending %d shares in %s", diff, shares, time.Since(started))
+	if n := len(m.Notifies()); n != 1 {
+		t.Errorf("the raise re-sent the job (%d notifies)", n)
 	}
 }
 
@@ -2000,5 +1971,237 @@ func TestVersionReadings(t *testing.T) {
 		if inMask != tc.inMask || fmt.Sprintf("%08x", got) != fmt.Sprintf("%08x", tc.want) {
 			t.Errorf("%s: versionReadings(%08x, %08x, %08x) = %08x, %v, want %08x, %v", tc.name, tc.job, tc.mask, tc.bits, got, inMask, tc.want, tc.inMask)
 		}
+	}
+}
+
+// simulation plays one miner against a real session with a clock of its own,
+// so that minutes of mining take milliseconds. The shares come as they would
+// from hardware: at random moments, each with a hash that is as likely to be
+// twice as good as needed as a real one is. That includes the odd share that
+// meets a difficulty far above the one the miner works at.
+type simulation struct {
+	t       *testing.T
+	sess    *session
+	jobs    *fakeJobs
+	now     time.Time
+	rng     *rand.Rand
+	jobSeq  uint64
+	jobID   string
+	working float64 // the difficulty the miner works at
+	defers  bool    // the miner takes a new difficulty in only with the next job
+
+	hashrate float64
+	accepted int
+	low      int // shares the miner sent that were below what their job required
+	highest  float64
+}
+
+func newSimulation(t *testing.T, hashrate float64, defers bool, seed int64) *simulation {
+	t.Helper()
+	sim := &simulation{t: t, jobs: &fakeJobs{}, now: time.Unix(1_700_000_000, 0), rng: rand.New(rand.NewSource(seed)), hashrate: hashrate, defers: defers}
+	srv := NewServer(Options{Network: regtest, DefaultAddress: defaultAddress, DefaultScript: defaultScript, StartDifficulty: 1024, MinDifficulty: 0.001}, sim.jobs, &fakeSink{})
+	client, server := net.Pipe()
+	t.Cleanup(func() { client.Close(); server.Close() })
+	sim.sess = newSession(srv, &deadlineConn{Conn: server}, [work.Extranonce1Size]byte{1})
+	sim.sess.clock = func() time.Time { return sim.now }
+	sim.sess.windowStart = sim.now
+	sim.sess.subscribed, sim.sess.authorized = true, true
+	go func() { // nobody reads what the session sends
+		for {
+			select {
+			case <-sim.sess.out:
+			case <-sim.sess.done:
+				return
+			}
+		}
+	}()
+	t.Cleanup(sim.sess.close)
+	sim.sendJob()
+	return sim
+}
+
+func (sim *simulation) sent() float64 {
+	sim.sess.mu.Lock()
+	defer sim.sess.mu.Unlock()
+	return sim.sess.sentDiff
+}
+
+func (sim *simulation) diff() float64 {
+	sim.sess.mu.Lock()
+	defer sim.sess.mu.Unlock()
+	return sim.sess.diff
+}
+
+// sendJob sends the miner new work, as happens every half minute. Every
+// miner takes the difficulty in by then.
+func (sim *simulation) sendJob() {
+	sim.jobSeq++
+	sim.jobID = fmt.Sprint(sim.jobSeq)
+	// Mainnet's difficulty, far above any share's.
+	job := makeJob(sim.t, sim.jobID, "1701d936", 0x20000000, 0, false)
+	job.Seq = sim.jobSeq
+	sim.jobs.add(job)
+	sim.sess.sendJob(job, false)
+	sim.working = sim.sent()
+}
+
+// run plays d of mining.
+func (sim *simulation) run(d time.Duration) {
+	end := sim.now.Add(d)
+	nextJob := sim.now.Add(30 * time.Second)
+	for {
+		// The time to the next share at this difficulty; drawn afresh after
+		// every event, which changes nothing for a process without memory.
+		wait := time.Duration(sim.rng.ExpFloat64() * sim.working * 4294967296 / sim.hashrate * float64(time.Second))
+		if next := sim.now.Add(wait); next.After(nextJob) || wait < 0 {
+			if nextJob.After(end) {
+				sim.now = end
+				return
+			}
+			sim.now = nextJob
+			nextJob = nextJob.Add(30 * time.Second)
+			sim.sendJob()
+			continue
+		} else if next.After(end) {
+			sim.now = end
+			return
+		} else {
+			sim.now = next
+		}
+		shareDiff := sim.working / (1 - sim.rng.Float64())
+		sim.sess.mu.Lock()
+		assigned, current := sim.sess.jobDiff[sim.jobID], sim.sess.sentDiff
+		sim.sess.mu.Unlock()
+		if shareDiff < assigned {
+			sim.low++ // would be rejected as too easy
+			continue
+		}
+		sim.accepted++
+		sim.sess.acceptShare(&request{ID: json.RawMessage("1")}, "sim", creditFor(assigned, current, shareDiff), shareDiff)
+		sim.sess.announceDifficulty() // as handleSubmit does after a change
+		sim.highest = math.Max(sim.highest, sim.diff())
+		if !sim.defers {
+			sim.working = sim.sent()
+		}
+	}
+}
+
+// Whatever a miner's speed, and whether it takes a new difficulty in at once
+// or only with the next job, the difficulty must come to suit it within a
+// few jobs, never go far beyond, and then stay. This plays ten minutes of
+// mining with real luck in the shares. Before, a 100 TH/s miner that defers
+// ended up at a difficulty of 10^29, and counting by work alone still let one
+// lucky share raise the difficulty of such a miner a hundredfold.
+func TestDifficultySuitsEveryMinerWithinAFewJobs(t *testing.T) {
+	for _, hashrate := range []float64{500e9, 1.2e12, 5e12, 22e12, 100e12, 200e12, 1e15} {
+		for _, defers := range []bool{false, true} {
+			for seed := int64(1); seed <= 5; seed++ {
+				name := fmt.Sprintf("%.3gH/s defers=%v seed=%d", hashrate, defers, seed)
+				ideal := hashrate * sharePeriod.Seconds() / 4294967296
+				sim := newSimulation(t, hashrate, defers, seed)
+
+				sim.run(2 * time.Minute)
+				if d := sim.diff(); d < ideal/4 || d > ideal*4 {
+					t.Errorf("%s: difficulty %.3g after two minutes, want within a factor of 4 of %.3g", name, d, ideal)
+				}
+				sim.highest = 0
+				for minute := 3; minute <= 10; minute++ {
+					sim.run(time.Minute)
+					if d := sim.diff(); d < ideal/8 || d > ideal*8 {
+						t.Errorf("%s: difficulty %.3g in minute %d, want within a factor of 8 of %.3g", name, d, minute, ideal)
+					}
+				}
+				if sim.highest > 8*ideal {
+					t.Errorf("%s: difficulty reached %.3g once it had settled, want at most %.3g", name, sim.highest, 8*ideal)
+				}
+				// A miner on the right difficulty sends a share every six
+				// seconds: about 100 in ten minutes, more while it settles.
+				if sim.accepted < 60 {
+					t.Errorf("%s: only %d shares in ten minutes", name, sim.accepted)
+				}
+			}
+		}
+	}
+}
+
+// The highest difficulty on the way up must not overshoot either: that is
+// where the old code ran away.
+func TestDifficultyDoesNotOvershootOnTheWayUp(t *testing.T) {
+	for _, hashrate := range []float64{22e12, 200e12, 1e15} {
+		for _, defers := range []bool{false, true} {
+			for seed := int64(1); seed <= 20; seed++ {
+				ideal := hashrate * sharePeriod.Seconds() / 4294967296
+				sim := newSimulation(t, hashrate, defers, seed)
+				sim.run(3 * time.Minute)
+				if sim.highest > 4*ideal {
+					t.Errorf("%.3g H/s defers=%v seed=%d: difficulty reached %.3g, want at most %.3g", hashrate, defers, seed, sim.highest, 4*ideal)
+				}
+			}
+		}
+	}
+}
+
+// A miner far too slow for the starting difficulty is brought down to the
+// lowest one, and one that suits the lowest mines there.
+func TestDifficultyComesDownForASlowMiner(t *testing.T) {
+	for _, defers := range []bool{false, true} {
+		sim := newSimulation(t, 50e3, defers, 1) // suits 0.00007, below the lowest
+		sim.run(5 * time.Minute)
+		if d := sim.diff(); d != 0.001 {
+			t.Errorf("50 kH/s, defers=%v: difficulty %v after five minutes, want the lowest, 0.001", defers, d)
+		}
+		sim = newSimulation(t, 5e6, defers, 1) // suits 0.007
+		sim.run(8 * time.Minute)
+		if d := sim.diff(); d < 0.007/4 || d > 0.007*4 {
+			t.Errorf("5 MH/s, defers=%v: difficulty %v after eight minutes, want about 0.007", defers, d)
+		}
+		if sim.accepted < 20 {
+			t.Errorf("5 MH/s, defers=%v: only %d shares in eight minutes", defers, sim.accepted)
+		}
+	}
+}
+
+// Between a change of the difficulty and the next job, nothing a miner sends
+// changes the difficulty again: not a flood of shares at the old difficulty,
+// and not a share that happens to meet the new one and counts for all of it.
+func TestDifficultyIsHeldUntilTheNextJob(t *testing.T) {
+	sim := newSimulation(t, 1e12, true, 1)
+	s := sim.sess
+	req := &request{ID: json.RawMessage("1")}
+	share := func(credit float64) {
+		sim.now = sim.now.Add(10 * time.Millisecond)
+		s.acceptShare(req, "sim", credit, credit)
+		s.announceDifficulty()
+	}
+	for i := 0; i < retargetShares; i++ {
+		share(1024)
+	}
+	if got := sim.diff(); got != 1024*16 || !s.held {
+		t.Fatalf("difficulty %v, held %v after 30 quick shares, want %v and held", got, s.held, 1024*16)
+	}
+	// 300 more at the old difficulty, every tenth one lucky enough to meet
+	// the new one.
+	for i := 0; i < 300; i++ {
+		if i%10 == 0 {
+			share(1024 * 16)
+		} else {
+			share(1024)
+		}
+	}
+	if got := sim.diff(); got != 1024*16 {
+		t.Fatalf("difficulty %v changed again before the next job", got)
+	}
+	// The next job ends the hold, and starts the measuring over: what came
+	// before it says nothing about the miner at its new difficulty.
+	sim.now = sim.now.Add(time.Second)
+	sim.sendJob()
+	if s.held || s.windowShares != 0 || s.windowWork != 0 || !s.windowStart.Equal(sim.now) {
+		t.Fatalf("after the next job: held %v, window of %d shares and %v work from %v", s.held, s.windowShares, s.windowWork, s.windowStart)
+	}
+	// A job that itself carries a new difficulty needs no hold.
+	sim.now = sim.now.Add(2 * quietWindow)
+	sim.sendJob()
+	if got := sim.diff(); got != 1024*2 || s.held {
+		t.Fatalf("difficulty %v, held %v after a silent window, want %v and not held", got, s.held, 1024*2)
 	}
 }

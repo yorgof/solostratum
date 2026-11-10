@@ -103,6 +103,12 @@ type session struct {
 	windowShares int
 	windowWork   float64 // sum of the difficulties the window's shares were credited at
 	quietWindows int     // windows in a row that ended without a share
+	// held is set from the moment the miner is told a new difficulty until
+	// the next job is sent, and stops the difficulty from being adjusted
+	// meanwhile (see retargetLocked).
+	held bool
+	// clock is time.Now, except in tests that play through minutes of mining.
+	clock func() time.Time
 
 	accepted      uint64
 	rejected      uint64
@@ -129,6 +135,14 @@ func newSession(srv *Server, conn net.Conn, id [work.Extranonce1Size]byte) *sess
 		windowStart: now,
 		payout:      srv.opts.DefaultAddress, payoutScript: srv.opts.DefaultScript,
 	}
+}
+
+// now is the time by the session's clock.
+func (s *session) now() time.Time {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
 }
 
 func (s *session) close() {
@@ -421,7 +435,7 @@ func (s *session) handleSuggestDifficulty(req *request, params []json.RawMessage
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.diff, s.floor = d, d
-	s.windowStart, s.windowShares, s.windowWork, s.quietWindows = time.Now(), 0, 0, 0
+	s.windowStart, s.windowShares, s.windowWork, s.quietWindows = s.now(), 0, 0, 0
 	s.announceDifficultyLocked()
 }
 
@@ -438,7 +452,8 @@ func (s *session) announceDifficulty() {
 // the miner start that job over and repeat work it has already done.
 // Firmware differs on whether a new difficulty applies to the job in hand
 // or only to the next one, so for jobs already sent the lower of the old
-// and new value is accepted.
+// and new value is accepted, and the difficulty is not adjusted again until
+// the next job has gone out (see held).
 func (s *session) announceDifficultyLocked() {
 	if !s.subscribed || !s.authorized {
 		return
@@ -453,6 +468,7 @@ func (s *session) announceDifficultyLocked() {
 	}
 	s.notify("mining.set_difficulty", diff)
 	s.sentDiff = diff
+	s.held = true
 	for id, d := range s.jobDiff {
 		if diff < d {
 			s.jobDiff[id] = diff
@@ -477,12 +493,19 @@ func (s *session) sendJob(job *work.Job, clean bool) {
 		return // a newer job has already been sent
 	}
 	s.lastSeq = job.Seq
-	now := time.Now()
-	if before := s.diff; s.retargetLocked(now) && s.diff < before {
+	now := s.now()
+	if s.held {
+		// The first job since the miner was told a new difficulty. Every
+		// miner works at that difficulty from this job on, so its speed can
+		// be measured again, starting now.
+		s.held = false
+		s.windowStart, s.windowShares, s.windowWork = now, 0, 0
+	} else if before := s.diff; s.retargetLocked(now) && s.diff < before {
 		// Lowered for a miner that is not finding shares, and so says
 		// nothing: give the easier work time to show before the silence
-		// counts as a dead connection (see idleTimeout).
-		s.conn.SetReadDeadline(now.Add(idleTimeout))
+		// counts as a dead connection (see idleTimeout). This job carries
+		// the new difficulty, so there is nothing to hold.
+		s.conn.SetReadDeadline(time.Now().Add(idleTimeout))
 	}
 
 	// A share can never need to be harder than the block itself.
@@ -528,14 +551,21 @@ func (s *session) sendJob(job *work.Job, clean bool) {
 //
 // It goes by the work the miner delivered, not by the number of its shares:
 // the sum of the difficulties the window's shares were credited at, per
-// second, is the miner's hashrate whatever difficulty it was working at. That
-// matters after a raise. Firmware differs on whether a new difficulty applies
-// to the job in hand or only to the next one, and shares at the old difficulty
-// are accepted until then. Counted one by one they would look like a miner
-// that is still far too fast, and each window of them would raise the
-// difficulty again, by up to 16 each time, until the next job: a fast miner
-// would end up with a difficulty no hardware can meet. Weighed by their
-// difficulty they say the same as before the raise, which is the truth.
+// second, is the miner's hashrate.
+//
+// That only holds while it is known what difficulty the miner works at, and
+// after a change it is not. Firmware differs on whether a new difficulty
+// applies to the job in hand or only to the next one, so until the next job
+// has gone out a miner may be working at either. Its shares then mislead
+// whichever way they are read. After a raise, a miner still at the old
+// difficulty keeps sending shares at the old rate; counted one by one, each
+// 30 of them raised the difficulty by 16 again, and a fast miner ended up
+// with a difficulty no hardware can meet. Weighed by their difficulty, the
+// odd share that happens to meet the new difficulty counts for all of it,
+// and one such share outweighs a window of the others. So the callers do not
+// call this at all between a change and the next job (see held): they start
+// a new window at that job, from which every miner works at the difficulty
+// it was last told.
 func (s *session) retargetLocked(now time.Time) bool {
 	elapsed := now.Sub(s.windowStart)
 	if s.windowShares < retargetShares && elapsed < retargetWindow {
@@ -796,12 +826,19 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 		s.srv.blocks.Found(job.Height, sol.hash.String(), job.Block(sol.header, coinbase), worker)
 	}
 
-	// Credit the share at the difficulty the miner was actually working at.
-	credit := assigned
-	if current > assigned && sol.shareDiff >= current {
-		credit = current
+	s.acceptShare(req, worker, creditFor(assigned, current, sol.shareDiff), sol.shareDiff)
+}
+
+// creditFor returns the difficulty an accepted share counts for: the one the
+// miner was working at, as far as that can be told. assigned is the lowest
+// difficulty announced while the share's job was live, and what the share
+// had to meet; current is the difficulty last announced. A share that meets
+// a higher current difficulty is taken to have been mined at it.
+func creditFor(assigned, current, shareDiff float64) float64 {
+	if current > assigned && shareDiff >= current {
+		return current
 	}
-	s.acceptShare(req, worker, credit, sol.shareDiff)
+	return assigned
 }
 
 // ordinaryShareProblem checks a share that is not a block against the rules
@@ -827,7 +864,7 @@ func ordinaryShareProblem(job *work.Job, sub submission, sol solution, inMask bo
 // difficulty. credit is the difficulty the share counts for, shareDiff the
 // difficulty its hash reached.
 func (s *session) acceptShare(req *request, worker string, credit, shareDiff float64) {
-	now := time.Now()
+	now := s.now()
 	s.mu.Lock()
 	s.accepted++
 	s.windowShares++
@@ -837,7 +874,9 @@ func (s *session) acceptShare(req *request, worker string, credit, shareDiff flo
 	if shareDiff > s.bestShare {
 		s.bestShare = shareDiff
 	}
-	changed := s.retargetLocked(now)
+	// Not between a change of the difficulty and the next job: until then
+	// the miner may be working at the old one or the new (see retargetLocked).
+	changed := !s.held && s.retargetLocked(now)
 	s.mu.Unlock()
 	s.srv.accepted.Add(1)
 	s.srv.noteBest(shareDiff)
