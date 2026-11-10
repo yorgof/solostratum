@@ -297,3 +297,29 @@ func TestPanicUnderTheManagerLockReleasesIt(t *testing.T) {
 		t.Fatalf("state after the bug: %+v", state)
 	}
 }
+
+// A reverse proxy in front of the node often ends a long poll before the node
+// answers it. That is not a failure of the node: the long poll starts again at
+// once, without the pause that follows a real failure. A proxy that answers
+// 504 at once cannot reach the node, and that is a failure.
+func TestGatewayTimeout(t *testing.T) {
+	gateway := fmt.Errorf("long poll: %w", &rpc.HTTPError{Status: 504})
+	for _, tc := range []struct {
+		name   string
+		err    error
+		waited time.Duration
+		want   bool
+	}{
+		{"proxy ran out of patience", gateway, time.Minute, true},
+		{"just long enough", gateway, gatewayPatience, true},
+		{"proxy cannot reach the node", gateway, time.Second, false},
+		{"bad gateway", &rpc.HTTPError{Status: 502}, time.Minute, false},
+		{"busy node", &rpc.HTTPError{Status: 503}, time.Minute, false},
+		{"node error", &rpc.Error{Code: rpc.CodeInWarmup}, time.Minute, false},
+		{"no error", nil, time.Minute, false},
+	} {
+		if got := isGatewayTimeout(tc.err, tc.waited); got != tc.want {
+			t.Errorf("%s: isGatewayTimeout = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

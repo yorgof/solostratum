@@ -183,6 +183,9 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	if err := selfTest(ctx, manager, payoutScript, checkOnly); err != nil {
 		return err
 	}
+	if err := submitCheck(ctx, node, checkOnly); err != nil {
+		return err
+	}
 	log.Printf("Self-test passed: the node accepts the blocks this program builds.")
 	if checkOnly {
 		flushLog() // the log comes first
@@ -478,6 +481,42 @@ func selfTest(ctx context.Context, manager *work.Manager, payoutScript []byte, c
 			return err
 		}
 		if msg := err.Error(); msg != last {
+			log.Printf("Not ready yet: %s. Waiting...", msg)
+			last = msg
+		}
+		select {
+		case <-ctx.Done():
+			return errors.New("stopped while waiting for the node")
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// submitChecker is the part of the RPC client submitCheck needs.
+type submitChecker interface {
+	CheckSubmitBlock(ctx context.Context) error
+}
+
+// submitCheck makes sure the node will take a found block from this program
+// (see rpc.Client.CheckSubmitBlock). A node that never will is fatal: mining
+// would go on for months and lose the one block it finds. A node that cannot
+// be asked just now is waited for, like in selfTest.
+func submitCheck(ctx context.Context, node submitChecker, checkOnly bool) error {
+	var last string
+	for {
+		err := node.CheckSubmitBlock(ctx)
+		if err == nil {
+			return nil
+		}
+		var refused *rpc.SubmitRefused
+		if errors.As(err, &refused) {
+			return fmt.Errorf("the node would not take a found block from solostratum: %s.\n  Mining was not started, because a block found this way would be lost", refused.Reason)
+		}
+		msg := "could not check that the node takes found blocks: " + rpc.Explain(err)
+		if checkOnly {
+			return errors.New(msg)
+		}
+		if msg != last {
 			log.Printf("Not ready yet: %s. Waiting...", msg)
 			last = msg
 		}

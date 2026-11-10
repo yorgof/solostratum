@@ -121,12 +121,28 @@ down if you like:
 rpcwhitelist=solostratum:getblockchaininfo,getblocktemplate,submitblock
 ```
 
+All three are tried at every start, `submitblock` included, so a call that
+is missing from the list is reported then and not when a block is found.
+
 A pruned node works. The node must be fully synced and connected to peers;
 solostratum waits until it is.
 
 For a node reached over the internet, put it behind a VPN or an HTTPS
 reverse proxy and use an `https://` address. Never expose the RPC port
 directly.
+
+A reverse proxy needs two settings changed from their usual defaults:
+
+- **Request size: 16 MB or more.** A found block is sent to the node as one
+  request of up to 8 MB. solostratum sends a request of that size at every
+  start and does not start if it is refused.
+- **Time to wait for the node: more than three minutes.** solostratum keeps
+  one request open that the node answers the moment a new block arrives.
+  A proxy that closes it sooner costs nothing but a second or two in
+  noticing some new blocks.
+
+With nginx these are `client_max_body_size 16m;` and
+`proxy_read_timeout 300s;`.
 
 ## Settings
 
@@ -284,7 +300,10 @@ then stops solostratum from starting.
 
 - **At every start** solostratum builds a complete block from the node's
   current template and asks the node to validate it (everything except the
-  proof of work). If the node objects, mining does not start.
+  proof of work). It also makes sure the node will take a found block from
+  it: it calls `submitblock` with something the size of the largest block
+  that is not a block, and expects the node to say so. If the node objects
+  to the test block, or refuses the call, mining does not start.
 - **A bug stays where it happens.** It is logged with the details needed to
   fix it, and ends only the work that hit it: one miner's connection, one
   attempt to submit a block (which is then retried), one update of the work,

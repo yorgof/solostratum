@@ -290,3 +290,72 @@ func TestExplainFailures(t *testing.T) {
 		}
 	}
 }
+
+// Nothing else calls submitblock until a block is found. The startup check
+// must tell a node that will take one from a node that never will, and from
+// one that cannot be asked just now.
+func TestCheckSubmitBlock(t *testing.T) {
+	const decodeFailed = `{"result":null,"error":{"code":-22,"message":"Block decode failed"},"id":1}`
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		refused string // part of the reason, if the node never will
+		retry   bool   // the node could not be asked just now
+	}{
+		{"bitcoin core", 500, decodeFailed, "", false},
+		{"another node error", 500, `{"result":null,"error":{"code":-1,"message":"odd"},"id":1}`, "", false},
+		{"an answer without an error", 200, `{"result":null,"error":null,"id":1}`, "", false},
+		{"not on the rpcwhitelist", 403, "", "add submitblock", false},
+		{"login refused", 401, "", "rejected the login", false},
+		{"proxy size limit", 413, "<html>Request Entity Too Large</html>", "16 MB", false},
+		{"unknown method", 404, `{"result":null,"error":{"code":-32601,"message":"Method not found"},"id":1}`, "does not know the submitblock call", false},
+		{"warming up", 500, `{"result":null,"error":{"code":-28,"message":"Loading block index..."},"id":1}`, "", true},
+		{"busy", 503, "Work queue depth exceeded", "", true},
+		{"bad gateway", 502, "<html>Bad Gateway</html>", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, c := newFake(t)
+			f.answer = func(method string, params []any) (int, string) {
+				sent, _ := params[0].(string)
+				if method != "submitblock" || len(params) != 1 || len(sent) != probeSize {
+					t.Errorf("sent %s with %d parameters, the first %d long", method, len(params), len(sent))
+				}
+				if strings.Trim(sent, "0123456789abcdefABCDEF") == "" {
+					t.Error("what was sent could be taken for a block: it is all hex")
+				}
+				return tc.status, tc.body
+			}
+			err := c.CheckSubmitBlock(context.Background())
+			var refused *SubmitRefused
+			switch {
+			case tc.refused != "":
+				if !errors.As(err, &refused) || !strings.Contains(refused.Reason, tc.refused) {
+					t.Fatalf("error %v, want a refusal mentioning %q", err, tc.refused)
+				}
+			case tc.retry:
+				if err == nil || errors.As(err, &refused) {
+					t.Fatalf("error %v, want one that is worth waiting out", err)
+				}
+			case err != nil:
+				t.Fatalf("error %v, want none", err)
+			}
+		})
+	}
+	dead := New("http://127.0.0.1:1", "u", "p", "")
+	var refused *SubmitRefused
+	if err := dead.CheckSubmitBlock(context.Background()); err == nil || errors.As(err, &refused) {
+		t.Fatalf("nothing listening: %v, want an error that is worth waiting out", err)
+	}
+}
+
+func TestRefused(t *testing.T) {
+	for status, want := range map[int]bool{401: true, 403: true, 413: true, 500: false, 502: false, 503: false, 504: false} {
+		if got := Refused(fmt.Errorf("submitting: %w", &HTTPError{status})); got != want {
+			t.Errorf("Refused(HTTP %d) = %v, want %v", status, got, want)
+		}
+	}
+	if Refused(&Error{Code: CodeInWarmup}) || Refused(errors.New("connection refused")) || Refused(nil) {
+		t.Error("an answer from the node, a failure to reach it, or no error counted as a refusal")
+	}
+}

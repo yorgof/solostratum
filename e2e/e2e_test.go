@@ -34,6 +34,13 @@ const (
 	rpcUser = "e2e"
 	rpcPass = "e2e-password"
 	label   = "solostratum-e2e"
+
+	// limitedUser may call everything solostratum needs except submitblock,
+	// as with an rpcwhitelist that leaves it out. limitedAuth is its rpcauth
+	// value: the salt, then HMAC-SHA256 of the password keyed with the salt.
+	limitedUser = "limited"
+	limitedPass = "limited-password"
+	limitedAuth = "e2esalt$ebb61177f0de8eb78331a2c0ba7fa6f8ec1177045b7c77020ff170db6fbb5874"
 )
 
 var (
@@ -113,7 +120,10 @@ func startNode(t *testing.T, image string) *node {
 		"-p", fmt.Sprintf("127.0.0.1:%d:18443", n.rpcPort),
 		image,
 		"-regtest", "-server", "-rpcbind=0.0.0.0", "-rpcallowip=0.0.0.0/0",
-		"-rpcuser="+rpcUser, "-rpcpassword="+rpcPass, "-fallbackfee=0.0002")
+		"-rpcuser="+rpcUser, "-rpcpassword="+rpcPass, "-fallbackfee=0.0002",
+		"-rpcauth="+limitedUser+":"+limitedAuth,
+		"-rpcwhitelist="+limitedUser+":getblockchaininfo,getblocktemplate",
+		"-rpcwhitelistdefault=0") // the whitelist binds limitedUser only
 	t.Cleanup(func() {
 		if t.Failed() {
 			out, _ := exec.Command("docker", "logs", "--tail", "40", n.name).CombinedOutput()
@@ -1084,6 +1094,17 @@ func testStartupChecks(t *testing.T, image string) {
 	os.WriteFile(conf, bytes.Replace(raw, []byte(rpcPass), []byte("wrong"), 1), 0o600)
 	if out, err := exec.Command(binary, "-config", conf, "-check").CombinedOutput(); err == nil || !strings.Contains(string(out), "rejected the login") {
 		t.Errorf("wrong password: %v\n%s", err, out)
+	}
+
+	// A login that may not call submitblock passes every other check: the
+	// node validates the test block for it. Only a found block would show
+	// the problem, so the start must.
+	limited := bytes.Replace(raw, []byte("node_user = "+rpcUser), []byte("node_user = "+limitedUser), 1)
+	limited = bytes.Replace(limited, []byte(rpcPass), []byte(limitedPass), 1)
+	os.WriteFile(conf, limited, 0o600)
+	if out, err := exec.Command(binary, "-config", conf, "-check").CombinedOutput(); err == nil ||
+		!strings.Contains(string(out), "would not take a found block") || !strings.Contains(string(out), "add submitblock") {
+		t.Errorf("login without submitblock: %v\n%s", err, out)
 	}
 
 	// Nothing listening at node_url.

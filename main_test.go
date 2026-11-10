@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -97,12 +98,21 @@ func startupNodeSubmitting(t *testing.T, chain string, onSubmit func(blockHex st
 					Bits: "207fffff", Height: 100, CurTime: time.Now().Unix(), CoinbaseValue: 5000000000, LongPollID: "tip-1"}
 			}
 		case "submitblock":
-			if onSubmit == nil || len(req.Params) != 1 {
+			var blockHex string
+			if len(req.Params) == 1 {
+				json.Unmarshal(req.Params[0], &blockHex)
+			}
+			if _, err := hex.DecodeString(blockHex); err != nil || blockHex == "" {
+				// The startup check (rpc.Client.CheckSubmitBlock), answered as
+				// Bitcoin Core answers it.
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]any{"result": nil, "error": map[string]any{"code": -22, "message": "Block decode failed"}, "id": 1})
+				return
+			}
+			if onSubmit == nil {
 				t.Error("unexpected submitblock")
 				return
 			}
-			var blockHex string
-			json.Unmarshal(req.Params[0], &blockHex)
 			time.Sleep(200 * time.Millisecond)
 			onSubmit(blockHex)
 		default:
@@ -782,5 +792,79 @@ func TestCheckPrintsItsVerdictAfterTheLog(t *testing.T) {
 	logged, verdict := strings.Index(out, "Self-test passed"), strings.Index(out, "Everything looks good.")
 	if logged < 0 || verdict < logged {
 		t.Fatalf("the verdict did not come after the log:\n%s", out)
+	}
+}
+
+type fakeSubmitChecker struct {
+	answers []error // one per call; the last one repeats
+	calls   atomic.Int32
+}
+
+func (f *fakeSubmitChecker) CheckSubmitBlock(context.Context) error {
+	i := int(f.calls.Add(1)) - 1
+	return f.answers[min(i, len(f.answers)-1)]
+}
+
+// A node that will never take a found block stops the start. One that cannot
+// be asked just now is waited for, except by -check.
+func TestSubmitCheck(t *testing.T) {
+	refusal := &rpc.SubmitRefused{Reason: "the node does not let this login call submitblock"}
+	busy := &rpc.HTTPError{Status: 503}
+
+	for _, checkOnly := range []bool{false, true} {
+		err := submitCheck(context.Background(), &fakeSubmitChecker{answers: []error{refusal}}, checkOnly)
+		if err == nil || !strings.Contains(err.Error(), "would not take a found block") || !strings.Contains(err.Error(), refusal.Reason) ||
+			!strings.Contains(err.Error(), "Mining was not started") {
+			t.Fatalf("refusal (check %v): %v", checkOnly, err)
+		}
+		if err := submitCheck(context.Background(), &fakeSubmitChecker{answers: []error{nil}}, checkOnly); err != nil {
+			t.Fatalf("a node that takes blocks (check %v): %v", checkOnly, err)
+		}
+	}
+
+	if err := submitCheck(context.Background(), &fakeSubmitChecker{answers: []error{busy}}, true); err == nil || !strings.Contains(err.Error(), "could not check that the node takes found blocks") {
+		t.Fatalf("-check with a busy node: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	node := &fakeSubmitChecker{answers: []error{busy}}
+	logs := logtest.Capture(t)
+	if err := submitCheck(ctx, node, false); err == nil || !strings.Contains(err.Error(), "stopped while waiting") {
+		t.Fatalf("cancelled while waiting: %v", err)
+	}
+	if !strings.Contains(logs.String(), "Not ready yet: could not check that the node takes found blocks") {
+		t.Fatalf("the wait was not explained:\n%s", logs.String())
+	}
+}
+
+// The whole start, against a node whose rpcwhitelist leaves out submitblock:
+// every other call works, and Bitcoin Core answers that one with HTTP 403.
+func TestStartRefusesANodeThatWillNotTakeBlocks(t *testing.T) {
+	inner, _ := startupNode(t, "regtest")
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct{ Method string }
+		json.Unmarshal(body, &req)
+		if req.Method == "submitblock" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		proxied, err := http.Post(inner.URL, "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer proxied.Body.Close()
+		w.WriteHeader(proxied.StatusCode)
+		io.Copy(w, proxied.Body)
+	}))
+	defer node.Close()
+	for _, checkOnly := range []bool{false, true} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := run(ctx, settingsFile(t, node.URL, nil), checkOnly)
+		cancel()
+		if err == nil || !strings.Contains(err.Error(), "would not take a found block") || !strings.Contains(err.Error(), "add submitblock") {
+			t.Fatalf("start (check %v): %v", checkOnly, err)
+		}
 	}
 }

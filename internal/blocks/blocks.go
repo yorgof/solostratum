@@ -73,7 +73,8 @@ type Store struct {
 // flight is a block whose delivery is under way.
 type flight struct {
 	block  []byte
-	logged bool // written in full to the log
+	logged bool   // written in full to the log
+	file   string // the block's file once it is written, though perhaps not yet forced onto the disk
 }
 
 const timeLayout = "20060102T150405.000000000Z"
@@ -262,7 +263,15 @@ func (s *Store) start(index int, rec Record, base string, block []byte) {
 func (s *Store) keep(index int, rec Record, base string, block []byte, answered <-chan string, written func()) {
 	if base == "" {
 		var err error
-		if base, err = s.save(rec.Height, rec.Hash, block, rec.Time, written); err != nil {
+		noteWritten := func(name string) {
+			s.mu.Lock()
+			if f := s.inFlight[index]; f != nil {
+				f.file = name + ".hex"
+			}
+			s.mu.Unlock()
+			written()
+		}
+		if base, err = s.save(rec.Height, rec.Hash, block, rec.Time, noteWritten); err != nil {
 			written() // nothing to wait for
 			log.Printf("WARNING: could not save the found block to disk: %v", err)
 			s.logInFull(index, "could not be saved")
@@ -294,7 +303,7 @@ func (s *Store) deliver(index int, hash string, block []byte, written <-chan str
 	var status string  // the node's answer, or why the delivery gave up
 	var lastWhy string // why the submission last failed, if it did
 	for {
-		failed := guard.Run("delivering a found block", func() { status = s.submit(ctx, hash, block, lastWhy) })
+		failed := guard.Run("delivering a found block", func() { status = s.submit(ctx, index, hash, block, lastWhy) })
 		if failed == nil {
 			break
 		}
@@ -414,10 +423,11 @@ func (s *Store) Wait() {
 }
 
 // save writes the block as hex to a new file that is never overwritten, calls
-// written, and forces the file onto the disk. The name carries the height,
+// written with the file's name without ".hex", and forces the file onto the
+// disk. The name carries the height,
 // the time to the nanosecond and the block hash, and the file is created
 // exclusively. It returns the name without ".hex".
-func (s *Store) save(height int64, hash string, block []byte, now time.Time, written func()) (string, error) {
+func (s *Store) save(height int64, hash string, block []byte, now time.Time, written func(name string)) (string, error) {
 	base := fmt.Sprintf("block-%d-%s-%s", height, now.Format(timeLayout), hash)
 	for attempt := 1; ; attempt++ {
 		name := base
@@ -435,7 +445,7 @@ func (s *Store) save(height int64, hash string, block []byte, now time.Time, wri
 			f.Close()
 			return "", err
 		}
-		written()
+		written(name)
 		log.Printf("Block saved to %s", filepath.Join(s.dir, name+".hex"))
 		if err := f.Sync(); err != nil {
 			log.Printf("WARNING: could not flush the block file to disk: %v", err)
@@ -452,13 +462,24 @@ func (s *Store) save(height int64, hash string, block []byte, now time.Time, wri
 // and the attempt is retried like one that could not reach the node: giving
 // up could lose the block. lastWhy is why the submission last failed, when it
 // starts again after a bug.
-func (s *Store) submit(ctx context.Context, hash string, block []byte, lastWhy string) string {
+//
+// A node that refuses the request itself (see rpc.Refused) answers the same
+// until a person changes a setting, so the first such answer is logged as a
+// warning that says how to submit the block by hand. The submission still goes
+// on: the setting may be put right in time.
+func (s *Store) submit(ctx context.Context, index int, hash string, block []byte, lastWhy string) string {
 	giveUp := func(attempt int, why string) string {
 		log.Printf("Giving up submitting block %s after %d attempts: %s", hash, attempt, why)
 		return "not submitted: " + why
 	}
+	warned := false
 	for attempt := 1; ; attempt++ {
-		status, why, ok := s.attemptInSlot(ctx, hash, block)
+		status, why, refused, ok := s.attemptInSlot(ctx, hash, block)
+		if refused && !warned {
+			warned = true
+			log.Printf("WARNING: THE NODE REFUSES BLOCK %s: %s. solostratum keeps trying for %s, but this needs you: put the node's settings right, or submit the block by hand now. %s",
+				hash, why, s.retryFor, s.byHand(index))
+		}
 		if !ok {
 			if lastWhy != "" {
 				return giveUp(attempt-1, lastWhy)
@@ -485,43 +506,58 @@ func (s *Store) submit(ctx context.Context, hash string, block []byte, lastWhy s
 // (see attempt). A panic in the attempt fails it. It reports false if ctx
 // ends before a slot is free. The slot is given back whatever happens: two
 // lost slots would hold every later block back.
-func (s *Store) attemptInSlot(ctx context.Context, hash string, block []byte) (status, why string, ok bool) {
+func (s *Store) attemptInSlot(ctx context.Context, hash string, block []byte) (status, why string, refused, ok bool) {
 	select {
 	case s.submitSlots <- struct{}{}:
 	case <-ctx.Done():
-		return "", "", false
+		return "", "", false, false
 	}
 	defer func() { <-s.submitSlots }()
-	if failed := guard.Run("submitting a found block", func() { status, why = s.attempt(hash, block) }); failed != nil {
+	if failed := guard.Run("submitting a found block", func() { status, why, refused = s.attempt(hash, block) }); failed != nil {
 		why = failed.Error()
 	}
-	return status, why, true
+	return status, why, refused, true
+}
+
+// byHand says how to submit the block of records[index] by hand.
+func (s *Store) byHand(index int) string {
+	s.mu.Lock()
+	file := s.records[index].File
+	if f := s.inFlight[index]; file == "" && f != nil {
+		file = f.file // written, and being forced onto the disk
+	}
+	s.mu.Unlock()
+	if file != "" {
+		return fmt.Sprintf("To submit it by hand, run: bitcoin-cli submitblock \"$(cat %s)\"", filepath.Join(s.dir, file))
+	}
+	return "It is not saved to disk yet: this log has it in full, ready to be submitted by hand, within a few seconds."
 }
 
 // attempt submits the block once. It returns the block's final status, or ""
-// and why the attempt failed when it is worth repeating.
-func (s *Store) attempt(hash string, block []byte) (status, why string) {
+// and why the attempt failed when it is worth repeating. refused is set when
+// the node refused the request itself (see rpc.Refused).
+func (s *Store) attempt(hash string, block []byte) (status, why string, refused bool) {
 	reason, err := s.node.SubmitBlock(context.Background(), block)
 	switch {
 	case err == nil && (reason == "" || reason == "duplicate"):
 		// "duplicate" means the node already has this exact block, which
 		// happens when a retry follows a lost answer.
 		log.Printf("BLOCK ACCEPTED by the node: %s", hash)
-		return "accepted", ""
+		return "accepted", "", false
 	case err == nil:
 		// Every other answer is final. "inconclusive" means the node stored
 		// the block without making it the tip, typically because another
 		// block at the same height arrived first. Submitting it again would
 		// return "duplicate", which here does not mean the block won.
 		log.Printf("Block %s was REJECTED by the node: %s", hash, reason)
-		return "rejected: " + reason, ""
+		return "rejected: " + reason, "", false
 	case permanentSubmitError(err):
 		log.Printf("Block %s could not be submitted: %s", hash, rpc.Explain(err))
 		var rpcErr *rpc.Error
 		errors.As(err, &rpcErr)
-		return "rejected: " + rpcErr.Message, ""
+		return "rejected: " + rpcErr.Message, "", false
 	}
-	return "", rpc.Explain(err)
+	return "", rpc.Explain(err), rpc.Refused(err)
 }
 
 // permanentSubmitError reports a node error that will not change on retry:
