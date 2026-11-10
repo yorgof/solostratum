@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -163,6 +164,21 @@ func (m *Manager) fetch(ctx context.Context, longPollID string) error {
 func isTimeout(err error) bool {
 	var t interface{ Timeout() bool }
 	return errors.As(err, &t) && t.Timeout() || errors.Is(err, context.DeadlineExceeded)
+}
+
+// gatewayPatience is how long a long poll must have lasted for an HTTP 504
+// to count as a proxy that ran out of patience, not as a node it cannot reach.
+const gatewayPatience = 10 * time.Second
+
+// isGatewayTimeout reports whether err is a reverse proxy in front of the node
+// ending a long poll that had waited for waited. The node holds a long poll
+// for a minute or more when no block arrives, and many proxies give up before
+// that with HTTP 504. That is the long poll working as far as the proxy lets
+// it, and it is simply started again. A 504 that comes at once means the proxy
+// cannot reach the node, which is a failure like any other.
+func isGatewayTimeout(err error, waited time.Duration) bool {
+	var httpErr *rpc.HTTPError
+	return errors.As(err, &httpErr) && httpErr.Status == http.StatusGatewayTimeout && waited >= gatewayPatience
 }
 
 // setOK records that the node delivered a usable template.
@@ -351,10 +367,11 @@ func (m *Manager) longPollLoop(ctx context.Context) {
 			continue
 		}
 		var err error
+		started := time.Now()
 		if failed := guard.Run("waiting for a new block", func() { err = m.fetch(ctx, id) }); failed != nil {
 			err = failed
 		}
-		if err != nil && !isTimeout(err) {
+		if err != nil && !isTimeout(err) && !isGatewayTimeout(err, time.Since(started)) {
 			sleep(ctx, 5*time.Second) // the regular poll reports the problem
 		}
 	}

@@ -79,6 +79,8 @@ func (e *HTTPError) Error() string {
 		return "the node rejected the login (wrong node_user / node_password, or wrong cookie file)"
 	case http.StatusForbidden:
 		return "the node refused the connection or the request (check rpcallowip and rpcwhitelist in bitcoin.conf)"
+	case http.StatusRequestEntityTooLarge:
+		return "the request was refused as too large (HTTP 413). If the node is behind a reverse proxy, raise the proxy's request size limit to 16 MB or more"
 	}
 	return fmt.Sprintf("the node answered with HTTP status %d", e.Status)
 }
@@ -255,6 +257,62 @@ func (c *Client) ProposeBlock(ctx context.Context, block []byte) (string, error)
 		return "", nil
 	}
 	return *result, nil
+}
+
+// probeSize is the length of what CheckSubmitBlock sends: that of the largest
+// block there can be, 4 MB, written as hex.
+const probeSize = 8_000_000
+
+// SubmitRefused means that the node, or something between this program and
+// the node, will not take a found block however often it is sent.
+type SubmitRefused struct{ Reason string }
+
+func (e *SubmitRefused) Error() string { return e.Reason }
+
+// CheckSubmitBlock finds out whether the node will take a found block from
+// this program, without having one. It calls submitblock with text that
+// cannot be a block and is as long as the largest block, and expects the node
+// to answer that it could not decode it. Nothing else calls submitblock until
+// a block is found, and that is too late to learn that the login may not use
+// it, or that a proxy in front of the node refuses a request of that size.
+//
+// It returns nil if the node took the call, a *SubmitRefused if it never
+// will, and any other error if the node could not be asked just now.
+func (c *Client) CheckSubmitBlock(ctx context.Context) error {
+	err := c.call(ctx, 60*time.Second, "submitblock", []any{strings.Repeat("z", probeSize)}, nil)
+	var rpcErr *Error
+	var httpErr *HTTPError
+	switch {
+	case errors.As(err, &rpcErr) && rpcErr.Code == CodeMethodNotFound:
+		return &SubmitRefused{"the node does not know the submitblock call (" + rpcErr.Message + ")"}
+	case errors.As(err, &rpcErr) && rpcErr.Code == CodeInWarmup:
+		return err
+	case errors.As(err, &rpcErr):
+		// The call reached submitblock, which is all there is to learn: it
+		// answers "Block decode failed" (CodeDeserialization).
+		return nil
+	case errors.As(err, &httpErr) && httpErr.Status == http.StatusForbidden:
+		return &SubmitRefused{"the node does not let this login call submitblock (HTTP 403). If bitcoin.conf has an rpcwhitelist line for this login, add submitblock to it"}
+	case errors.As(err, &httpErr) && (httpErr.Status == http.StatusUnauthorized || httpErr.Status == http.StatusRequestEntityTooLarge):
+		return &SubmitRefused{httpErr.Error()}
+	}
+	return err
+}
+
+// Refused reports whether err says that the node, or something in front of
+// it, refused the request itself: the login, the call or its size. Sending
+// the same request again gets the same answer until a person changes a
+// setting.
+func Refused(err error) bool {
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	switch httpErr.Status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestEntityTooLarge:
+		return true
+	}
+	return false
 }
 
 // SubmitBlock sends a solved block to the node. It returns "" if the node

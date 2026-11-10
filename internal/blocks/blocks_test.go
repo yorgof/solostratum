@@ -178,11 +178,11 @@ func TestEveryBlockGetsItsOwnFile(t *testing.T) {
 func TestSameNameIsNeverOverwritten(t *testing.T) {
 	s, dir, _ := open(t, &fakeNode{})
 	now := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
-	first, err := s.save(1, "abcd", []byte{1}, now, func() {})
+	first, err := s.save(1, "abcd", []byte{1}, now, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.save(1, "abcd", []byte{2}, now, func() {})
+	second, err := s.save(1, "abcd", []byte{2}, now, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1144,4 +1144,60 @@ func TestNewWorkIsAskedForBeforeTheDiskIsDone(t *testing.T) {
 	close(release)
 	within(t, "finishing the delivery", s.Wait)
 	within(t, "the file's goroutine to finish", s.files.Wait)
+}
+
+// A node that refuses the request itself, as when submitblock is missing from
+// its rpcwhitelist, answers the same until a person changes a setting. That
+// is said once, loudly and with the way to submit the block by hand, and the
+// delivery goes on, so a setting put right in time still saves the block.
+func TestRefusalByTheNodeIsLoggedOnceAndRetried(t *testing.T) {
+	for _, status := range []int{401, 403, 413} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			logs := logtest.Capture(t)
+			refusal := &rpc.HTTPError{Status: status}
+			node := &fakeNode{answers: []submitAnswer{{err: refusal}, {err: refusal}, {err: refusal}, {reason: ""}}}
+			s, dir, accepted := open(t, node)
+			s.Found(100, "aa", []byte{0xc0, 0xff, 0xee}, "rig")
+			s.Wait()
+			if got := s.Records()[0].Status; got != "accepted" || accepted.Load() != 1 || node.calls != 4 {
+				t.Fatalf("status %q after %d calls, want accepted after 4", got, node.calls)
+			}
+			out := logs.String()
+			if n := strings.Count(out, "WARNING: THE NODE REFUSES BLOCK aa"); n != 1 {
+				t.Fatalf("the refusal was announced %d times, want once:\n%s", n, out)
+			}
+			file := filepath.Join(dir, s.Records()[0].File)
+			if want := `bitcoin-cli submitblock "$(cat ` + file + `)"`; !strings.Contains(out, want) {
+				t.Fatalf("the log does not say how to submit the block by hand (%s):\n%s", want, out)
+			}
+		})
+	}
+}
+
+// A failure to reach the node is not a refusal, and is not announced as one.
+func TestUnreachableNodeIsNotARefusal(t *testing.T) {
+	logs := logtest.Capture(t)
+	node := &fakeNode{failures: 2}
+	s, _, _ := open(t, node)
+	s.Found(100, "aa", []byte{1}, "rig")
+	s.Wait()
+	if out := logs.String(); strings.Contains(out, "REFUSES") || s.Records()[0].Status != "accepted" {
+		t.Fatalf("status %q, log:\n%s", s.Records()[0].Status, out)
+	}
+}
+
+// A block that is not on disk when the node refuses it cannot be pointed to
+// by its file. The warning says where it will be instead.
+func TestRefusalOfAnUnsavedBlockPointsToTheLog(t *testing.T) {
+	logs := logtest.Capture(t)
+	node := &fakeNode{answers: []submitAnswer{{err: &rpc.HTTPError{Status: 403}}, {reason: ""}}}
+	s, _, _ := open(t, node)
+	s.create = func(string) (*os.File, error) { return nil, errors.New("disk full") }
+	s.Found(100, "aa", []byte{0xc0, 0xff, 0xee}, "rig")
+	s.Wait()
+	out := logs.String()
+	if !strings.Contains(out, "WARNING: THE NODE REFUSES BLOCK aa") || !strings.Contains(out, "this log has it in full") ||
+		!strings.Contains(out, "bitcoin-cli submitblock c0ffee") {
+		t.Fatalf("the warning does not lead to the block:\n%s", out)
+	}
 }
