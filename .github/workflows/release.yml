@@ -20,6 +20,8 @@ jobs:
           cache: false # no go.sum to key a cache on: the program has no dependencies
       - name: Test
         run: make test
+      - name: Mine blocks against real Bitcoin Core nodes
+        run: make e2e
       - name: Build archives
         run: make release VERSION="${GITHUB_REF_NAME}"
       - name: Checksums

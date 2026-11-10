@@ -1,0 +1,13 @@
+# Keeps the Go version the Docker image is built with, and the actions the
+# workflows use, on releases that still get security fixes. The program
+# itself has no dependencies to update.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
