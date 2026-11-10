@@ -28,7 +28,11 @@ const (
 	versionRollingMask = 0x1fffe000
 
 	maxLineLength = 16 * 1024
-	idleTimeout   = 10 * time.Minute
+	// idleTimeout is how long a miner may send nothing before its connection
+	// is taken for dead. A miner that finds no share sends nothing, so the
+	// time starts again whenever its difficulty is lowered for that reason
+	// (see sendJob): it is only given up once easier work has not helped.
+	idleTimeout = 10 * time.Minute
 	// loginTimeout is how long a connection may take to subscribe and
 	// authorize, so idle connections cannot crowd out real miners.
 	loginTimeout = 60 * time.Second
@@ -41,6 +45,9 @@ const (
 	retargetWindow = 30 * time.Second
 	retargetShares = 30
 	quietWindow    = 60 * time.Second // wait this long before lowering when no share arrived
+	// maxQuietSteps limits how fast the difficulty falls for a miner that
+	// stays silent: by 8, then by 64, then by 512 for every quietWindow.
+	maxQuietSteps = 3
 )
 
 // Stratum error codes.
@@ -93,6 +100,8 @@ type session struct {
 
 	windowStart  time.Time
 	windowShares int
+	windowWork   float64 // sum of the difficulties the window's shares were credited at
+	quietWindows int     // windows in a row that ended without a share
 
 	accepted      uint64
 	rejected      uint64
@@ -411,7 +420,7 @@ func (s *session) handleSuggestDifficulty(req *request, params []json.RawMessage
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.diff, s.floor = d, d
-	s.windowStart, s.windowShares = time.Now(), 0
+	s.windowStart, s.windowShares, s.windowWork, s.quietWindows = time.Now(), 0, 0, 0
 	s.announceDifficultyLocked()
 }
 
@@ -467,7 +476,13 @@ func (s *session) sendJob(job *work.Job, clean bool) {
 		return // a newer job has already been sent
 	}
 	s.lastSeq = job.Seq
-	s.retargetLocked(time.Now())
+	now := time.Now()
+	if before := s.diff; s.retargetLocked(now) && s.diff < before {
+		// Lowered for a miner that is not finding shares, and so says
+		// nothing: give the easier work time to show before the silence
+		// counts as a dead connection (see idleTimeout).
+		s.conn.SetReadDeadline(now.Add(idleTimeout))
+	}
 
 	// A share can never need to be harder than the block itself.
 	diff := math.Min(s.diff, job.NetDiff)
@@ -509,6 +524,17 @@ func (s *session) sendJob(job *work.Job, clean bool) {
 
 // retargetLocked adjusts the difficulty towards one share per sharePeriod.
 // It reports whether the difficulty changed.
+//
+// It goes by the work the miner delivered, not by the number of its shares:
+// the sum of the difficulties the window's shares were credited at, per
+// second, is the miner's hashrate whatever difficulty it was working at. That
+// matters after a raise. Firmware differs on whether a new difficulty applies
+// to the job in hand or only to the next one, and shares at the old difficulty
+// are accepted until then. Counted one by one they would look like a miner
+// that is still far too fast, and each window of them would raise the
+// difficulty again, by up to 16 each time, until the next job: a fast miner
+// would end up with a difficulty no hardware can meet. Weighed by their
+// difficulty they say the same as before the raise, which is the truth.
 func (s *session) retargetLocked(now time.Time) bool {
 	elapsed := now.Sub(s.windowStart)
 	if s.windowShares < retargetShares && elapsed < retargetWindow {
@@ -518,20 +544,38 @@ func (s *session) retargetLocked(now time.Time) bool {
 		return false
 	}
 	seconds := math.Max(elapsed.Seconds(), 0.5)
-	shares := s.windowShares
-	ratio := float64(shares) / seconds * sharePeriod.Seconds()
-	s.windowStart, s.windowShares = now, 0
+	shares, work := s.windowShares, s.windowWork
+	s.windowStart, s.windowShares, s.windowWork = now, 0, 0
+
+	if shares == 0 {
+		// Silence says only that the miner is much slower than assumed, not
+		// by how much, so each silent window in a row lowers the difficulty
+		// further than the last. A miner far below its starting difficulty
+		// then gets work it can do within a few minutes. A miner that
+		// suggested a difficulty and cannot produce a share at it goes below
+		// its suggestion too.
+		s.quietWindows++
+		next := s.diff / math.Pow(8, float64(min(s.quietWindows, maxQuietSteps)))
+		next = math.Max(roundDifficulty(next), s.minDiff)
+		if next == s.diff {
+			return false
+		}
+		s.diff = next
+		return true
+	}
+	s.quietWindows = 0
+
+	// ideal is the difficulty at which this hashrate gives one share per
+	// sharePeriod.
+	ideal := work / seconds * sharePeriod.Seconds()
+	ratio := ideal / s.diff
 	if ratio > 0.5 && ratio < 2 {
 		return false // close enough; avoid flapping
 	}
-	// A miner that suggested a difficulty keeps it as its lower bound,
-	// unless it cannot produce any share at that level.
-	floor := s.floor
-	if shares == 0 {
-		floor = s.minDiff
-	}
+	// A miner that suggested a difficulty keeps it as its lower bound while
+	// it delivers shares.
 	next := s.diff * math.Min(math.Max(ratio, 1.0/8), 16)
-	next = math.Max(roundDifficulty(next), floor)
+	next = math.Max(roundDifficulty(next), s.floor)
 	if next == s.diff {
 		return false
 	}
@@ -694,6 +738,7 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	s.mu.Lock()
 	s.accepted++
 	s.windowShares++
+	s.windowWork += credit
 	s.lastShare = now
 	s.rate.add(now, credit)
 	if shareDiff > s.bestShare {
