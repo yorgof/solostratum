@@ -281,7 +281,7 @@ func (e *SubmitRefused) Error() string { return e.Reason }
 func (c *Client) CheckSubmitBlock(ctx context.Context) error {
 	err := c.call(ctx, 60*time.Second, "submitblock", []any{strings.Repeat("z", probeSize)}, nil)
 	if err == nil {
-		return errors.New("unexpected answer to submitblock check")
+		return errors.New("unexpected answer to submitblock check (accepted invalid test data instead of rejecting it; check your node or proxy)")
 	}
 	var rpcErr *Error
 	var httpErr *HTTPError
@@ -292,6 +292,10 @@ func (c *Client) CheckSubmitBlock(ctx context.Context) error {
 		return nil
 	case errors.As(err, &rpcErr) && rpcErr.Code == CodeMethodNotFound:
 		return &SubmitRefused{"the node does not know the submitblock call (" + rpcErr.Message + ")"}
+	case errors.As(err, &rpcErr) && rpcErr.Code == CodeInWarmup:
+		return err
+	case errors.As(err, &rpcErr):
+		return fmt.Errorf("unexpected answer to submitblock check (%s; check your node or proxy)", rpcErr)
 	case errors.As(err, &httpErr) && httpErr.Status == http.StatusForbidden:
 		return &SubmitRefused{"the node does not let this login call submitblock (HTTP 403). If bitcoin.conf has an rpcwhitelist line for this login, add submitblock to it"}
 	case errors.As(err, &httpErr) && (httpErr.Status == http.StatusUnauthorized || httpErr.Status == http.StatusRequestEntityTooLarge):

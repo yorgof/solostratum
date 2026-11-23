@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -362,13 +364,18 @@ func TestRefused(t *testing.T) {
 }
 
 func TestKeepAliveReusesConnectionWithTrailingNewline(t *testing.T) {
-	remotes := map[string]int{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		remotes[r.RemoteAddr]++
+	var conns atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "{\"result\":{\"chain\":\"main\"},\"error\":null,\"id\":1}\n")
 	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
 	defer srv.Close()
 
 	c := New(srv.URL, "u", "p", "")
@@ -377,7 +384,7 @@ func TestKeepAliveReusesConnectionWithTrailingNewline(t *testing.T) {
 			t.Fatalf("call %d: %v", i, err)
 		}
 	}
-	if len(remotes) != 1 {
-		t.Fatalf("used %d TCP connections for 5 sequential calls, want 1", len(remotes))
+	if got := conns.Load(); got != 1 {
+		t.Fatalf("opened %d TCP connections for 5 sequential calls, want 1", got)
 	}
 }
