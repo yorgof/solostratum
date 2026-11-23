@@ -154,7 +154,7 @@ All settings live in `solostratum.conf`, next to the program. Use
 | `node_url`         | `http://127.0.0.1:8332` | Address of the node's RPC port. |
 | `node_user`, `node_password` | –       | RPC login. |
 | `node_cookie_file` | –                 | Alternative to the login for a local node. |
-| `payout_address`   | –                 | Where block rewards go. Any address type. |
+| `payout_address`   | –                 | Where block rewards go (P2PKH, P2SH, P2WPKH, P2WSH or Taproot). |
 | `stratum_listen`   | `0.0.0.0:3333`    | Where miners connect. |
 | `status_listen`    | `0.0.0.0:3334`    | Status page. Empty turns it off; `127.0.0.1:3334` makes it local only. If the port is taken, mining goes on without the page, and the port is tried again every 30 seconds. |
 | `coinbase_tag`     | `/solostratum/`   | Short text written into blocks you find. |
