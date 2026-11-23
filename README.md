@@ -354,6 +354,7 @@ go run ./cmd/axesim -addr 127.0.0.1:3333 -user test
 ```sh
 docker build -t solostratum .
 mkdir data && cp internal/config/solostratum.conf.example data/solostratum.conf
+chmod 600 data/solostratum.conf
 # edit data/solostratum.conf, then:
 docker run -d --name solostratum --restart unless-stopped \
     --user "$(id -u):$(id -g)" \

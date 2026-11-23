@@ -53,7 +53,6 @@ type Job struct {
 	Target    *big.Int // network target
 	NetDiff   float64  // network difficulty
 	CurTime   uint32
-	MinTime   uint32
 	Value     int64 // subsidy plus fees, in satoshi
 	Branches  []btc.Hash
 	TxCount   int // transactions excluding the coinbase
@@ -133,7 +132,6 @@ func buildJob(id string, t *rpc.BlockTemplate, tag string, now time.Time, cache 
 		Target:    target,
 		NetDiff:   btc.DifficultyFromTarget(target),
 		CurTime:   uint32(t.CurTime),
-		MinTime:   uint32(max(t.MinTime, 0)),
 		Value:     t.CoinbaseValue,
 		TxCount:   len(t.Transactions),
 		Created:   now,

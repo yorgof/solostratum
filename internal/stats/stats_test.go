@@ -921,6 +921,13 @@ func TestBestSharesIgnoreImpossibleSharesAndRepeatedEntries(t *testing.T) {
 	if got := s.BestShares(); len(got) != 1 || s.bestDirty {
 		t.Fatalf("an impossible share was listed: %+v (changed: %v)", got, s.bestDirty)
 	}
+	// Persistent totals and history still count the shares and marshal cleanly
+	// without non-finite BestShare values.
+	s.Flush(when.Add(time.Hour))
+	reloaded := open(t, dir)
+	if tot := reloaded.totals["rig"]; tot == nil || tot.Accepted != 4 || tot.Work != 4 || tot.BestShare != 0 {
+		t.Fatalf("totals after impossible shares: %+v", tot)
+	}
 }
 
 func TestBestShareFileThatCannotBeReadIsSetAside(t *testing.T) {

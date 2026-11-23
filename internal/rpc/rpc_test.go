@@ -304,11 +304,12 @@ func TestCheckSubmitBlock(t *testing.T) {
 		retry   bool   // the node could not be asked just now
 	}{
 		{"bitcoin core", 500, decodeFailed, "", false},
-		{"another node error", 500, `{"result":null,"error":{"code":-1,"message":"odd"},"id":1}`, "", false},
-		{"an answer without an error", 200, `{"result":null,"error":null,"id":1}`, "", false},
+		{"another node error", 500, `{"result":null,"error":{"code":-1,"message":"odd"},"id":1}`, "", true},
+		{"an answer without an error", 200, `{"result":null,"error":null,"id":1}`, "", true},
 		{"not on the rpcwhitelist", 403, "", "add submitblock", false},
 		{"login refused", 401, "", "rejected the login", false},
 		{"proxy size limit", 413, "<html>Request Entity Too Large</html>", "16 MB", false},
+		{"proxy size limit with json", 413, `{"result":null,"error":{"code":-1,"message":"too large"},"id":1}`, "16 MB", false},
 		{"unknown method", 404, `{"result":null,"error":{"code":-32601,"message":"Method not found"},"id":1}`, "does not know the submitblock call", false},
 		{"warming up", 500, `{"result":null,"error":{"code":-28,"message":"Loading block index..."},"id":1}`, "", true},
 		{"busy", 503, "Work queue depth exceeded", "", true},
@@ -357,5 +358,26 @@ func TestRefused(t *testing.T) {
 	}
 	if Refused(&Error{Code: CodeInWarmup}) || Refused(errors.New("connection refused")) || Refused(nil) {
 		t.Error("an answer from the node, a failure to reach it, or no error counted as a refusal")
+	}
+}
+
+func TestKeepAliveReusesConnectionWithTrailingNewline(t *testing.T) {
+	remotes := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remotes[r.RemoteAddr]++
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "{\"result\":{\"chain\":\"main\"},\"error\":null,\"id\":1}\n")
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "u", "p", "")
+	for i := 0; i < 5; i++ {
+		if _, err := c.GetBlockchainInfo(context.Background()); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	if len(remotes) != 1 {
+		t.Fatalf("used %d TCP connections for 5 sequential calls, want 1", len(remotes))
 	}
 }

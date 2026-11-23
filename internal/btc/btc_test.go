@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"math"
 	"math/big"
 	"os"
@@ -244,6 +245,41 @@ func TestAddressToScript(t *testing.T) {
 	for _, c := range invalid {
 		if s, err := AddressToScript(c.addr, c.net); err == nil {
 			t.Errorf("%q (%s): accepted with script %x", c.addr, c.why, s)
+		}
+	}
+}
+
+func TestPayoutAddressToScript(t *testing.T) {
+	main, _ := NetworkByChain("main")
+	test, _ := NetworkByChain("testnet4")
+
+	allowed := []struct {
+		net  Network
+		addr string
+	}{
+		{main, "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"},
+		{main, "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"},
+		{main, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"},
+		{test, "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7"},
+		{main, "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"},
+	}
+	for _, tc := range allowed {
+		if _, err := PayoutAddressToScript(tc.addr, tc.net); err != nil {
+			t.Errorf("PayoutAddressToScript(%s): unexpected error: %v", tc.addr, err)
+		}
+	}
+
+	// Syntactically valid BIP350 addresses that are anyone-can-spend today
+	// must not be accepted as payout addresses.
+	unsupported := []string{
+		"bc1pfeessrawgf", // Pay-to-Anchor (v1, 2-byte program)
+		"bc1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7kt5nd6y", // v1, 40-byte program
+		"bc1zw508d6qejxtdg4y5r3zarvaryvaxxpcs",                                       // v2
+		"BC1SW50QGDZ25J",                                                             // v16
+	}
+	for _, addr := range unsupported {
+		if _, err := PayoutAddressToScript(addr, main); !errors.Is(err, ErrUnsupportedPayout) {
+			t.Errorf("PayoutAddressToScript(%s) = %v, want ErrUnsupportedPayout", addr, err)
 		}
 	}
 }

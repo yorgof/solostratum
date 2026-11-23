@@ -90,7 +90,7 @@ func TestPageIsSelfContainedAndReadOnly(t *testing.T) {
 	if resp.StatusCode != 200 || !strings.Contains(html, "<title>solostratum</title>") {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
-	if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+	if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "frame-ancestors 'none'") {
 		t.Errorf("CSP %q", csp)
 	}
 	// Nothing may be loaded from elsewhere.
