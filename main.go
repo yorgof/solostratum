@@ -149,7 +149,7 @@ func run(ctx context.Context, configPath string, checkOnly bool) error {
 	if info.Chain == "signet" {
 		return errors.New("the node is on signet, where blocks must be signed by the network's operators and cannot be mined this way. Use mainnet, testnet4 or regtest")
 	}
-	payoutScript, err := btc.AddressToScript(cfg.PayoutAddress, network)
+	payoutScript, err := btc.PayoutAddressToScript(cfg.PayoutAddress, network)
 	if err != nil {
 		return fmt.Errorf("payout_address %q is not usable on the node's network (%s): %v", cfg.PayoutAddress, info.Chain, err)
 	}
@@ -396,7 +396,10 @@ func runHealthcheck(configPath string) error {
 	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
 		host = "127.0.0.1"
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
 	resp, err := client.Get("http://" + net.JoinHostPort(host, port) + "/api/health")
 	if err != nil {
 		return fmt.Errorf("solostratum is not answering: %v", err)

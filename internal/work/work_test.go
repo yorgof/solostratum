@@ -28,7 +28,6 @@ func template(prev byte, height int64, curTime int64, txs int) *rpc.BlockTemplat
 		CoinbaseValue:     312500000 + 4242,
 		Bits:              "1d00ffff",
 		CurTime:           curTime,
-		MinTime:           curTime - 3600,
 		Height:            height,
 		WitnessCommitment: commitment,
 		LongPollID:        fmt.Sprintf("lp-%d-%d", prev, curTime),

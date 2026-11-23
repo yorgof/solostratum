@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/big"
@@ -142,7 +143,6 @@ func makeJob(t *testing.T, id, bits string, version uint32, txs int, clean bool)
 		CoinbaseValue:     312500000,
 		Bits:              bits,
 		CurTime:           1700000000,
-		MinTime:           1699990000,
 		Height:            840000,
 		WitnessCommitment: "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9",
 	}
@@ -523,7 +523,7 @@ func TestBlockIsSubmittedWhateverItsTime(t *testing.T) {
 	m := h.dial(axesim.Options{User: "rig1"})
 	notified := firstJob(t, m)
 
-	for _, ntime := range []uint32{serverJob.CurTime + maxNTimeRoll + 1, serverJob.MinTime - 1, math.MaxUint32} {
+	for _, ntime := range []uint32{serverJob.CurTime + maxNTimeRoll + 1, serverJob.CurTime - 1, math.MaxUint32} {
 		job := *notified
 		job.NTime = ntime
 		share := mustMine(t, m, &job, job.NetworkDifficulty())
@@ -2203,5 +2203,234 @@ func TestDifficultyIsHeldUntilTheNextJob(t *testing.T) {
 	sim.sendJob()
 	if got := sim.diff(); got != 1024*2 || s.held {
 		t.Fatalf("difficulty %v, held %v after a silent window, want %v and not held", got, s.held, 1024*2)
+	}
+}
+
+func TestLoginTimeoutHardDeadline(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	srv := NewServer(Options{StartDifficulty: 1, MinDifficulty: 0.001}, &fakeJobs{}, &fakeSink{})
+	sess := newSession(srv, c1, [work.Extranonce1Size]byte{1})
+	// Leave 80ms of the login window; sending blank lines must not extend it.
+	sess.connected = time.Now().Add(-loginTimeout + 80*time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		defer sess.close()
+		sess.serve()
+		close(done)
+	}()
+	go func() {
+		for {
+			if _, err := c2.Write([]byte("\n")); err != nil {
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unauthenticated session extended login deadline with blank lines")
+	}
+}
+
+func TestNegotiatedZeroVersionMaskIsEnforced(t *testing.T) {
+	h := newHarness(t, 0.001, makeJob(t, "a", diff1Bits, 0x20000000, 0, true))
+	c, err := net.Dial("tcp", h.srv.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r := bufio.NewReader(c)
+	send := func(line string) map[string]any {
+		t.Helper()
+		if _, err := io.WriteString(c, line+"\n"); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			raw, err := r.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			var msg map[string]any
+			if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+				t.Fatal(err)
+			}
+			if msg["id"] != nil {
+				return msg
+			}
+		}
+	}
+	cfg := send(`{"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"00000000"}]}`)
+	if res, _ := cfg["result"].(map[string]any); res["version-rolling.mask"] != "00000000" {
+		t.Fatalf("configure result = %v", cfg)
+	}
+	send(`{"id":2,"method":"mining.subscribe","params":["test"]}`)
+	send(`{"id":3,"method":"mining.authorize","params":["rig1","x"]}`)
+	// Submitting non-zero version bits when 00000000 was negotiated must be rejected.
+	sub := send(`{"id":4,"method":"mining.submit","params":["rig1","a","00000000","6553f100","00000001","00002000"]}`)
+	errArr, _ := sub["error"].([]any)
+	if len(errArr) < 2 || errArr[1] != "Version bits outside the allowed mask" {
+		t.Fatalf("submit response = %v, want mask rejection", sub)
+	}
+}
+
+// Even when a miner negotiated a zero version mask, if its firmware cleared
+// the full BIP320 rolling mask on a job whose version has bits inside that
+// mask and found a valid block, the block must still be submitted.
+func TestNegotiatedZeroVersionMaskStillSubmitsFullMaskBlock(t *testing.T) {
+	// Job version has bit 0x00004000 set inside versionRollingMask (0x1fffe000).
+	serverJob := makeJob(t, "a", regtestBits, 0x20004000, 0, true)
+	h := newHarness(t, 1024, serverJob)
+	c, err := net.Dial("tcp", h.srv.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r := bufio.NewReader(c)
+	readUntilID := func() (map[string]any, []map[string]any) {
+		var notes []map[string]any
+		for {
+			raw, err := r.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			var msg map[string]any
+			if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+				t.Fatal(err)
+			}
+			if msg["id"] != nil {
+				return msg, notes
+			}
+			notes = append(notes, msg)
+		}
+	}
+	send := func(line string) (map[string]any, []map[string]any) {
+		t.Helper()
+		if _, err := io.WriteString(c, line+"\n"); err != nil {
+			t.Fatal(err)
+		}
+		return readUntilID()
+	}
+
+	send(`{"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"00000000"}]}`)
+	subResp, _ := send(`{"id":2,"method":"mining.subscribe","params":["test"]}`)
+	en1Hex := subResp["result"].([]any)[1].(string)
+	en1, _ := hex.DecodeString(en1Hex)
+	send(`{"id":3,"method":"mining.authorize","params":["rig1","x"]}`)
+
+	// Mine a block using version with rolling bits cleared (0x20000000),
+	// while submitting versionBits = 00000000.
+	en2 := []byte{0, 0, 0, 1}
+	coinbase := serverJob.Coinbase(defaultScript, en1, en2)
+	var nonce uint32
+	var foundHash btc.Hash
+	for nonce = 0; nonce < 100000; nonce++ {
+		hdr := serverJob.Header(coinbase, 0x20000000, serverJob.CurTime, nonce)
+		hash := btc.SHA256d(hdr[:])
+		if btc.HashToInt(hash).Cmp(serverJob.Target) <= 0 {
+			// Ensure the un-cleared job version does NOT also meet the target,
+			// so the test proves the alternate header was actually checked.
+			origHdr := serverJob.Header(coinbase, serverJob.Version, serverJob.CurTime, nonce)
+			if btc.HashToInt(btc.SHA256d(origHdr[:])).Cmp(serverJob.Target) > 0 {
+				foundHash = hash
+				break
+			}
+		}
+	}
+	if foundHash == (btc.Hash{}) {
+		t.Fatal("could not find a regtest block for alternate version")
+	}
+
+	resp, _ := send(fmt.Sprintf(`{"id":4,"method":"mining.submit","params":["rig1","a","%08x","%08x","%08x","00000000"]}`,
+		1, serverJob.CurTime, nonce))
+	if resp["result"] != true {
+		t.Fatalf("block submission rejected: %v", resp)
+	}
+	select {
+	case found := <-h.sink.ch:
+		if found.hash != foundHash.String() {
+			t.Fatalf("submitted block hash %s, want %s", found.hash, foundHash.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("block with cleared rolling bits was not submitted")
+	}
+}
+
+func TestUnsupportedMinerPayoutAddressIsRejected(t *testing.T) {
+	mainNet, _ := btc.NetworkByChain("main")
+	defaultAddr := "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+	defaultScript, _ := btc.PayoutAddressToScript(defaultAddr, mainNet)
+	srv := NewServer(Options{
+		Network: mainNet, DefaultAddress: defaultAddr, DefaultScript: defaultScript,
+		StartDifficulty: 1, MinDifficulty: 0.001,
+	}, &fakeJobs{current: makeJob(t, "a", diff1Bits, 0x20000000, 0, true)}, &fakeSink{})
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	sess := newSession(srv, c1, [work.Extranonce1Size]byte{2})
+	sess.handleAuthorize(&request{ID: json.RawMessage("1")}, []json.RawMessage{json.RawMessage(`"bc1pfeessrawgf.rig1"`)})
+	select {
+	case raw := <-sess.out:
+		var msg map[string]any
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg["result"] != false || msg["error"] == nil {
+			t.Fatalf("authorize response = %v, want rejection", msg)
+		}
+	default:
+		t.Fatal("no response queued")
+	}
+	if sess.loggedIn() {
+		t.Fatal("miner with unsupported payout address was authorized")
+	}
+}
+
+func TestLooksLikeBitcoinAddress(t *testing.T) {
+	for _, s := range []string{
+		"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5",
+		"BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T5",
+		"tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7",
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb",
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf0a", // typo with non-Base58 '0'
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfIa", // typo with non-Base58 'I'
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfOa", // typo with non-Base58 'O'
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7Divfla", // typo with non-Base58 'l'
+		"3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+	} {
+		if !looksLikeBitcoinAddress(s) {
+			t.Errorf("looksLikeBitcoinAddress(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{
+		"bitaxe1",
+		"my-very-long-worker-name-in-the-basement-rack-01",
+		"bc1short",
+		"9A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+	} {
+		if looksLikeBitcoinAddress(s) {
+			t.Errorf("looksLikeBitcoinAddress(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestLiveStatsIgnoreNonFiniteBestShare(t *testing.T) {
+	srv := NewServer(Options{StartDifficulty: 1, MinDifficulty: 0.001}, &fakeJobs{}, &fakeSink{})
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	sess := newSession(srv, c1, [work.Extranonce1Size]byte{3})
+	sess.authorized = true
+	sess.worker = "rig"
+	sess.acceptShare(&request{ID: json.RawMessage("1")}, "rig", 1, math.Inf(1))
+	sess.acceptShare(&request{ID: json.RawMessage("2")}, "rig", 1, math.NaN())
+	if sess.bestShare != 0 || srv.best != 0 {
+		t.Fatalf("non-finite share poisoned live bestShare: session=%v server=%v", sess.bestShare, srv.best)
+	}
+	if _, err := json.Marshal(srv.Status()); err != nil {
+		t.Fatalf("Status() failed to marshal: %v", err)
 	}
 }

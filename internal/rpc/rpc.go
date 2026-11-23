@@ -128,6 +128,30 @@ func (c *Client) credentials() (string, string, error) {
 	return user, pass, nil
 }
 
+const (
+	drainLimit   = 4096
+	drainTimeout = 50 * time.Millisecond
+)
+
+// closeResponseBody drains up to drainLimit trailing bytes (such as Bitcoin
+// Core's trailing newline) within drainTimeout so HTTP/1.1 keep-alive
+// connections can be reused, without letting a stalled response tail delay a
+// result that has already been decoded.
+func closeResponseBody(body io.ReadCloser) {
+	done := make(chan struct{})
+	timer := time.AfterFunc(drainTimeout, func() {
+		body.Close()
+	})
+	go func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(body, drainLimit))
+		close(done)
+	}()
+	<-done
+	if timer.Stop() {
+		body.Close()
+	}
+}
+
 // call performs one JSON-RPC request and decodes the result into out.
 func (c *Client) call(ctx context.Context, timeout time.Duration, method string, params []any, out any) error {
 	if params == nil {
@@ -156,9 +180,8 @@ func (c *Client) call(ctx context.Context, timeout time.Duration, method string,
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		io.Copy(io.Discard, resp.Body)
+	defer closeResponseBody(resp.Body)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusRequestEntityTooLarge {
 		return &HTTPError{resp.StatusCode}
 	}
 	// Bitcoin Core reports RPC errors with a JSON body and a 4xx/5xx status.
@@ -174,6 +197,9 @@ func (c *Client) call(ctx context.Context, timeout time.Duration, method string,
 	}
 	if envelope.Error != nil {
 		return envelope.Error
+	}
+	if resp.StatusCode != http.StatusOK {
+		return &HTTPError{resp.StatusCode}
 	}
 	if out == nil {
 		return nil
@@ -201,19 +227,17 @@ func (c *Client) GetBlockchainInfo(ctx context.Context) (ChainInfo, error) {
 
 // BlockTemplate is the answer of getblocktemplate.
 type BlockTemplate struct {
-	Version           uint32            `json:"version"`
-	Rules             []string          `json:"rules"`
-	PreviousBlockHash string            `json:"previousblockhash"`
-	Transactions      []TemplateTx      `json:"transactions"`
-	CoinbaseAux       map[string]string `json:"coinbaseaux"`
-	CoinbaseValue     int64             `json:"coinbasevalue"`
-	LongPollID        string            `json:"longpollid"`
-	Target            string            `json:"target"`
-	MinTime           int64             `json:"mintime"`
-	CurTime           int64             `json:"curtime"`
-	Bits              string            `json:"bits"`
-	Height            int64             `json:"height"`
-	WitnessCommitment string            `json:"default_witness_commitment"`
+	Version           uint32       `json:"version"`
+	Rules             []string     `json:"rules"`
+	PreviousBlockHash string       `json:"previousblockhash"`
+	Transactions      []TemplateTx `json:"transactions"`
+	CoinbaseValue     int64        `json:"coinbasevalue"`
+	LongPollID        string       `json:"longpollid"`
+	Target            string       `json:"target"`
+	CurTime           int64        `json:"curtime"`
+	Bits              string       `json:"bits"`
+	Height            int64        `json:"height"`
+	WitnessCommitment string       `json:"default_witness_commitment"`
 }
 
 // TemplateTx is one transaction of a block template.
@@ -280,17 +304,22 @@ func (e *SubmitRefused) Error() string { return e.Reason }
 // will, and any other error if the node could not be asked just now.
 func (c *Client) CheckSubmitBlock(ctx context.Context) error {
 	err := c.call(ctx, 60*time.Second, "submitblock", []any{strings.Repeat("z", probeSize)}, nil)
+	if err == nil {
+		return errors.New("unexpected answer to submitblock check (accepted invalid test data instead of rejecting it; check your node or proxy)")
+	}
 	var rpcErr *Error
 	var httpErr *HTTPError
 	switch {
+	case errors.As(err, &rpcErr) && rpcErr.Code == CodeDeserialization:
+		// The call reached submitblock and failed to decode the non-hex probe
+		// ("Block decode failed"), which is all there is to learn.
+		return nil
 	case errors.As(err, &rpcErr) && rpcErr.Code == CodeMethodNotFound:
 		return &SubmitRefused{"the node does not know the submitblock call (" + rpcErr.Message + ")"}
 	case errors.As(err, &rpcErr) && rpcErr.Code == CodeInWarmup:
 		return err
 	case errors.As(err, &rpcErr):
-		// The call reached submitblock, which is all there is to learn: it
-		// answers "Block decode failed" (CodeDeserialization).
-		return nil
+		return fmt.Errorf("unexpected answer to submitblock check (%s; check your node or proxy)", rpcErr)
 	case errors.As(err, &httpErr) && httpErr.Status == http.StatusForbidden:
 		return &SubmitRefused{"the node does not let this login call submitblock (HTTP 403). If bitcoin.conf has an rpcwhitelist line for this login, add submitblock to it"}
 	case errors.As(err, &httpErr) && (httpErr.Status == http.StatusUnauthorized || httpErr.Status == http.StatusRequestEntityTooLarge):

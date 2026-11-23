@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -214,6 +216,7 @@ func TestResponseFailures(t *testing.T) {
 		{"invalid JSON", "{broken", "unreadable answer", http.StatusOK},
 		{"wrong result type", `{"result":false}`, "cannot unmarshal", http.StatusOK},
 		{"missing result", `{"error":null}`, "unexpected end", http.StatusOK},
+		{"non-200 null result", `{"result":null,"error":null}`, "HTTP status 502", http.StatusBadGateway},
 		{"RPC error", `{"error":{"code":-1,"message":"invalid block"}}`, "invalid block", http.StatusInternalServerError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -304,11 +307,12 @@ func TestCheckSubmitBlock(t *testing.T) {
 		retry   bool   // the node could not be asked just now
 	}{
 		{"bitcoin core", 500, decodeFailed, "", false},
-		{"another node error", 500, `{"result":null,"error":{"code":-1,"message":"odd"},"id":1}`, "", false},
-		{"an answer without an error", 200, `{"result":null,"error":null,"id":1}`, "", false},
+		{"another node error", 500, `{"result":null,"error":{"code":-1,"message":"odd"},"id":1}`, "", true},
+		{"an answer without an error", 200, `{"result":null,"error":null,"id":1}`, "", true},
 		{"not on the rpcwhitelist", 403, "", "add submitblock", false},
 		{"login refused", 401, "", "rejected the login", false},
 		{"proxy size limit", 413, "<html>Request Entity Too Large</html>", "16 MB", false},
+		{"proxy size limit with json", 413, `{"result":null,"error":{"code":-1,"message":"too large"},"id":1}`, "16 MB", false},
 		{"unknown method", 404, `{"result":null,"error":{"code":-32601,"message":"Method not found"},"id":1}`, "does not know the submitblock call", false},
 		{"warming up", 500, `{"result":null,"error":{"code":-28,"message":"Loading block index..."},"id":1}`, "", true},
 		{"busy", 503, "Work queue depth exceeded", "", true},
@@ -357,5 +361,71 @@ func TestRefused(t *testing.T) {
 	}
 	if Refused(&Error{Code: CodeInWarmup}) || Refused(errors.New("connection refused")) || Refused(nil) {
 		t.Error("an answer from the node, a failure to reach it, or no error counted as a refusal")
+	}
+}
+
+func TestKeepAliveReusesConnectionWithTrailingNewline(t *testing.T) {
+	var conns atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		// Flush the JSON object before sending the trailing newline in a
+		// second chunk so json.NewDecoder finishes before EOF is buffered.
+		io.WriteString(w, `{"result":{"chain":"main"},"error":null,"id":1}`)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(5 * time.Millisecond)
+		io.WriteString(w, "\n")
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	c := New(srv.URL, "u", "p", "")
+	for i := 0; i < 5; i++ {
+		if _, err := c.GetBlockchainInfo(context.Background()); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	if got := conns.Load(); got != 1 {
+		t.Fatalf("opened %d TCP connections for 5 sequential calls, want 1", got)
+	}
+}
+
+func TestStalledResponseTailDoesNotDelayDecodedResult(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, `{"result":{"chain":"main"},"error":null,"id":1}`)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+
+	c := New(srv.URL, "u", "p", "")
+	start := time.Now()
+	info, err := c.GetBlockchainInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetBlockchainInfo: %v", err)
+	}
+	if info.Chain != "main" {
+		t.Fatalf("chain = %q, want main", info.Chain)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("stalled response tail delayed decoded result by %v", elapsed)
 	}
 }

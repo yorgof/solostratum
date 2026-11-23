@@ -244,12 +244,17 @@ func Open(dir string) (*Store, error) {
 // counts for, shareDiff the difficulty its hash actually reached.
 func (s *Store) Accepted(worker string, at time.Time, credit, shareDiff float64) {
 	s.change(func() {
-		s.recordLocked(worker, at, Counts{Accepted: 1, Work: credit, BestShare: shareDiff})
+		// Infinity or NaN cannot be written as JSON and would sort above
+		// every real share. Still count the share and its work.
+		best := shareDiff
+		if !(best > 0 && best < math.Inf(1)) {
+			best = 0
+		}
+		s.recordLocked(worker, at, Counts{Accepted: 1, Work: credit, BestShare: best})
 		// The list of the highest shares covers every worker, including one
-		// whose name is no longer recorded. Infinity would sort above every
-		// real share.
-		if shareDiff > 0 && shareDiff < math.Inf(1) {
-			s.noteBestLocked(worker, at, shareDiff)
+		// whose name is no longer recorded.
+		if best > 0 {
+			s.noteBestLocked(worker, at, best)
 		}
 	})
 }

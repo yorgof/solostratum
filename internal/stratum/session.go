@@ -82,15 +82,16 @@ type session struct {
 	// mu is held with defer wherever its holder calls out of the session, to
 	// the job source or to send a message: a panic there must not leave it
 	// held, since the manager's Broadcast and the status page take it too.
-	mu           sync.Mutex
-	subscribed   bool
-	authorized   bool
-	client       string
-	worker       string
-	payout       string
-	payoutScript []byte
-	ownPayout    bool
-	versionMask  uint32
+	mu                sync.Mutex
+	subscribed        bool
+	authorized        bool
+	client            string
+	worker            string
+	payout            string
+	payoutScript      []byte
+	ownPayout         bool
+	versionMask       uint32
+	versionConfigured bool
 
 	diff     float64            // difficulty the miner should be using
 	floor    float64            // lowest difficulty while the miner delivers shares
@@ -181,17 +182,25 @@ func (s *session) run() {
 // serve handles the miner's messages until the connection closes.
 func (s *session) serve() {
 	reader := bufio.NewReaderSize(s.conn, maxLineLength)
+	loginDeadline := s.connected.Add(loginTimeout)
 	for {
-		timeout := loginTimeout
-		if s.ready() {
-			timeout = idleTimeout
+		ready := s.ready()
+		if ready {
+			s.conn.SetReadDeadline(time.Now().Add(idleTimeout))
+		} else {
+			if !time.Now().Before(loginDeadline) {
+				return
+			}
+			s.conn.SetReadDeadline(loginDeadline)
 		}
-		s.conn.SetReadDeadline(time.Now().Add(timeout))
 		line, err := reader.ReadSlice('\n')
 		if err != nil {
 			if errors.Is(err, bufio.ErrBufferFull) {
 				log.Printf("Miner %s sent an over-long message; disconnecting.", s.label())
 			}
+			return
+		}
+		if !ready && !time.Now().Before(loginDeadline) {
 			return
 		}
 		var req request
@@ -343,6 +352,7 @@ func (s *session) handleConfigure(req *request, params []json.RawMessage) {
 		}
 		s.mu.Lock()
 		s.versionMask = mask
+		s.versionConfigured = true
 		s.mu.Unlock()
 		result["version-rolling"] = true
 		result["version-rolling.mask"] = fmt.Sprintf("%08x", mask)
@@ -390,8 +400,15 @@ func (s *session) handleAuthorize(req *request, params []json.RawMessage) {
 	// "address.workername". Anything else is just a name.
 	payout, script, own := s.srv.opts.DefaultAddress, s.srv.opts.DefaultScript, false
 	candidate, _, _ := strings.Cut(user, ".")
-	if sc, err := btc.AddressToScript(candidate, s.srv.opts.Network); err == nil {
+	if sc, err := btc.PayoutAddressToScript(candidate, s.srv.opts.Network); err == nil {
 		payout, script, own = candidate, sc, true
+	} else if errors.Is(err, btc.ErrUnsupportedPayout) {
+		log.Printf("WARNING: rejected miner %s from %s: %v", user, s.remote, err)
+		s.reply(req.ID, false, errUnauthorized, "Unsupported payout address type")
+		return
+	} else if looksLikeBitcoinAddress(candidate) {
+		log.Printf("WARNING: miner %s from %s uses a username that looks like a Bitcoin address, but it is not usable on %s (%v). Rewards for this miner will go to the default payout address %s.",
+			user, s.remote, s.srv.opts.Network.Name, err, s.srv.opts.DefaultAddress)
 	}
 	if user == "" {
 		user = "miner"
@@ -768,9 +785,9 @@ func (s *session) rejectShare(req *request, code int, msg string) {
 func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	s.mu.Lock()
 	subscribed, authorized := s.subscribed, s.authorized
-	payoutScript, mask, worker := s.payoutScript, s.versionMask, s.worker
+	payoutScript, mask, versionConfigured, worker := s.payoutScript, s.versionMask, s.versionConfigured, s.worker
 	s.mu.Unlock()
-	if mask == 0 {
+	if !versionConfigured {
 		// Some firmware rolls the version without negotiating it first.
 		// Refusing such a share could throw away a valid block.
 		mask = versionRollingMask
@@ -801,6 +818,24 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	versions, inMask := versionReadings(job.Version, mask, sub.versionBits)
 	coinbase := job.Coinbase(payoutScript, s.extranonce1[:], sub.extranonce2)
 	sol := solve(job, coinbase, sub, versions)
+	// If the miner negotiated a narrower (or zero) mask, firmware may still
+	// have cleared the full BIP320 rolling mask when hashing. Check that
+	// header for a valid block without relaxing ordinary share validation.
+	if !sol.isBlock && inMask && mask != versionRollingMask {
+		alt := job.Version&^versionRollingMask | sub.versionBits
+		seen := false
+		for _, v := range versions {
+			if v == alt {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			if altSol := solve(job, coinbase, sub, []uint32{alt}); altSol.isBlock {
+				sol = altSol
+			}
+		}
+	}
 
 	s.mu.Lock()
 	assigned, known := s.jobDiff[sub.jobID]
@@ -871,7 +906,8 @@ func (s *session) acceptShare(req *request, worker string, credit, shareDiff flo
 	s.windowWork += credit
 	s.lastShare = now
 	s.rate.add(now, credit)
-	if shareDiff > s.bestShare {
+	finiteBest := shareDiff > 0 && !math.IsInf(shareDiff, 0) && !math.IsNaN(shareDiff)
+	if finiteBest && shareDiff > s.bestShare {
 		s.bestShare = shareDiff
 	}
 	// Not between a change of the difficulty and the next job: until then
@@ -879,7 +915,9 @@ func (s *session) acceptShare(req *request, worker string, credit, shareDiff flo
 	changed := !s.held && s.retargetLocked(now)
 	s.mu.Unlock()
 	s.srv.accepted.Add(1)
-	s.srv.noteBest(shareDiff)
+	if finiteBest {
+		s.srv.noteBest(shareDiff)
+	}
 	s.reply(req.ID, true, 0, "")
 
 	if changed {
@@ -903,6 +941,35 @@ func (s *session) status(now time.Time) (MinerStatus, bool) {
 		Accepted: s.accepted, Rejected: s.rejected, RejectReasons: maps.Clone(s.rejectReasons),
 		BestShare: s.bestShare, LastShare: s.lastShare,
 	}, true
+}
+
+// looksLikeBitcoinAddress reports whether s looks like an attempted Bitcoin
+// address (SegWit prefix or plausible Base58 legacy address), so a mistyped
+// per-miner payout address can be logged as a warning without flagging
+// ordinary worker names.
+func looksLikeBitcoinAddress(s string) bool {
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "bc1") || strings.HasPrefix(lower, "tb1") || strings.HasPrefix(lower, "bcrt1") {
+		return len(s) >= 14
+	}
+	if len(s) < 25 || len(s) > 35 {
+		return false
+	}
+	switch s[0] {
+	case '1', '3', 'm', 'n', '2':
+	default:
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isDigit := c >= '0' && c <= '9'
+		isUpper := c >= 'A' && c <= 'Z'
+		isLower := c >= 'a' && c <= 'z'
+		if !isDigit && !isUpper && !isLower {
+			return false
+		}
+	}
+	return true
 }
 
 // cleanString makes a miner-supplied string safe to log and display: it

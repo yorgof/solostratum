@@ -31,6 +31,39 @@ func NetworkByChain(chain string) (Network, bool) {
 	return n, ok
 }
 
+// ErrUnsupportedPayout reports a syntactically valid address whose output
+// script is not a standard spendable payout type (for example, an unknown
+// SegWit witness version or a non-Taproot v1 program such as Pay-to-Anchor).
+var ErrUnsupportedPayout = errors.New("unsupported payout address type")
+
+// PayoutAddressToScript validates addr for net and returns its output script,
+// rejecting non-standard witness programs (such as unknown witness versions
+// or non-32-byte v1 outputs) that are anyone-can-spend on Bitcoin.
+func PayoutAddressToScript(addr string, net Network) ([]byte, error) {
+	script, err := AddressToScript(addr, net)
+	if err != nil {
+		return nil, err
+	}
+	if !isStandardPayoutScript(script) {
+		return nil, fmt.Errorf("%w: only P2PKH, P2SH, P2WPKH, P2WSH and Taproot (P2TR) payout addresses are supported", ErrUnsupportedPayout)
+	}
+	return script, nil
+}
+
+func isStandardPayoutScript(s []byte) bool {
+	switch len(s) {
+	case 25: // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+		return s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac
+	case 23: // P2SH: OP_HASH160 <20> OP_EQUAL
+		return s[0] == 0xa9 && s[1] == 0x14 && s[22] == 0x87
+	case 22: // P2WPKH: OP_0 <20>
+		return s[0] == 0x00 && s[1] == 0x14
+	case 34: // P2WSH (OP_0 <32>) or P2TR (OP_1 <32>)
+		return (s[0] == 0x00 || s[0] == 0x51) && s[1] == 0x20
+	}
+	return false
+}
+
 // AddressToScript validates addr for the given network and returns the
 // output script that pays to it. Every checksum is verified; an address for
 // a different network is rejected.
