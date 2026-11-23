@@ -962,9 +962,9 @@ func looksLikeBitcoinAddress(s string) bool {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		isDigit := c >= '1' && c <= '9'
-		isUpper := c >= 'A' && c <= 'Z' && c != 'I' && c != 'O'
-		isLower := c >= 'a' && c <= 'z' && c != 'l'
+		isDigit := c >= '0' && c <= '9'
+		isUpper := c >= 'A' && c <= 'Z'
+		isLower := c >= 'a' && c <= 'z'
 		if !isDigit && !isUpper && !isLower {
 			return false
 		}

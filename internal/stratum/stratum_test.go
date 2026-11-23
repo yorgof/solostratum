@@ -2395,6 +2395,10 @@ func TestLooksLikeBitcoinAddress(t *testing.T) {
 		"BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T5",
 		"tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7",
 		"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb",
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf0a", // typo with non-Base58 '0'
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfIa", // typo with non-Base58 'I'
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfOa", // typo with non-Base58 'O'
+		"1A1zP1eP5QGefi2DMPTfTL5SLmv7Divfla", // typo with non-Base58 'l'
 		"3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
 	} {
 		if !looksLikeBitcoinAddress(s) {
