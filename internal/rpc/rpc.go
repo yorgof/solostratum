@@ -128,6 +128,30 @@ func (c *Client) credentials() (string, string, error) {
 	return user, pass, nil
 }
 
+const (
+	drainLimit   = 4096
+	drainTimeout = 50 * time.Millisecond
+)
+
+// closeResponseBody drains up to drainLimit trailing bytes (such as Bitcoin
+// Core's trailing newline) within drainTimeout so HTTP/1.1 keep-alive
+// connections can be reused, without letting a stalled response tail delay a
+// result that has already been decoded.
+func closeResponseBody(body io.ReadCloser) {
+	done := make(chan struct{})
+	timer := time.AfterFunc(drainTimeout, func() {
+		body.Close()
+	})
+	go func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(body, drainLimit))
+		close(done)
+	}()
+	<-done
+	if timer.Stop() {
+		body.Close()
+	}
+}
+
 // call performs one JSON-RPC request and decodes the result into out.
 func (c *Client) call(ctx context.Context, timeout time.Duration, method string, params []any, out any) error {
 	if params == nil {
@@ -156,10 +180,7 @@ func (c *Client) call(ctx context.Context, timeout time.Duration, method string,
 	if err != nil {
 		return err
 	}
-	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-	}()
+	defer closeResponseBody(resp.Body)
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusRequestEntityTooLarge {
 		return &HTTPError{resp.StatusCode}
 	}

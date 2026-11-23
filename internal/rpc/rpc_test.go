@@ -369,7 +369,14 @@ func TestKeepAliveReusesConnectionWithTrailingNewline(t *testing.T) {
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusOK)
-		io.WriteString(w, "{\"result\":{\"chain\":\"main\"},\"error\":null,\"id\":1}\n")
+		// Flush the JSON object before sending the trailing newline in a
+		// second chunk so json.NewDecoder finishes before EOF is buffered.
+		io.WriteString(w, `{"result":{"chain":"main"},"error":null,"id":1}`)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(5 * time.Millisecond)
+		io.WriteString(w, "\n")
 	}))
 	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
 		if state == http.StateNew {
@@ -387,5 +394,38 @@ func TestKeepAliveReusesConnectionWithTrailingNewline(t *testing.T) {
 	}
 	if got := conns.Load(); got != 1 {
 		t.Fatalf("opened %d TCP connections for 5 sequential calls, want 1", got)
+	}
+}
+
+func TestStalledResponseTailDoesNotDelayDecodedResult(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, `{"result":{"chain":"main"},"error":null,"id":1}`)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+
+	c := New(srv.URL, "u", "p", "")
+	start := time.Now()
+	info, err := c.GetBlockchainInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetBlockchainInfo: %v", err)
+	}
+	if info.Chain != "main" {
+		t.Fatalf("chain = %q, want main", info.Chain)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("stalled response tail delayed decoded result by %v", elapsed)
 	}
 }
