@@ -818,6 +818,24 @@ func (s *session) handleSubmit(req *request, params []json.RawMessage) {
 	versions, inMask := versionReadings(job.Version, mask, sub.versionBits)
 	coinbase := job.Coinbase(payoutScript, s.extranonce1[:], sub.extranonce2)
 	sol := solve(job, coinbase, sub, versions)
+	// If the miner negotiated a narrower (or zero) mask, firmware may still
+	// have cleared the full BIP320 rolling mask when hashing. Check that
+	// header for a valid block without relaxing ordinary share validation.
+	if !sol.isBlock && inMask && mask != versionRollingMask {
+		alt := job.Version&^versionRollingMask | sub.versionBits
+		seen := false
+		for _, v := range versions {
+			if v == alt {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			if altSol := solve(job, coinbase, sub, []uint32{alt}); altSol.isBlock {
+				sol = altSol
+			}
+		}
+	}
 
 	s.mu.Lock()
 	assigned, known := s.jobDiff[sub.jobID]

@@ -2277,6 +2277,88 @@ func TestNegotiatedZeroVersionMaskIsEnforced(t *testing.T) {
 	}
 }
 
+// Even when a miner negotiated a zero version mask, if its firmware cleared
+// the full BIP320 rolling mask on a job whose version has bits inside that
+// mask and found a valid block, the block must still be submitted.
+func TestNegotiatedZeroVersionMaskStillSubmitsFullMaskBlock(t *testing.T) {
+	// Job version has bit 0x00004000 set inside versionRollingMask (0x1fffe000).
+	serverJob := makeJob(t, "a", regtestBits, 0x20004000, 0, true)
+	h := newHarness(t, 1024, serverJob)
+	c, err := net.Dial("tcp", h.srv.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r := bufio.NewReader(c)
+	readUntilID := func() (map[string]any, []map[string]any) {
+		var notes []map[string]any
+		for {
+			raw, err := r.ReadString('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			var msg map[string]any
+			if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+				t.Fatal(err)
+			}
+			if msg["id"] != nil {
+				return msg, notes
+			}
+			notes = append(notes, msg)
+		}
+	}
+	send := func(line string) (map[string]any, []map[string]any) {
+		t.Helper()
+		if _, err := io.WriteString(c, line+"\n"); err != nil {
+			t.Fatal(err)
+		}
+		return readUntilID()
+	}
+
+	send(`{"id":1,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"00000000"}]}`)
+	subResp, _ := send(`{"id":2,"method":"mining.subscribe","params":["test"]}`)
+	en1Hex := subResp["result"].([]any)[1].(string)
+	en1, _ := hex.DecodeString(en1Hex)
+	send(`{"id":3,"method":"mining.authorize","params":["rig1","x"]}`)
+
+	// Mine a block using version with rolling bits cleared (0x20000000),
+	// while submitting versionBits = 00000000.
+	en2 := []byte{0, 0, 0, 1}
+	coinbase := serverJob.Coinbase(defaultScript, en1, en2)
+	var nonce uint32
+	var foundHash btc.Hash
+	for nonce = 0; nonce < 100000; nonce++ {
+		hdr := serverJob.Header(coinbase, 0x20000000, serverJob.CurTime, nonce)
+		hash := btc.SHA256d(hdr[:])
+		if btc.HashToInt(hash).Cmp(serverJob.Target) <= 0 {
+			// Ensure the un-cleared job version does NOT also meet the target,
+			// so the test proves the alternate header was actually checked.
+			origHdr := serverJob.Header(coinbase, serverJob.Version, serverJob.CurTime, nonce)
+			if btc.HashToInt(btc.SHA256d(origHdr[:])).Cmp(serverJob.Target) > 0 {
+				foundHash = hash
+				break
+			}
+		}
+	}
+	if foundHash == (btc.Hash{}) {
+		t.Fatal("could not find a regtest block for alternate version")
+	}
+
+	resp, _ := send(fmt.Sprintf(`{"id":4,"method":"mining.submit","params":["rig1","a","%08x","%08x","%08x","00000000"]}`,
+		1, serverJob.CurTime, nonce))
+	if resp["result"] != true {
+		t.Fatalf("block submission rejected: %v", resp)
+	}
+	select {
+	case found := <-h.sink.ch:
+		if found.hash != foundHash.String() {
+			t.Fatalf("submitted block hash %s, want %s", found.hash, foundHash.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("block with cleared rolling bits was not submitted")
+	}
+}
+
 func TestUnsupportedMinerPayoutAddressIsRejected(t *testing.T) {
 	mainNet, _ := btc.NetworkByChain("main")
 	defaultAddr := "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
