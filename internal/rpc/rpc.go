@@ -177,6 +177,9 @@ func (c *Client) call(ctx context.Context, timeout time.Duration, method string,
 	if envelope.Error != nil {
 		return envelope.Error
 	}
+	if resp.StatusCode != http.StatusOK {
+		return &HTTPError{resp.StatusCode}
+	}
 	if out == nil {
 		return nil
 	}

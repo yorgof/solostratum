@@ -216,6 +216,7 @@ func TestResponseFailures(t *testing.T) {
 		{"invalid JSON", "{broken", "unreadable answer", http.StatusOK},
 		{"wrong result type", `{"result":false}`, "cannot unmarshal", http.StatusOK},
 		{"missing result", `{"error":null}`, "unexpected end", http.StatusOK},
+		{"non-200 null result", `{"result":null,"error":null}`, "HTTP status 502", http.StatusBadGateway},
 		{"RPC error", `{"error":{"code":-1,"message":"invalid block"}}`, "invalid block", http.StatusInternalServerError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
